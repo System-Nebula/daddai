@@ -12,7 +12,7 @@ Logger.writter(msg)
 
 # Oollama 
 Logger.writter("config.get_ollama == " + Config.get_ollama()) #debuging for dummmmies
-ollamma = Ollama(base_url=str(Config.get_ollama()),model="llama2:7b") 
+ollamma = Ollama(base_url=str(Config.get_ollama()),model=Config.get_model()) 
 Logger.writter("attempted to connect to ollama - waht is error handling")
 
 if __name__ == "__main__" :
