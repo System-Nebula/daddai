@@ -12,3 +12,6 @@ class Config:
     def get_ollama():
         ollamaSrv = os.getenv("OLLAMA_URL")
         return ollamaSrv
+    def get_model():
+        model = os.getenv("OLLAMA_MODEL")
+        return str(model)
