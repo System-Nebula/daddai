@@ -1,9 +1,7 @@
 name: Pull Request Action
 on:
   push:
-    branches:
-      - dev/*
-      - testing/*
+    branches: [ dev ]
 
 jobs:
   create-pull-request:
