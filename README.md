@@ -8,3 +8,9 @@ In order to run the bot you need the following settings: </br>
 - A .log directory
 
 It is also needed to run ```pip3 install -r deps/requirements.txt```
+
+### Repo workflow
+
+It would be good to work on a branch called dev </br>
+When the work on the branch is done commit it to dev </br>
+The gh workflow will automatically create a PR
