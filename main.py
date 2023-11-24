@@ -2,18 +2,13 @@ import discord
 from discord.ext import commands
 from config.config import Config
 from logger.logger import Logger
-from langchain.llms import Ollama
+from ollama.ollama import Llama
 
 # logging stuff
 file = '.log/discord.log'
 msg = 'The discord bot has started'
 Logger.cfg(file, Config.set_loglvl())
 Logger.writter(msg)
-
-# Oollama 
-Logger.writter("config.get_ollama == " + Config.get_ollama()) #debuging for dummmmies
-ollamma = Ollama(base_url=str(Config.get_ollama()),model=Config.get_model()) 
-Logger.writter("attempted to connect to ollama - waht is error handling")
 
 if __name__ == "__main__" :
     token = Config.get_token()
@@ -29,7 +24,7 @@ if __name__ == "__main__" :
     async def on_message(message):
       if bot.user.mention in message.content.split():
          try:
-            msg = ollamma(message.content) #big brain llm messasges
+            msg = Llama.conn(message.content) #big brain llm messasges
             Logger.writter("ollama message length:" +  str(len(msg)) )
             await message.reply(msg)
          except discord.errors.HTTPException:
