@@ -12,4 +12,3 @@ class Config:
     def get_ollama():
         ollamaSrv = os.getenv("OLLAMA_URL")
         return ollamaSrv
-        #dumb comment
