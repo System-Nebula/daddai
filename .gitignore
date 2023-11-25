@@ -1,5 +1,6 @@
 .venv
 .env
 .log/discord.log
-config/__pycache__/*
-ollama/__pycache__/*
+config/__pycache__/
+ollama/__pycache__/
+commands/__pycache__/

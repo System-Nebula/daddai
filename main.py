@@ -1,3 +1,4 @@
+import asyncio
 import discord
 from discord.ext import commands
 from config.config import Config
@@ -10,15 +11,21 @@ msg = 'The discord bot has started'
 Logger.cfg(file, Config.set_loglvl())
 Logger.writter(msg)
 
+token = Config.get_token()
+itents = discord.Intents.default()
+itents.members = True
+itents.message_content = True
+initial_extensions = ['commands.general']
+bot = commands.Bot(command_prefix='?', description='Nebula AI interact with an LLM Model', intents=itents)
+
 if __name__ == "__main__" :
-    token = Config.get_token()
-    itents = discord.Intents.default()
-    itents.members = True
-    itents.message_content = True
-    bot = commands.Bot(command_prefix='?', description='Test', intents=itents)
+
     @bot.event
     async def on_ready():
        Logger.writter(f'Logged in as {bot.user} (ID: {bot.user.id})')
+       for extension in initial_extensions:
+        print("loading extensions")
+        await bot.load_extension(extension)
        
     @bot.event
     async def on_message(message):
@@ -32,4 +39,9 @@ if __name__ == "__main__" :
             await message.channel.typing()
             msg="I cant reply to that"
             await message.reply(msg)
-    bot.run(token)
+      await bot.process_commands(message)
+    async def main():
+      async with bot:
+         await bot.start(token)
+    asyncio.run(main())
+    

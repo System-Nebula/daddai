@@ -1,8 +1,9 @@
 from langchain.llms import Ollama
 from config.config import Config
 from logger.logger import Logger
-import os
 import requests
+import json
+
 class Llama:
     def conn(msg):
         try:
@@ -12,4 +13,12 @@ class Llama:
             return ollama(msg)
         except requests.exceptions.Connectionerror:
             Logger.writter(f'Unable to access the ollama server')
-            os.Exit(1)
+            Llama.conn(msg)
+
+    def list():
+        response = requests.get(Config.get_ollama() + '/api/tags')
+        models = response.json()
+        names = [model["name"] for model in models["models"]]
+#        r = json.dumps(models, indent=4, sort_keys=True)
+        return names
+
