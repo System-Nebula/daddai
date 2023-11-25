@@ -27,12 +27,10 @@ if __name__ == "__main__" :
             async with message.typing():
                msg = Llama.conn(message.content) #big brain llm messasges
                Logger.writter("ollama message length:" +  str(len(msg)) )
-               await asyncio.sleep(10)
             await message.reply(msg)
          except discord.errors.HTTPException:
             async with message.typing():
                msg="I cant reply to that"
-               await asyncio.sleep(10)
             await message.reply(msg)
     bot.run(token)
         
