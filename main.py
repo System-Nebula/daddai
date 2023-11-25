@@ -30,7 +30,7 @@ if __name__ == "__main__" :
             await message.reply(msg)
          except discord.errors.HTTPException:
                msg="I cant reply to that"
-               await message.typing():
+               await message.typing()
                await asyncio.sleep(10)
             await message.reply(msg)
     bot.run(token)
