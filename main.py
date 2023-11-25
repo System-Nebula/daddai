@@ -26,9 +26,9 @@ if __name__ == "__main__" :
          try:
             msg = Llama.conn(message.content) #big brain llm messasges
             Logger.writter("ollama message length:" +  str(len(msg)) )
-            await message.reply(msg)
+            await message.send(msg)
          except discord.errors.HTTPException:
             msg="I cant reply to that"
-            await message.reply(msg)
+            await message.send(msg)
     bot.run(token)
         
