@@ -9,6 +9,16 @@ In order to run the bot you need the following settings: </br>
 
 It is also needed to run ```pip3 install -r deps/requirements.txt```
 
+Another way to have the bot running could be by running the docker-compose file ``` docker-compose up -d ``` </br>
+Make sure you have a .env file in the current directory with the following structure </br>
+```
+DISCORD_TOKEN = YOUR_DISCORD_TOKEN
+level = debug
+OLLAMA_URL = http://ollama_host:ollama_port
+OLLAMA_MODEL = llm_model
+```
+To check if the container is running ``` docker-compose ps ``` </br>
+
 ### Repo workflow
 
 It would be good to work on a branch called dev </br>
