@@ -24,3 +24,7 @@ To check if the container is running ``` docker-compose ps ``` </br>
 It would be good to work on a branch called dev </br>
 When the work on the branch is done commit it to dev </br>
 The gh workflow will automatically create a PR
+
+### How to interact with the bot
+
+In order to interact with the bot you just have to mention it in your message @bot_name text
