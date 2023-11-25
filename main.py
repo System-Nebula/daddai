@@ -20,15 +20,17 @@ if __name__ == "__main__" :
     async def on_ready():
        Logger.writter(f'Logged in as {bot.user} (ID: {bot.user.id})')
        
-    @bot.event
+    @bot.command
     async def on_message(message):
       if bot.user.mention in message.content.split():
          try:
             msg = Llama.conn(message.content) #big brain llm messasges
             Logger.writter("ollama message length:" +  str(len(msg)) )
-            await message.send(msg)
+            await asyncio.sleep(10)
+            await message.reply(msg)
          except discord.errors.HTTPException:
             msg="I cant reply to that"
-            await message.send(msg)
+            await asyncio.sleep(10)
+            await message.reply(msg)
     bot.run(token)
         
