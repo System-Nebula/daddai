@@ -24,13 +24,14 @@ if __name__ == "__main__" :
     async def on_message(message):
       if bot.user.mention in message.content.split():
          try:
-            async with message.typing():
-               msg = Llama.conn(message.content) #big brain llm messasges
-               Logger.writter("ollama message length:" +  str(len(msg)) )
+            msg = Llama.conn(message.content) #big brain llm messasges
+            await message.typing()
+            Logger.writter("ollama message length:" +  str(len(msg)) )
             await message.reply(msg)
          except discord.errors.HTTPException:
-            async with message.typing():
                msg="I cant reply to that"
+               await message.typing():
+               await asyncio.sleep(10)
             await message.reply(msg)
     bot.run(token)
         
