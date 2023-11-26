@@ -12,10 +12,8 @@
 - [License](#license)
 
 ## Overview
+The bot connect to an ollama endpoint and queries said endpoint whenever it gets mentioned
 
-[Your Bot's Name] is a Discord bot that provides a fun and interactive experience for users. With a wide range of features, users can engage in exciting conversations, play games, and much more.
-
-[Add a brief description of your bot's unique features or any additional information that you want to include in the Overview section.]
 
 ## Installation
 
