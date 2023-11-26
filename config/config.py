@@ -1,4 +1,5 @@
 from dotenv import load_dotenv
+import discord
 import os
 
 class Config:
@@ -15,3 +16,11 @@ class Config:
     def get_model():
         model = os.getenv("OLLAMA_MODEL")
         return str(model)
+    def set_bot():
+        itents = discord.Intents.default()
+        itents.members = True
+        itents.message_content = True
+        return itents
+    def extensions():
+        initial_extensions = ['commands.general']
+        return initial_extensions

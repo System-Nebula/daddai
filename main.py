@@ -6,24 +6,15 @@ from logger.logger import Logger
 from ollama.ollama import Llama
 
 # logging stuff
-file = '.log/discord.log'
-msg = 'The discord bot has started'
-Logger.cfg(file, Config.set_loglvl())
-Logger.writter(msg)
-
-token = Config.get_token()
-itents = discord.Intents.default()
-itents.members = True
-itents.message_content = True
-initial_extensions = ['commands.general']
-bot = commands.Bot(command_prefix='?', description='Nebula AI interact with an LLM Model', intents=itents)
+Logger.cfg(Config.set_loglvl())
+bot = commands.Bot(command_prefix='?', description='Nebula AI interact with an LLM Model', intents=Config.set_bot())
 
 if __name__ == "__main__" :
 
     @bot.event
     async def on_ready():
        Logger.writter(f'Logged in as {bot.user} (ID: {bot.user.id})')
-       for extension in initial_extensions:
+       for extension in Config.extensions():
         print("loading extensions")
         await bot.load_extension(extension)
        
@@ -42,6 +33,5 @@ if __name__ == "__main__" :
       await bot.process_commands(message)
     async def main():
       async with bot:
-         await bot.start(token)
+         await bot.start(Config.get_token())
     asyncio.run(main())
-    
