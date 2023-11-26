@@ -1,4 +1,4 @@
-# [nebula.ai]
+# nebula.ai
 
 
 
