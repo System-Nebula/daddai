@@ -1,4 +1,25 @@
-# nebula.ai
+# [nebula.ai]
+
+
+
+[![Publish Docker image](https://github.com/System-Nebula/daddai/actions/workflows/imgBuilder.yaml/badge.svg?branch=main)](https://github.com/System-Nebula/daddai/actions/workflows/imgBuilder.yaml)
+## Table of Contents
+
+- [Overview](#overview)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Overview
+
+[Your Bot's Name] is a Discord bot that provides a fun and interactive experience for users. With a wide range of features, users can engage in exciting conversations, play games, and much more.
+
+[Add a brief description of your bot's unique features or any additional information that you want to include in the Overview section.]
+
+## Installation
+
+[Describe the installation process, including any dependencies that the user needs to install before running your bot. If your bot is available on PyPI, include a link to the PyPI page.]
 
 In order to run the bot you need the following settings: </br>
 - *.env* file that contains the following info :
