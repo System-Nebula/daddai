@@ -11,7 +11,7 @@ class Llama:
             Logger.writter(f'Connecting to {Config.get_ollama()} and using the model {Config.get_model()}')
             ollama(msg)
             return ollama(msg)
-        except requests.exceptions.Connectionerror:
+        except requests.exceptions.ConnectionError:
             Logger.writter(f'Unable to access the ollama server')
             Llama.conn(msg)
 

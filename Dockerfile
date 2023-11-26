@@ -1,4 +1,4 @@
-FROM python:3.9.18-slim AS compile-image
+FROM python:3.11.6-slim AS compile-image
 RUN apt-get update
 RUN apt-get install -y --no-install-recommends build-essential gcc
 RUN useradd -rm -d /bot -s /bin/sh bot
@@ -12,7 +12,7 @@ ENV PATH="/bot/venv/bin:$PATH"
 COPY deps/requirements.txt .
 RUN pip install -r requirements.txt
 
-FROM python:3.9.18-slim AS build-image
+FROM python:3.11.6-slim AS build-image
 RUN useradd -rm -d /bot -s /bin/sh bot
 USER bot
 COPY --chown=bot:root --from=compile-image /bot/venv /bot/venv
