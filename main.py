@@ -23,7 +23,7 @@ if __name__ == "__main__" :
       if bot.user.mention in message.content.split():
          try:
             await message.channel.typing()
-            msg = Llama.conn(message.content) #big brain llm messasges
+            msg = Llama.conn(message.content, Config.get_model()) #big brain llm messasges
             Logger.writter("ollama message length:" +  str(len(msg)) )
             await message.reply(msg)
          except discord.errors.HTTPException:

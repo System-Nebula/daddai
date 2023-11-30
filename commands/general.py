@@ -12,6 +12,14 @@ class General(commands.Cog):
       await ctx.reply(self.bot.latency)
 
     @commands.command()
+    async def query(self,ctx, model, q):
+      if model in Llama.list():
+        await ctx.reply(Llama.conn(q, model))
+      else:
+        Logger.writter("Invalid model")
+        await ctx.reply("Please select a valid model")
+
+    @commands.command()
     async def list(self, message):
       await message.channel.typing()
       msg = Llama.list()
