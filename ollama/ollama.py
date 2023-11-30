@@ -4,11 +4,11 @@ from logger.logger import Logger
 import requests
 import json
 
+ollama = Ollama(base_url=str(Config.get_ollama()),model=Config.get_model()) 
 class Llama:
-    def conn(msg):
+    def conn(msg, model):
         try:
-            ollama = Ollama(base_url=str(Config.get_ollama()),model=Config.get_model()) 
-            Logger.writter(f'Connecting to {Config.get_ollama()} and using the model {Config.get_model()}')
+            Logger.writter(f'Connecting to {Config.get_ollama()} and using the model {model}')
             ollama(msg)
             return ollama(msg)
         except requests.exceptions.ConnectionError:
@@ -19,6 +19,5 @@ class Llama:
         response = requests.get(Config.get_ollama() + '/api/tags')
         models = response.json()
         names = [model["name"] for model in models["models"]]
-#        r = json.dumps(models, indent=4, sort_keys=True)
         return names
 
