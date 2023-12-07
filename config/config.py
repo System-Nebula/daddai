@@ -4,23 +4,30 @@ import os
 
 class Config:
     load_dotenv()
+    
+    @staticmethod
     def get_token():
-        TOKEN = os.getenv("DISCORD_TOKEN")
-        return TOKEN
+        return os.getenv("DISCORD_TOKEN")
+    
+    @staticmethod
     def set_loglvl():
-        level = os.getenv("level")
-        return level
+        return os.getenv("level")
+    
+    @staticmethod
     def get_ollama():
-        ollamaSrv = os.getenv("OLLAMA_URL")
-        return ollamaSrv
+        return os.getenv("OLLAMA_URL")
+    
+    @staticmethod
     def get_model():
-        model = os.getenv("OLLAMA_MODEL")
-        return str(model)
+        return str(os.getenv("OLLAMA_MODEL"))
+    
+    @staticmethod
     def set_bot():
-        itents = discord.Intents.default()
-        itents.members = True
-        itents.message_content = True
-        return itents
+        intents = discord.Intents.default()
+        intents.members = True
+        intents.message_content = True
+        return intents
+    
+    @staticmethod
     def extensions():
-        initial_extensions = ['commands.general']
-        return initial_extensions
+        return ['commands.general']
