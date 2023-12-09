@@ -20,6 +20,12 @@ class Config:
     @staticmethod
     def get_model():
         return str(os.getenv("OLLAMA_MODEL"))
+    @staticmethod
+    def get_hf():
+        return os.getenv("HUGGINFACEHUB_API_TOKEN")
+    @staticmethod
+    def get_redis():
+        return os.getenv("REDIS_URL")
     
     @staticmethod
     def set_bot():
