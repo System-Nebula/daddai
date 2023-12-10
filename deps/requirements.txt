@@ -6,3 +6,7 @@ transformers
 redis
 sqlalchemy
 tensorrt
+llama-cpp-python
+sentencepiece
+protobuf
+torch

@@ -22,12 +22,12 @@ if __name__ == "__main__":
         if bot.user.mention in message.content.split():
             async with message.channel.typing():
                 try:
-                    msg = Model.modCon(message) + " testing by Frankie"
+                    msg = Model.modCon(message.content) 
                     #msg = Llama.conn(message.content, Config.get_model())
                     Logger.writter(f'ollama message length:{len(msg)}')
                 except discord.errors.HTTPException:
                     msg = "I can't reply to that"
-                await message.reply(msg)
+                await message.reply(msg.replace(str(bot.user.id), ''))
         await bot.process_commands(message)
 
     async def main():
