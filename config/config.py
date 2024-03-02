@@ -4,36 +4,23 @@ import os
 
 class Config:
     load_dotenv()
-    
-    @staticmethod
     def get_token():
-        return os.getenv("DISCORD_TOKEN")
-    
-    @staticmethod
+        TOKEN = os.getenv("DISCORD_TOKEN")
+        return TOKEN
     def set_loglvl():
-        return os.getenv("level")
-    
-    @staticmethod
+        level = os.getenv("level")
+        return level
     def get_ollama():
-        return os.getenv("OLLAMA_URL")
-    
-    @staticmethod
+        ollamaSrv = os.getenv("OLLAMA_URL")
+        return ollamaSrv
     def get_model():
-        return str(os.getenv("OLLAMA_MODEL"))
-    @staticmethod
-    def get_hf():
-        return os.getenv("HUGGINFACEHUB_API_TOKEN")
-    @staticmethod
-    def get_redis():
-        return os.getenv("REDIS_URL")
-    
-    @staticmethod
+        model = os.getenv("OLLAMA_MODEL")
+        return str(model)
     def set_bot():
-        intents = discord.Intents.default()
-        intents.members = True
-        intents.message_content = True
-        return intents
-    
-    @staticmethod
+        itents = discord.Intents.default()
+        itents.members = True
+        itents.message_content = True
+        return itents
     def extensions():
-        return ['commands.general']
+        initial_extensions = ['commands.general']
+        return initial_extensions

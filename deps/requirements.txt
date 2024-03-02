@@ -1,12 +1,3 @@
 discord
 python-dotenv
 langchain
-huggingface_hub
-transformers
-redis
-sqlalchemy
-tensorrt
-llama-cpp-python
-sentencepiece
-protobuf
-torch
