@@ -3,7 +3,11 @@ import discord
 from discord.ext import commands
 from config.config import Config
 from logger.logger import Logger
-from ollama.ollama import Llama
+from PIL import Image
+import ollama
+import requests
+import base64
+import shutil
 
 # logging stuff
 Logger.cfg(Config.set_loglvl())
@@ -22,11 +26,38 @@ if __name__ == "__main__" :
     async def on_message(message):
       if bot.user.mention in message.content.split():
          try:
-            await message.channel.typing()
-            msg = Llama.conn(message.content, Config.get_model()) #big brain llm messasges
-            Logger.writter("ollama message length:" +  str(len(msg)) )
-            await message.reply(msg)
-         except discord.errors.HTTPException:
+            await message.channel.typing() #I like this feature 
+            if "image" in message.attachments[0].content_type:
+              Logger.writter(f'url is {message.attachments[0].url}')
+              response = requests.get(message.attachments[0].url, stream=True) # download img??
+              MAGIC_STATIC_VAR = "insert_fn.png"
+              leprompt = message.content
+              with open(MAGIC_STATIC_VAR, 'wb')  as out_file:
+                shutil.copyfileobj(response.raw, out_file)
+
+              del response
+              
+              img = Image.open(MAGIC_STATIC_VAR).convert("RGB")
+              img.save(MAGIC_STATIC_VAR, "png")
+
+              with open(MAGIC_STATIC_VAR, 'rb') as file:
+                response = ollama.chat(
+                  model='llava',
+                  messages=[
+                    {
+                      'role': 'user',
+                      'content': leprompt,
+                      'images': [file.read()],
+                    },
+                  ],
+                )
+                await message.reply(response['message']['content'])
+                print(response['message']['content'])    
+            else: 
+                msg = Llama.conn(message.content, Config.get_model()) #big brain llm messages
+                Logger.writter("ollama message length:" +  str(len(msg)) )
+                await message.reply(msg)
+         except discord.errors.HTTPException: #EXCEPTIONSSSSSS
             await message.channel.typing()
             msg="I cant reply to that"
             await message.reply(msg)
@@ -35,3 +66,4 @@ if __name__ == "__main__" :
       async with bot:
          await bot.start(Config.get_token())
     asyncio.run(main())
+
