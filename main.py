@@ -66,3 +66,4 @@ if __name__ == "__main__" :
       async with bot:
          await bot.start(Config.get_token())
     asyncio.run(main())
+
