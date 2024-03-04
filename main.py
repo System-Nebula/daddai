@@ -4,14 +4,15 @@ from discord.ext import commands
 from config.config import Config
 from logger.logger import Logger
 from PIL import Image
-import ollama
+from ollama_custom.ollama import Llama
 import requests
 import base64
 import shutil
-
+# This is going to fail somewhere else
 # logging stuff
 Logger.cfg(Config.set_loglvl())
 bot = commands.Bot(command_prefix='?', description='Nebula AI interact with an LLM Model', intents=Config.set_bot())
+
 
 if __name__ == "__main__" :
 
@@ -27,36 +28,15 @@ if __name__ == "__main__" :
       if bot.user.mention in message.content.split():
          try:
             await message.channel.typing() #I like this feature 
-            if "image" in message.attachments[0].content_type:
-              Logger.writter(f'url is {message.attachments[0].url}')
-              response = requests.get(message.attachments[0].url, stream=True) # download img??
-              MAGIC_STATIC_VAR = "insert_fn.png"
-              leprompt = message.content
-              with open(MAGIC_STATIC_VAR, 'wb')  as out_file:
-                shutil.copyfileobj(response.raw, out_file)
-
-              del response
-              
-              img = Image.open(MAGIC_STATIC_VAR).convert("RGB")
-              img.save(MAGIC_STATIC_VAR, "png")
-
-              with open(MAGIC_STATIC_VAR, 'rb') as file:
-                response = ollama.chat(
-                  model='llava',
-                  messages=[
-                    {
-                      'role': 'user',
-                      'content': leprompt,
-                      'images': [file.read()],
-                    },
-                  ],
-                )
-                await message.reply(response['message']['content'])
-                print(response['message']['content'])    
+            if not message.attachments:
+               msg = Llama.conn(message.content, Config.get_model()) #big brain llm messages
+               Logger.writter("ollama message length:" +  str(len(msg)) )
+               await message.reply(msg)
+            elif "image" in message.attachments[0].content_type:
+                  reply = Llama.imgPrompt(message.content, message.attachments[0])
+                  await message.reply(reply)
             else: 
-                msg = Llama.conn(message.content, Config.get_model()) #big brain llm messages
-                Logger.writter("ollama message length:" +  str(len(msg)) )
-                await message.reply(msg)
+               pass
          except discord.errors.HTTPException: #EXCEPTIONSSSSSS
             await message.channel.typing()
             msg="I cant reply to that"
@@ -66,4 +46,3 @@ if __name__ == "__main__" :
       async with bot:
          await bot.start(Config.get_token())
     asyncio.run(main())
-
