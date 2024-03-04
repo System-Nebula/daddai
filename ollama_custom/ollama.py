@@ -13,27 +13,7 @@ import shutil
 
 set_debug(True)
 #ollama = Ollama(base_url=str(Config.get_ollama()),model=Config.get_model()) 
-class Llama:
-    def conn(msg, model, **kwargs):
-        ollama = Ollama(base_url=str(Config.get_ollama()),model=model) 
-        if model == Config.get_model():
-            try:
-                Logger.writter(f'Connecting to {Config.get_ollama()} and using the model {model}')
-                ollama(msg)
-                return ollama(msg) #main.py "i cant reply to that"
-            except requests.exceptions.ConnectionError:
-                Logger.writter(f'Unable to access the ollama server')
-                Llama.conn(msg)
-        if model == "llava:latest":
-            img = kwargs['img'] 
-            #img = kwargs.items()[0]
-            Logger.writter(f'Connecting to llava using {img} with ctx {msg}') # just easier to debug later
-            
-            print(img)
-
-            ollama.bind(images=[img]) 
-            return ollama.invoke(re.sub(r'<(.*?)>', '', msg))
-    
+class Llama: 
     def promptGen(msg, model):
         Logger.writter(f'Using {Config.get_model()} to generate response')
         aimodel = Config.get_model()
