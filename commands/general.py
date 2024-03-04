@@ -14,7 +14,7 @@ class General(commands.Cog):
     @commands.command()
     async def query(self,ctx, model, q):
       if model in Llama.list():
-        await ctx.reply(Llama.conn(q, model))
+        await ctx.reply(Llama.promptGen(q, model))
       else:
         Logger.writter("Invalid model")
         await ctx.reply("Please select a valid model")
