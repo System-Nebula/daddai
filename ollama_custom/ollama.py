@@ -39,19 +39,10 @@ class Llama:
             img.save(MAGIC_STATIC_VAR, "png")
 
             with open(MAGIC_STATIC_VAR, 'rb') as file:
-                response = ollama.chat(
-                  model='llava',
-                  messages=[
-                    {
-                      'role': 'user',
-                      'content': leprompt,
-                      'images': [file.read()],
-                    },
-                  ],
-                )
-        resp = response['message']['content']
+                messages={'role': 'user','content': leprompt,'images': [file.read()]}
+                resp = await AsyncClient().chat("llava", messages=[messages])
         Logger.writter("The response from the ollama ep is ~> {resp}")
-        return response['message']['content']
+        return resp['message']['content']
 
     def list():
         response = requests.get(Config.get_ollama() + '/api/tags')
