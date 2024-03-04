@@ -1,5 +1,3 @@
-from langchain.llms import Ollama
-from langchain.globals import set_debug
 from config.config import Config
 from logger.logger import Logger
 from PIL import Image
