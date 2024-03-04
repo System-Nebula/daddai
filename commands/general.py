@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-from ollama.ollama import Llama
+from ollama_custom.ollama import Llama
 from logger.logger import Logger
 
 class General(commands.Cog):
