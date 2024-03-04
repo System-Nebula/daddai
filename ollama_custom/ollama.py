@@ -1,36 +1,30 @@
 from config.config import Config
 from logger.logger import Logger
 from PIL import Image
+from ollama import AsyncClient
 
 import re
 import requests
 import json
 import ollama
 import shutil
+import asyncio
 
 
-set_debug(True)
+#set_debug(True)
 #ollama = Ollama(base_url=str(Config.get_ollama()),model=Config.get_model()) 
 class Llama: 
-    def promptGen(msg, model):
+    async def promptGen(msg, model):
         Logger.writter(f'Using {Config.get_model()} to generate response')
         aimodel = Config.get_model()
-        response = ollama.chat(
-        model=aimodel,
-        messages=[
-             {
-               'role': 'user',
-               'content': re.sub(r'<(.*?)>', '', msg)
-             },
-           ],
-         )
+        messages= {'role': 'user', 'content': re.sub(r'<(.*?)>', '', msg)}
 
+        resp = await AsyncClient().chat(model, messages=[messages])
 
-        resp = response['message']['content']
         Logger.writter("The response from the ollama ep is ~> {resp}")
-        return response['message']['content']
+        return resp['message']['content']
                       
-    def imgPrompt(msg, url):
+    async def imgPrompt(msg, url):
         Logger.writter(f'url is {url}')
         response = requests.get(url, stream=True)
         MAGIC_STATIC_VAR = "insert_fn.png"
