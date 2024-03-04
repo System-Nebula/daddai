@@ -29,7 +29,7 @@ if __name__ == "__main__" :
          try:
             await message.channel.typing() #I like this feature 
             if not message.attachments:
-               msg = Llama.conn(message.content, Config.get_model()) #big brain llm messages
+               msg = Llama.promptGen(message.content, Config.get_model()) #big brain llm messages
                Logger.writter("ollama message length:" +  str(len(msg)) )
                await message.reply(msg)
             elif "image" in message.attachments[0].content_type:
