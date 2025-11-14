@@ -579,7 +579,9 @@ class RAGPipeline:
         if doc_id or doc_filename:
             system_prompt = """You are an expert document analyst. Your task is to answer questions using ONLY the provided document content. 
 You must base your answer entirely on the document. Do not use general knowledge or information from other sources.
-Be precise, cite specific parts of the document when possible, and clearly state when information is not available in the document."""
+Be precise, cite specific parts of the document when possible, and clearly state when information is not available in the document.
+CRITICAL: START DIRECTLY WITH THE ANSWER - NO GREETINGS, NO 'Hey there', NO 'I'm not sure', NO CONVERSATIONAL INTRO!
+Your first sentence should be the answer or first fact, NOT a greeting!"""
             
             user_prompt = f"""Analyze the following document to answer the user's question.
 
@@ -596,8 +598,9 @@ Instructions:
 - If asking for comparisons, identify and present relevant comparisons
 - Be specific and cite document sections when possible
 - If the document doesn't contain enough information, clearly state what IS available
+- START WITH THE ANSWER, NOT A GREETING - Your first sentence should be the answer or first fact!
 
-Answer based on the document:"""
+Answer based on the document (START WITH THE ANSWER, NOT A GREETING):"""
         
         else:
             # Build document list for prompt (used in all question types)
@@ -613,25 +616,29 @@ Answer based on the document:"""
             if question_type == 'factual':
                 system_prompt = """You are a precise information assistant. Answer factual questions accurately using the provided context.
 Focus on extracting specific facts, numbers, names, dates, and concrete information. Be concise and direct.
-NEVER mention documents that aren't explicitly listed in the available documents."""
+NEVER mention documents that aren't explicitly listed in the available documents.
+CRITICAL: START DIRECTLY WITH THE ANSWER - NO GREETINGS, NO 'Hey there', NO 'I'm not sure', NO CONVERSATIONAL INTRO!
+Your first sentence should be the answer or first fact, NOT a greeting!"""
                 
                 user_prompt = f"""Context:
 {context}{doc_list_text}{anti_hallucination_note}
 
 Question: {safe_question}{entity_context}
 
-Provide a factual, direct answer based on the context:"""
+Provide a factual, direct answer based on the context. START WITH THE ANSWER, NOT A GREETING:"""
             
             elif question_type == 'analytical':
                 system_prompt = """You are an analytical assistant. Analyze the provided context to answer analytical questions.
-Provide insights, explanations, and reasoning based on the information available. Connect ideas and identify patterns."""
+Provide insights, explanations, and reasoning based on the information available. Connect ideas and identify patterns.
+CRITICAL: START DIRECTLY WITH THE ANSWER - NO GREETINGS, NO 'Hey there', NO 'I'm not sure', NO CONVERSATIONAL INTRO!
+Your first sentence should be the answer or first insight, NOT a greeting!"""
                 
                 user_prompt = f"""Context:
 {context}{doc_list_text}{anti_hallucination_note}
 
 Question: {safe_question}{entity_context}
 
-Analyze the context and provide a thoughtful answer with reasoning:"""
+Analyze the context and provide a thoughtful answer with reasoning. START WITH THE ANSWER, NOT A GREETING:"""
             
             elif question_type == 'comparative':
                 system_prompt = """You are a comparison expert. Compare and contrast information from the context to answer comparative questions.
