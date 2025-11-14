@@ -1,0 +1,6 @@
+# Ensure sensitive files are not tracked
+.env linguist-generated=true
+.env.local linguist-generated=true
+discord-bot/data/config.json linguist-generated=true
+llm_tools_storage.json linguist-generated=true
+

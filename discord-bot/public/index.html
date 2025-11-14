@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GopherBot Dashboard</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header-content">
+                <h1><span class="code-symbol">&lt;</span>GopherBot<span class="code-symbol">/&gt;</span> Dashboard</h1>
+                <p class="subtitle">// View memories and documents</p>
+            </div>
+            <div class="header-stats" id="headerStats">
+                <div class="stat">
+                    <span class="stat-value" id="totalMemories">-</span>
+                    <span class="stat-label">Memories</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-value" id="totalChannels">-</span>
+                    <span class="stat-label">Channels</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-value" id="totalDocuments">-</span>
+                    <span class="stat-label">Documents</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Tabs -->
+        <div class="tabs">
+            <button class="tab-button active" onclick="switchTab('memories')">Memories</button>
+            <button class="tab-button" onclick="switchTab('documents')">Documents</button>
+        </div>
+
+        <!-- Memories Tab -->
+        <div id="memoriesTab" class="tab-content active">
+            <div class="controls">
+                <div class="filter-group">
+                    <input type="text" id="searchInput" placeholder="// Search memories..." class="code-input" />
+                    <select id="channelFilter" class="code-select">
+                        <option value="">All Channels</option>
+                    </select>
+                    <select id="typeFilter" class="code-select">
+                        <option value="">All Types</option>
+                        <option value="conversation">Conversation</option>
+                        <option value="bot_response">Bot Response</option>
+                        <option value="fact">Fact</option>
+                        <option value="preference">Preference</option>
+                    </select>
+                    <button onclick="refreshMemories()" class="btn-primary">Refresh</button>
+                </div>
+            </div>
+
+            <div class="memories-container">
+                <div id="memoriesList" class="memories-list">
+                    <div class="loading">
+                        <span class="code-comment">// Loading memories...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Documents Tab -->
+        <div id="documentsTab" class="tab-content">
+            <div class="controls">
+                <div class="filter-group">
+                    <input type="text" id="documentSearchInput" placeholder="// Search documents..." class="code-input" />
+                    <button onclick="refreshDocuments()" class="btn-primary">Refresh</button>
+                </div>
+            </div>
+
+            <div class="documents-container">
+                <div id="documentsList" class="documents-list">
+                    <div class="loading">
+                        <span class="code-comment">// Loading documents...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

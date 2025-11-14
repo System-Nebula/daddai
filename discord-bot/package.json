@@ -1,0 +1,26 @@
+{
+  "name": "discord-rag-bot",
+  "version": "1.0.0",
+  "description": "Discord bot with RAG capabilities and conversation memory",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "deploy": "node src/commands/deploy.js"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "rag",
+    "ai"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.13.2",
+    "discord.js": "^14.24.2",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "winston": "^3.11.0"
+  }
+}

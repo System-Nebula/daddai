@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+documents/
+*.pdf
+*.docx
+*.doc
+*.log
+
+# Neo4j data (if stored locally)
+neo4j_data/
+data/
+
+# Tool storage
+llm_tools_storage.json
+
+# Discord bot specific
+discord-bot/logs/
+discord-bot/node_modules/
+discord-bot/temp/
+discord-bot/data/config.json
+discord-bot/data/conversations/
+discord-bot/.env
+discord-bot/.env.local
+
+# Cache
+.cache/
+*.cache
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+temp/
+tmp/
+*.tmp
