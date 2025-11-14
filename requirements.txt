@@ -10,3 +10,7 @@ tenacity>=8.2.0
 # State-of-the-art RAG components
 # Cross-encoder reranking is included in sentence-transformers
 # No additional dependencies needed for multi-query, evaluation, monitoring, A/B testing
+
+# Elasticsearch (optional - for hybrid search)
+# Must match your Elasticsearch server version (8.x client for 8.x server)
+elasticsearch>=8.0.0,<9.0.0

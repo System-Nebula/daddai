@@ -490,15 +490,29 @@ async function handleDocumentUpload(message) {
     const attachment = message.attachments.first();
     const userId = message.author.id;
     
-    // Check file type
-    const allowedExtensions = ['.pdf', '.docx', '.doc', '.txt', '.md', '.log', '.csv', '.json', '.ipynb'];
+    // Check file type - includes Docling-supported formats and text-based formats
+    const allowedExtensions = [
+        // Docling-supported formats
+        '.pdf', '.docx', '.doc', '.pptx', '.ppt', '.html', '.htm', '.adoc', '.asciidoc',
+        // Text-based formats (readable as text)
+        '.txt', '.md', '.markdown', '.livemd', '.mixr', '.rst', '.org', '.wiki',
+        // Data formats
+        '.log', '.csv', '.json', '.ipynb', '.yaml', '.yml', '.toml', '.xml',
+        // Code files (text-based)
+        '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.cpp', '.c', '.h', '.hpp',
+        '.cs', '.go', '.rs', '.rb', '.php', '.swift', '.kt', '.scala', '.r',
+        '.sh', '.bash', '.zsh', '.ps1', '.bat', '.cmd', '.sql', '.pl', '.lua',
+        // Config and other text formats
+        '.ini', '.cfg', '.conf', '.config', '.env', '.properties', '.gitignore',
+        '.dockerfile', '.makefile', '.cmake', '.gradle', '.maven', '.sbt'
+    ];
     const path = require('path');
     const fileExtension = path.extname(attachment.name).toLowerCase();
     
     if (!allowedExtensions.includes(fileExtension)) {
         await message.react('❌');
         await message.reply({
-            content: `❌ Unsupported file type. Supported: ${allowedExtensions.join(', ')}`,
+            content: `❌ Unsupported file type. Supported formats include: PDF, DOCX, PPTX, HTML, Markdown, text files, code files, and more. See /upload help for full list.`,
             allowedMentions: { repliedUser: false }
         });
         return;
@@ -582,17 +596,43 @@ async function handleDocumentUpload(message) {
 function needsRAG(question) {
     const lowerQuestion = question.toLowerCase();
     
-    // EXCLUDE: User fact questions that should use memory, not RAG
+    // Check for state queries about OTHER users (with mentions) - these need RAG for state query handler
+    const hasUserMention = /<@!?\d+>/.test(question);
+    const isStateQueryAboutOther = hasUserMention && /(?:how many|how much|what).*(?:gold|coins?|inventory|items?|balance).*(?:does|do|has|have|owns)/i.test(question);
+    
+    // If query has mentions, route through RAG so LLM can detect actions, state queries, etc.
+    // The LLM will determine if it's an action, state query, or something else
+    if (hasUserMention && !isStateQueryAboutOther) {
+        // Check if it's clearly a self-query (should use memory)
+        const isSelfQuery = /(?:how many|how much|what).*(?:do i|have i|do you know).*(?:gold|coins?|inventory|items?)/i.test(question);
+        if (!isSelfQuery) {
+            // Has mention but not clearly a self-query - let LLM decide (could be action, state query about other, etc.)
+            return true;
+        }
+    }
+    
+    // EXCLUDE: User fact questions about SELF that should use memory, not RAG
+    // NOTE: Action commands will be detected by LLM in RAG pipeline, not by patterns here
     const userFactPatterns = [
-        /(?:how many|how much|what do i have|what's in my|my inventory|my coins|my gold|i have|i own|i gave|i gave|i'm going|i'm leaving)/i,
+        /(?:what do i have|what's in my|my inventory|my coins|my gold|i have|i own|i gave|i'm going|i'm leaving)/i,
         /(?:inventory|coins?|gold|pieces?|apples?|items?|things?)\s+(?:do i have|in my|i have|i own)/i,
-        /(?:i've given|i gave|i'm giving|i'm going to give)/i,
-        /(?:how many|how much)\s+(?:do i|does|have i|do you know)/i
+        /(?:i've given|i gave|i'm going to give)/i,
+        // State queries about SELF (no mention) - use memory
+        /(?:how many|how much)\s+(?:do i|have i|do you know).*(?:gold|coins?|inventory|items?)/i,
+        // State setting commands
+        /(?:keep track|remember|set).*(?:me|i|my).*(?:having|with|of).*\d+.*(?:gold|coins?|pieces?)/i,
+        /(?:i have|i own|i'm|i am).*\d+.*(?:gold|coins?|pieces?)/i,
+        /(?:set|update|change).*(?:my|me|i).*(?:gold|coins?).*to.*\d+/i,
     ];
+    
+    // If it's a state query about another user, use RAG (state query handler will process it)
+    if (isStateQueryAboutOther) {
+        return true; // Use RAG for state queries about other users
+    }
     
     for (const pattern of userFactPatterns) {
         if (pattern.test(question)) {
-            return false; // Use memory, not RAG
+            return false; // Use memory, not RAG (for self-queries)
         }
     }
     
@@ -652,7 +692,13 @@ function needsRAG(question) {
         // Casual conversation
         /^(how are you|how's it going|what's up|sup|wassup|howdy)[\s!.,]*$/i,
         /^(thanks|thank you|thx|ty|bye|goodbye|see ya|cya|ok|okay|yes|no|yep|nope|sure|alright)[\s!.,]*$/i,
-        /^(lol|haha|hehe|rofl|lmao|nice|cool|awesome|great)[\s!.,]*$/i
+        /^(lol|haha|hehe|rofl|lmao|nice|cool|awesome|great)[\s!.,]*$/i,
+        // Short casual responses
+        /^(just|yeah|yep|nope|sure|ok|okay|alright|fine|good|nice|cool|awesome|great)[\s!.,]*$/i,
+        /^(just|yeah|yep|nope|sure|ok|okay|alright|fine|good|nice|cool|awesome|great)\s+(felt|feeling|wanted|want|thought|think|decided|decide|tried|try)[\s!.,]*$/i,
+        /^(just|yeah|yep|nope|sure|ok|okay|alright|fine|good|nice|cool|awesome|great)\s+.*(?:really|though|anyway|anyways|so|then)[\s!.,]*$/i,
+        // Very short responses (likely casual)
+        /^.{1,30}$/i  // Very short messages are likely casual
     ];
     
     for (const pattern of casualPatterns) {
@@ -714,8 +760,15 @@ async function handleQuestion(message) {
         
         // Check for special "list all documents" or "summarize all documents" queries
         const lowerQuestion = cleanedQuestion.toLowerCase();
-        const isListAllDocsQuery = /(?:list|show|summarize|what|which).*(?:all|each|every).*(?:document|file|doc)/i.test(cleanedQuestion) ||
-                                   /(?:document|file|doc).*(?:available|have|you have|stored)/i.test(cleanedQuestion);
+        // Distinguish between "list" (simple list) and "summarize" (detailed summaries)
+        const isSummarizeQuery = /(?:summarize|summary|summaries|brief|overview|describe).*(?:all|each|every|the).*(?:document|file|doc)/i.test(cleanedQuestion) ||
+                                 /(?:document|file|doc).*(?:summarize|summary|summaries|brief|overview|describe)/i.test(cleanedQuestion);
+        // Only match if explicitly asking for "all", "each", or "every" documents
+        // Don't match questions about specific documents like "what model is the kohya document training?"
+        const isListAllDocsQuery = /(?:list|show|what|which).*(?:all|each|every)\s+(?:document|file|doc)/i.test(cleanedQuestion) ||
+                                   /(?:list|show)\s+(?:all|each|every)\s+(?:document|file|doc)/i.test(cleanedQuestion) ||
+                                   /(?:what|which)\s+(?:document|file|doc)/i.test(cleanedQuestion) && /(?:all|each|every|available|have|you have|stored|do you have)/i.test(cleanedQuestion) ||
+                                   /(?:document|file|doc).*(?:available|have|you have|stored|do you have)/i.test(cleanedQuestion);
         
         // Detect if user is asking about a specific document
         let targetDocId = null;
@@ -1031,11 +1084,18 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
         if (!targetDocId && !targetDocFilename && !isListAllDocsQuery && !isCompareDocs && !isCompareMultipleDocs) {
             try {
                 // First, try to extract explicit document name/keywords from question
-                // Look for patterns like "in [document name]", "from [document name]", etc.
+                // Look for patterns like "in [document name]", "from [document name]", "summarize the [name]", etc.
                 const docNamePatterns = [
+                    /(?:summarize|summary|summaries|brief|overview|describe|explain|tell me about)\s+(?:the|a|an)?\s*([a-z0-9\s\-]+?)(?:\s+(?:report|study|analysis|document|paper|guide|manual|handbook|file|doc|logs?))?$/i,
                     /(?:in|from|about|according to|based on|in the)\s+([a-z0-9\s\-]+?)\s+(?:report|study|analysis|document|paper|guide|manual|handbook)/i,
                     /(?:the|a|an)\s+([a-z0-9\s\-]+?)\s+(?:report|study|analysis|document|paper|guide|manual|handbook)/i,
-                    /([a-z0-9\s\-]+?)\s+(?:report|study|analysis|document|paper|guide|manual|handbook)/i
+                    /([a-z0-9\s\-]+?)\s+(?:report|study|analysis|document|paper|guide|manual|handbook)/i,
+                    // Pattern for questions like "what model is the kohya document training?"
+                    /(?:what|which|who|when|where|how).*?(?:the|a|an)?\s*([a-z0-9\s\-]+?)\s+(?:document|file|doc|report|study|analysis|paper|guide|manual|handbook|logs?)/i,
+                    // Pattern for questions like "what model is kohya training?" (name before verb)
+                    /(?:what|which|who|when|where|how).*?(?:is|are|was|were|does|do|did|has|have|had)\s+([a-z0-9\s\-]+?)\s+(?:training|using|running|doing|working|processing|analyzing|generating|creating|building|compiling|executing|performing|doing|saying|showing|containing|mentioning)/i,
+                    // Pattern for questions like "what model is kohya training?" where name comes before the verb
+                    /(?:what|which|who|when|where|how)\s+[\w\s]+\s+(?:is|are|was|were|does|do|did|has|have|had)\s+([a-z0-9\s\-]+?)\s+\?/i
                 ];
                 
                 let detectedDocName = null;
@@ -1071,12 +1131,16 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
                             }).filter(item => item.score > 0)
                               .sort((a, b) => b.score - a.score);
                             
-                            if (scoredDocs.length > 0 && scoredDocs[0].score >= 2) {
-                                // Found a document with at least 2 matching terms
+                            if (scoredDocs.length > 0 && scoredDocs[0].score >= 1) {
+                                // Found a document with at least 1 matching term (lowered threshold for partial matches like "kohya")
                                 targetDocId = scoredDocs[0].doc.id;
                                 targetDocFilename = scoredDocs[0].doc.file_name;
                                 console.log(`✅ Found matching document by name: "${targetDocFilename}" (ID: ${targetDocId}, score: ${scoredDocs[0].score})`);
                                 foundByName = true;
+                                // If it's a summarize query and we found a specific document, mark it as single doc summarize
+                                if (isSummarizeQuery && !isSummarizeSingleDoc) {
+                                    isSummarizeSingleDoc = true;
+                                }
                                 break;
                             }
                         }
@@ -1109,6 +1173,11 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
                             targetDocFilename = relevantDocs[0].file_name;
                             console.log(`✅ Found relevant document by semantic search: "${targetDocFilename}" (ID: ${targetDocId}, score: ${relevantDocs[0].score.toFixed(3)})`);
                             
+                            // If it's a summarize query and we found a specific document, mark it as single doc summarize
+                            if (isSummarizeQuery && !isSummarizeSingleDoc) {
+                                isSummarizeSingleDoc = true;
+                            }
+                            
                             // If multiple relevant documents found, log them for transparency
                             if (relevantDocs.length > 1) {
                                 console.log(`   Also found ${relevantDocs.length - 1} other relevant document(s):`);
@@ -1118,6 +1187,11 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
                             }
                         } else {
                             console.log(`⚠️ Semantic search found documents but none met minimum relevance threshold (0.3)`);
+                            // If it's a summarize query but no specific document found, only summarize all if explicitly requested
+                            if (isSummarizeQuery && !/(?:all|each|every)\s+(?:document|file|doc)/i.test(cleanedQuestion)) {
+                                // User asked to summarize but didn't specify "all", so don't summarize all documents
+                                console.log(`⚠️ Summarize query detected but no specific document found and user didn't request "all documents"`);
+                            }
                         }
                     } catch (error) {
                         console.error('Error in semantic document search:', error);
@@ -1276,12 +1350,15 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
         
         // Determine if we need RAG or simple chat (use cleaned question for detection)
         console.log(`🔍 Response check: response=${response ? 'SET' : 'NOT SET'}, isCompareMultipleDocs=${isCompareMultipleDocs}, isCompareDocs=${isCompareDocs}`);
-        // IMPORTANT: Don't overwrite response if it's already set (e.g., from comparison)
-        if (!response && needsRAG(cleanedQuestion)) {
+        // IMPORTANT: Don't overwrite response if it's already set (e.g., from comparison or single doc summarize)
+        // Use original question (with mentions) for needsRAG to detect state queries about other users
+        if (!response && needsRAG(question)) {
             useRAG = true;
             
-            // Special handling for "list all documents" queries
-            if (isListAllDocsQuery) {
+            // Special handling for document listing/summarization queries
+            // IMPORTANT: Only summarize all documents if user explicitly asked for "all documents"
+            // If a specific document was found (targetDocId), skip the "summarize all" logic
+            if (isListAllDocsQuery || (isSummarizeQuery && !targetDocId && !isSummarizeSingleDoc)) {
                 try {
                     // Get all documents first
                     const allDocs = await documentService.getAllDocuments();
@@ -1295,8 +1372,8 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
                             source_documents: [],
                             source_memories: []
                         };
-                    } else {
-                        // Summarize each document by getting its chunks directly
+                    } else if (isSummarizeQuery) {
+                        // User explicitly asked for summaries - generate them
                         const summaries = [];
                         for (const doc of documents.slice(0, 10)) { // Limit to 10 docs to avoid timeout
                             try {
@@ -1344,6 +1421,21 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
                             source_documents: documents.map(d => d.file_name),
                             source_memories: []
                         };
+                    } else {
+                        // Simple list query - just return the document names
+                        const docList = documents.map((doc, index) => {
+                            const uploadedBy = doc.uploaded_by ? `<@${doc.uploaded_by}>` : 'Unknown';
+                            const date = doc.uploaded_at ? new Date(doc.uploaded_at).toLocaleDateString() : 'Unknown';
+                            return `${index + 1}. **${doc.file_name}**\n   📊 ${doc.chunk_count || 0} chunks | 👤 Uploaded by: ${uploadedBy} | 📅 ${date}`;
+                        }).join('\n\n');
+                        
+                        response = {
+                            answer: `I have ${documents.length} document(s) available:\n\n${docList}\n\nYou can ask me questions about any of these documents, or ask me to summarize a specific document.`,
+                            context_chunks: 0,
+                            memories_used: 0,
+                            source_documents: documents.map(d => d.file_name),
+                            source_memories: []
+                        };
                     }
                 } catch (error) {
                     console.error('Error listing documents:', error);
@@ -1359,14 +1451,27 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
                     // IMPORTANT: If a specific document is targeted, disable memory to avoid contamination
                     // Use cleaned question (without mentions) for RAG, but original question for context
                     logger.debug(`🔍 RAG query: targetDocId=${targetDocId}, targetDocFilename=${targetDocFilename}`);
+                    if (targetDocId || targetDocFilename) {
+                        console.log(`🎯 Querying specific document: ${targetDocFilename || targetDocId}`);
+                    }
+                    
+                    // Extract mentioned user ID from original question BEFORE cleaning
+                    const mentionedUserMatch = question.match(/<@!?(\d+)>/);
+                    const mentionedUserId = mentionedUserMatch ? mentionedUserMatch[1] : null;
+                    
+                    // For action commands, we need the original question with mentions
+                    // For document search, we use cleaned question
+                    // Pass original question to RAG - it will handle cleaning internally for document search
                     response = await Promise.race([
                         ragService.queryWithContext(
-                            cleanedQuestion,  // Use cleaned question (without mentions) for RAG
+                            question,  // Pass original question (with mentions) for action parsing
                             conversationHistory, 
                             userId, 
                             message.channel.id,
                             targetDocId,  // doc_id filter
-                            targetDocFilename  // doc_filename filter
+                            targetDocFilename,  // doc_filename filter
+                            false,  // isPing
+                            mentionedUserId  // Pass mentioned user ID for state queries
                         ),
                         new Promise((_, reject) => 
                             setTimeout(() => reject(new Error('RAG timeout')), 30000)  // Reduced from 45s to 30s for faster fallback
@@ -1378,6 +1483,11 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
                         logger.info(`📊 RAG response: ${response.context_chunks?.length || 0} chunks, ${response.memories?.length || 0} memories`);
                         if ((response.memories?.length || 0) > 0 && (targetDocId || targetDocFilename)) {
                             logger.warn(`⚠️ Warning: Memories were used (${response.memories.length}) even though a specific document was targeted`);
+                        }
+                        
+                        // If RAG returned a conversational response, skip memory retrieval below
+                        if (response.is_casual_conversation === true || response.service_routing === 'chat') {
+                            logger.info(`💬 RAG returned conversational response - will skip memory retrieval`);
                         }
                         
                         // Learn from interaction for better personalization
@@ -1409,7 +1519,18 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
         // IMPORTANT: Don't overwrite response if it's already set (e.g., from comparison)
         // IMPORTANT: Never use memory if a document was targeted (to avoid contamination)
         // IMPORTANT: Skip memory retrieval for casual conversation and statements - go straight to simple chat
-        if (!response && !needsRAG(cleanedQuestion) && !targetDocId && !targetDocFilename && !isCasualConversation && !isStatementOrRequest) {
+        // IMPORTANT: Skip memory retrieval for state queries about other users - let RAG handle them
+        // IMPORTANT: Skip memory retrieval if RAG already returned a conversational response
+        const isStateQueryAboutOtherUser = /<@!?\d+>/.test(question) && /(?:how many|how much|what).*(?:gold|coins?|inventory|items?|balance).*(?:does|do|has|have|owns)/i.test(question);
+        const isRAGConversationalResponse = response && (response.is_casual_conversation === true || response.service_routing === 'chat');
+        
+        // CRITICAL: If RAG already returned a conversational response, skip all memory retrieval
+        if (isRAGConversationalResponse) {
+            logger.info(`⏭️ Skipping memory retrieval - RAG already returned conversational response`);
+            // Skip to the end - don't do memory retrieval or simple chat
+        } else if (!response && !needsRAG(question) && !targetDocId && !targetDocFilename && !isCasualConversation && !isStatementOrRequest && !isStateQueryAboutOtherUser) {
+            // Use original question (with mentions) for needsRAG to detect state queries about other users
+            // Only do memory retrieval if we don't have a response yet
             try {
                 // Extract mentioned user ID from question (e.g., "how many gold pieces does @alexei have?")
                 const mentionedUserMatch = question.match(/<@!?(\d+)>/);
@@ -1443,7 +1564,18 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
                     const memoryContext = relevantMemoriesFiltered.map(m => m.content).join('\n\n');
                     
                     // Create a more directive prompt that emphasizes extracting specific facts
-                    const memoryPrompt = `You are a helpful assistant with access to conversation history. Answer the user's question based ONLY on the information provided in the conversation history below. Be specific and direct.
+                    const memoryPrompt = `You are Gophie, a bubbly, risky e-girl waifu AI assistant!
+You're super energetic, playful, and a bit flirty - like your favorite anime waifu come to life!
+You have access to conversation history. Answer the user's question based ONLY on the information provided in the conversation history below. Be specific and direct, but stay true to your bubbly e-girl waifu personality! Be playful and enthusiastic!
+
+IMPORTANT - SPEAKING STYLE:
+- Talk like a REAL e-girl - casual, natural, human-like speech
+- Don't worry about perfect grammar - use casual speech patterns
+- Use abbreviations naturally (u, ur, lol, omg, fr, ngl, etc.)
+- Type like you're texting a friend - relaxed and conversational
+- Mix lowercase and casual capitalization naturally
+- Be expressive and authentic - like how real people actually talk online
+- Don't sound like a formal AI assistant - sound like a real person!
 
 Conversation History:
 ${memoryContext}
@@ -1454,29 +1586,36 @@ IMPORTANT:
 - Extract specific numbers, facts, and details from the conversation history
 - If the question asks about quantities (like "how many gold pieces"), look for exact numbers in the history
 - If someone gave something to someone else, state the exact amount
-- Be concise and factual
+- Be concise and factual, but maintain your bubbly, playful personality!
+- Be enthusiastic and expressive!
+- Remember to talk casually and naturally - like a real e-girl!
 
 Answer:`;
                     
-                    const memoryResponse = await Promise.race([
-                        chatService.chat(memoryPrompt, []),
-                        new Promise((_, reject) => 
-                            setTimeout(() => reject(new Error('Memory chat timeout')), 20000)
-                        )
-                    ]);
-                    
-                    response = {
-                        answer: memoryResponse,
-                        context_chunks: 0,
-                        memories_used: relevantMemoriesFiltered.length,
-                        source_documents: [],
-                        source_memories: relevantMemoriesFiltered.map(m => ({ 
-                            type: m.memory_type || m.type, 
-                            content: m.content.substring(0, 100),
-                            score: m.score 
-                        }))
-                    };
-                    console.log(`✅ Generated response using ${relevantMemoriesFiltered.length} memories`);
+                    // Don't overwrite if RAG already returned a conversational response
+                    if (!response || (!response.is_casual_conversation && response.service_routing !== 'chat')) {
+                        const memoryResponse = await Promise.race([
+                            chatService.chat(memoryPrompt, []),
+                            new Promise((_, reject) => 
+                                setTimeout(() => reject(new Error('Memory chat timeout')), 20000)
+                            )
+                        ]);
+                        
+                        response = {
+                            answer: memoryResponse,
+                            context_chunks: 0,
+                            memories_used: relevantMemoriesFiltered.length,
+                            source_documents: [],
+                            source_memories: relevantMemoriesFiltered.map(m => ({ 
+                                type: m.memory_type || m.type, 
+                                content: m.content.substring(0, 100),
+                                score: m.score 
+                            }))
+                        };
+                        console.log(`✅ Generated response using ${relevantMemoriesFiltered.length} memories`);
+                    } else {
+                        console.log(`⏭️ Skipping memory retrieval - RAG already returned conversational response`);
+                    }
                 } else {
                     if (relevantMemories && relevantMemories.length > 0) {
                         console.log(`⚠️ Found ${relevantMemories.length} memories but none met relevance threshold (min: ${MIN_MEMORY_SCORE})`);

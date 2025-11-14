@@ -118,15 +118,30 @@ This will start an interactive session where you can ask multiple questions.
 ```
 .
 ├── main.py                 # Main entry point
-├── document_processor.py   # Docling-based document processing
-├── embedding_generator.py  # Sentence transformer embeddings
-├── neo4j_store.py         # Neo4j integration and storage
-├── lmstudio_client.py     # LMStudio API client
-├── rag_pipeline.py        # Complete RAG pipeline
 ├── config.py              # Configuration settings
-├── requirements.txt       # Python dependencies
-└── README.md             # This file
+├── logger_config.py        # Logging configuration
+├── requirements.txt        # Python dependencies
+├── src/                    # Source code
+│   ├── core/              # Core RAG components
+│   ├── stores/            # Storage backends (Neo4j, Elasticsearch, hybrid)
+│   ├── processors/        # Document processing
+│   ├── api/               # API servers
+│   ├── memory/            # Memory management
+│   ├── search/            # Search components
+│   ├── tools/             # LLM tools
+│   ├── evaluation/        # Evaluation and monitoring
+│   ├── clients/           # External clients (LMStudio, Ollama)
+│   └── utils/             # Utilities
+├── scripts/               # Utility scripts
+├── tests/                 # Test files
+├── docs/                  # Documentation
+├── discord-bot/           # Discord bot (Node.js)
+├── config/                # Config package (legacy)
+├── logger/                # Logger package
+└── deps/                  # Dependencies
 ```
+
+See the `docs/` directory for detailed documentation on specific features.
 
 ## How It Works
 
@@ -346,15 +361,30 @@ This will start an interactive session where you can ask multiple questions.
 ```
 .
 ├── main.py                 # Main entry point
-├── document_processor.py   # Docling-based document processing
-├── embedding_generator.py  # Sentence transformer embeddings
-├── neo4j_store.py         # Neo4j integration and storage
-├── lmstudio_client.py     # LMStudio API client
-├── rag_pipeline.py        # Complete RAG pipeline
 ├── config.py              # Configuration settings
-├── requirements.txt       # Python dependencies
-└── README.md             # This file
+├── logger_config.py        # Logging configuration
+├── requirements.txt        # Python dependencies
+├── src/                    # Source code
+│   ├── core/              # Core RAG components
+│   ├── stores/            # Storage backends (Neo4j, Elasticsearch, hybrid)
+│   ├── processors/        # Document processing
+│   ├── api/               # API servers
+│   ├── memory/            # Memory management
+│   ├── search/            # Search components
+│   ├── tools/             # LLM tools
+│   ├── evaluation/        # Evaluation and monitoring
+│   ├── clients/           # External clients (LMStudio, Ollama)
+│   └── utils/             # Utilities
+├── scripts/               # Utility scripts
+├── tests/                 # Test files
+├── docs/                  # Documentation
+├── discord-bot/           # Discord bot (Node.js)
+├── config/                # Config package (legacy)
+├── logger/                # Logger package
+└── deps/                  # Dependencies
 ```
+
+See the `docs/` directory for detailed documentation on specific features.
 
 ## How It Works
 

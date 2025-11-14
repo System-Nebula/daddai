@@ -11,7 +11,7 @@ class PersistentRAGService extends EventEmitter {
     constructor() {
         super();
         this.pythonPath = process.env.PYTHON_PATH || 'python';
-        this.serverScriptPath = path.join(__dirname, '..', '..', 'rag_server.py');
+        this.serverScriptPath = path.join(__dirname, '..', '..', 'src', 'api', 'rag_server.py');
         this.serverProcess = null;
         this.requestQueue = [];
         this.requestId = 0;
@@ -186,30 +186,40 @@ class PersistentRAGService extends EventEmitter {
         });
     }
     
-    queryWithContext(question, conversationHistory = [], userId = null, channelId = null, docId = null, docFilename = null, isPing = false) {
+    queryWithContext(question, conversationHistory = [], userId = null, channelId = null, docId = null, docFilename = null, isPing = false, mentionedUserId = null) {
         return new Promise((resolve, reject) => {
             const requestId = ++this.requestId;
             
-            // Clean the question but don't include full conversation history in the question
-            // The RAG pipeline's memory system will handle retrieving relevant context
-            // Only clean Discord mentions and special characters from the current question
-            const cleanQuestion = isPing ? 'ping' : this._cleanDiscordText(question);
+            // Extract mentioned user ID from question BEFORE cleaning (in case it wasn't passed)
+            let extractedMentionedUserId = mentionedUserId;
+            if (!extractedMentionedUserId) {
+                const mentionMatch = question.match(/<@!?(\d+)>/);
+                if (mentionMatch) {
+                    extractedMentionedUserId = mentionMatch[1];
+                }
+            }
+            
+            // For action commands, we need to preserve mentions in the question
+            // The RAG pipeline will handle cleaning internally for document search
+            // But action parsing needs the original question with mentions
+            const questionToSend = isPing ? 'ping' : question;
             
             // Truncate if too long (max 500 chars for the question itself)
-            const truncatedQuestion = cleanQuestion.length > 500 
-                ? cleanQuestion.substring(0, 500) + '...' 
-                : cleanQuestion;
+            const truncatedQuestion = questionToSend.length > 500 
+                ? questionToSend.substring(0, 500) + '...' 
+                : questionToSend;
             
             const request = {
                 id: requestId,
                 method: isPing ? 'ping' : 'query',
                 params: {
-                    question: truncatedQuestion,  // Only send the current question, not full context
+                    question: truncatedQuestion,  // Send original question with mentions for action parsing
                     top_k: 10,
                     user_id: userId,  // Kept for backward compat
                     channel_id: channelId,  // New: channel-based memories
                     doc_id: docId,  // Filter to specific document by ID
                     doc_filename: docFilename,  // Filter to specific document by filename
+                    mentioned_user_id: extractedMentionedUserId,  // Pass mentioned user ID for state queries
                     use_memory: true,  // Memory system will retrieve relevant context
                     use_shared_docs: true,
                     use_hybrid_search: true,

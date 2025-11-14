@@ -4,7 +4,7 @@ const path = require('path');
 class RAGService {
     constructor() {
         this.pythonPath = process.env.PYTHON_PATH || 'python';
-        this.ragScriptPath = path.join(__dirname, '..', '..', 'rag_api.py');
+        this.ragScriptPath = path.join(__dirname, '..', '..', 'src', 'api', 'rag_api.py');
     }
 
     /**
@@ -21,7 +21,7 @@ class RAGService {
             
             // Build command arguments
             const args = [
-                path.join(__dirname, '..', '..', 'rag_api.py'),
+                path.join(__dirname, '..', '..', 'src', 'api', 'rag_api.py'),
                 '--question', contextPrompt,
                 '--top-k', '10',
                 '--use-memory', 'true',

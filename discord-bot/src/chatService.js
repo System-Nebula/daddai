@@ -15,7 +15,7 @@ class ChatService {
     async chat(message, conversationHistory = []) {
         return new Promise((resolve, reject) => {
             const args = [
-                path.join(__dirname, '..', '..', 'chat_api.py'),
+                path.join(__dirname, '..', '..', 'src', 'api', 'chat_api.py'),
                 '--message', message
             ];
             

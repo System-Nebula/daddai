@@ -8,9 +8,9 @@ module.exports = {
     data: new SlashCommandBuilder()
         .setName('upload')
         .setDescription('Upload a document to the shared knowledge base')
-        .addAttachmentOption(option =>
+                .addAttachmentOption(option =>
             option.setName('file')
-                .setDescription('PDF, DOCX, TXT, LOG, MD, CSV, JSON, or IPYNB (Jupyter) file to upload')
+                .setDescription('Document or text file to upload (PDF, DOCX, PPTX, HTML, Markdown, code files, etc.)')
                 .setRequired(true)),
     
     async execute(interaction, conversationManager, ragService, memoryService, documentService, configManager) {
@@ -19,13 +19,27 @@ module.exports = {
         const attachment = interaction.options.getAttachment('file');
         const userId = interaction.user.id;
         
-        // Check file type
-        const allowedExtensions = ['.pdf', '.docx', '.doc', '.txt', '.md', '.log', '.csv', '.json', '.ipynb'];
+        // Check file type - includes Docling-supported formats and text-based formats
+        const allowedExtensions = [
+            // Docling-supported formats
+            '.pdf', '.docx', '.doc', '.pptx', '.ppt', '.html', '.htm', '.adoc', '.asciidoc',
+            // Text-based formats (readable as text)
+            '.txt', '.md', '.markdown', '.livemd', '.mixr', '.rst', '.org', '.wiki',
+            // Data formats
+            '.log', '.csv', '.json', '.ipynb', '.yaml', '.yml', '.toml', '.xml',
+            // Code files (text-based)
+            '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.cpp', '.c', '.h', '.hpp',
+            '.cs', '.go', '.rs', '.rb', '.php', '.swift', '.kt', '.scala', '.r',
+            '.sh', '.bash', '.zsh', '.ps1', '.bat', '.cmd', '.sql', '.pl', '.lua',
+            // Config and other text formats
+            '.ini', '.cfg', '.conf', '.config', '.env', '.properties', '.gitignore',
+            '.dockerfile', '.makefile', '.cmake', '.gradle', '.maven', '.sbt'
+        ];
         const fileExtension = path.extname(attachment.name).toLowerCase();
         
         if (!allowedExtensions.includes(fileExtension)) {
             await interaction.editReply({
-                content: `❌ Unsupported file type. Supported: ${allowedExtensions.join(', ')}`
+                content: `❌ Unsupported file type. Supported formats include: PDF, DOCX, PPTX, HTML, Markdown, text files, code files, and more.`
             });
             return;
         }

@@ -12,7 +12,7 @@ class MemoryService {
     async storeMemory(channelId, content, memoryType = 'conversation', metadata = {}, channelName = null, userId = null, username = null, mentionedUserId = null) {
         return new Promise((resolve, reject) => {
             const args = [
-                path.join(__dirname, '..', '..', 'memory_api.py'),
+                path.join(__dirname, '..', '..', 'src', 'api', 'memory_api.py'),
                 '--action', 'store',
                 '--channel-id', channelId,
                 '--content', content,
@@ -80,7 +80,7 @@ class MemoryService {
     async getChannelMemories(channelId = null, limit = 100, channelName = null) {
         return new Promise((resolve, reject) => {
             const args = [
-                path.join(__dirname, '..', '..', 'memory_api.py'),
+                path.join(__dirname, '..', '..', 'src', 'api', 'memory_api.py'),
                 '--action', 'get',
                 '--limit', limit.toString()
             ];
@@ -128,7 +128,7 @@ class MemoryService {
     async getAllChannels() {
         return new Promise((resolve, reject) => {
             const pythonProcess = spawn(this.pythonPath, [
-                path.join(__dirname, '..', '..', 'memory_api.py'),
+                path.join(__dirname, '..', '..', 'src', 'api', 'memory_api.py'),
                 '--action', 'list-channels'
             ]);
 
@@ -172,7 +172,7 @@ class MemoryService {
     async getUserMemories(channelId, query, topK = 5, mentionedUserId = null) {
         return new Promise((resolve, reject) => {
             const args = [
-                path.join(__dirname, '..', '..', 'memory_api.py'),
+                path.join(__dirname, '..', '..', 'src', 'api', 'memory_api.py'),
                 '--action', 'search',
                 '--channel-id', channelId,
                 '--query', query,
@@ -231,7 +231,7 @@ class MemoryService {
     async getAllMemories(limit = 1000) {
         return new Promise((resolve, reject) => {
             const args = [
-                path.join(__dirname, '..', '..', 'memory_api.py'),
+                path.join(__dirname, '..', '..', 'src', 'api', 'memory_api.py'),
                 '--action', 'get-all',
                 '--limit', limit.toString()
             ];

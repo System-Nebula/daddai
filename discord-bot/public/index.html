@@ -3,84 +3,278 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="GopherBot Dashboard - AI Assistant Management Interface">
+    <meta name="theme-color" content="#24273a">
     <title>GopherBot Dashboard</title>
     <link rel="stylesheet" href="styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 </head>
 <body>
-    <div class="container">
-        <header>
-            <div class="header-content">
-                <h1><span class="code-symbol">&lt;</span>GopherBot<span class="code-symbol">/&gt;</span> Dashboard</h1>
-                <p class="subtitle">// View memories and documents</p>
-            </div>
-            <div class="header-stats" id="headerStats">
-                <div class="stat">
-                    <span class="stat-value" id="totalMemories">-</span>
-                    <span class="stat-label">Memories</span>
-                </div>
-                <div class="stat">
-                    <span class="stat-value" id="totalChannels">-</span>
-                    <span class="stat-label">Channels</span>
-                </div>
-                <div class="stat">
-                    <span class="stat-value" id="totalDocuments">-</span>
-                    <span class="stat-label">Documents</span>
-                </div>
-            </div>
-        </header>
-
-        <!-- Tabs -->
-        <div class="tabs">
-            <button class="tab-button active" onclick="switchTab('memories')">Memories</button>
-            <button class="tab-button" onclick="switchTab('documents')">Documents</button>
-        </div>
-
-        <!-- Memories Tab -->
-        <div id="memoriesTab" class="tab-content active">
-            <div class="controls">
-                <div class="filter-group">
-                    <input type="text" id="searchInput" placeholder="// Search memories..." class="code-input" />
-                    <select id="channelFilter" class="code-select">
-                        <option value="">All Channels</option>
-                    </select>
-                    <select id="typeFilter" class="code-select">
-                        <option value="">All Types</option>
-                        <option value="conversation">Conversation</option>
-                        <option value="bot_response">Bot Response</option>
-                        <option value="fact">Fact</option>
-                        <option value="preference">Preference</option>
-                    </select>
-                    <button onclick="refreshMemories()" class="btn-primary">Refresh</button>
-                </div>
-            </div>
-
-            <div class="memories-container">
-                <div id="memoriesList" class="memories-list">
-                    <div class="loading">
-                        <span class="code-comment">// Loading memories...</span>
+    <div class="app-container">
+        <!-- Navigation Sidebar -->
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <div class="logo-icon">
+                        <svg width="24" height="24" viewBox="0 0 71 55" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M60.1045 4.8978C55.5792 2.8214 50.7265 1.2916 45.6527 0.41542C45.5603 0.39851 45.468 0.440769 45.4204 0.525289C44.7963 1.6353 44.105 3.0834 43.6209 4.2216C38.1637 3.4046 32.7345 3.4046 27.3892 4.2216C26.905 3.0581 26.1886 1.6353 25.5617 0.525289C25.5141 0.443589 25.4218 0.40133 25.3294 0.41542C20.2584 1.2888 15.4057 2.8186 10.8776 4.8978C10.8384 4.9147 10.8048 4.9429 10.7825 4.9795C1.57795 18.7309 -0.943561 32.1443 0.293408 45.3914C0.299005 45.4562 0.335386 45.5182 0.385761 45.5576C6.45866 50.0174 12.3413 52.7249 18.1147 54.5195C18.2071 54.5477 18.305 54.5139 18.3638 54.4378C19.7295 52.5728 20.9469 50.6063 21.9907 48.5383C22.0523 48.4172 21.9935 48.2735 21.8676 48.2256C19.9366 47.4931 18.0979 46.6 16.3292 45.5858C16.1893 45.5041 16.1781 45.304 16.3068 45.2082C16.679 44.9293 17.0513 44.6391 17.4067 44.3461C17.471 44.2926 17.5606 44.2813 17.6362 44.3151C29.1938 49.4312 41.8674 49.4312 53.2722 44.3151C53.3481 44.2785 53.4372 44.2898 53.5017 44.3433C53.8624 44.6363 54.2341 44.9293 54.6157 45.2082C54.7444 45.304 54.7332 45.5041 54.5933 45.5858C52.8156 46.6197 50.977 47.4931 49.0254 48.2222C48.8994 48.2701 48.8406 48.4172 48.9023 48.5383C49.9509 50.6034 51.1683 52.5699 52.5266 54.435C52.5854 54.5139 52.6836 54.5477 52.776 54.5195C58.6467 52.7249 64.5294 50.0174 70.6023 45.5576C70.6552 45.5182 70.6888 45.459 70.6944 45.3942C72.1747 30.0791 68.2147 16.7757 60.1968 4.9823C60.1772 4.9429 60.1437 4.9147 60.1045 4.8978ZM23.7259 37.3253C20.2276 37.3253 17.3451 34.1136 17.3451 30.1693C17.3451 26.225 20.1717 23.0133 23.7259 23.0133C27.3083 23.0133 30.1626 26.2532 30.1066 30.1693C30.1066 34.1136 27.28 37.3253 23.7259 37.3253ZM47.3178 37.3253C43.8196 37.3253 40.9371 34.1136 40.9371 30.1693C40.9371 26.225 43.7636 23.0133 47.3178 23.0133C50.9003 23.0133 53.7545 26.2532 53.6986 30.1693C53.6986 34.1136 50.9 37.3253 47.3178 37.3253Z" fill="currentColor"/>
+                        </svg>
+                    </div>
+                    <div class="logo-text">
+                        <span class="logo-name">GopherBot</span>
+                        <span class="logo-subtitle">Dashboard</span>
                     </div>
                 </div>
             </div>
-        </div>
-
-        <!-- Documents Tab -->
-        <div id="documentsTab" class="tab-content">
-            <div class="controls">
-                <div class="filter-group">
-                    <input type="text" id="documentSearchInput" placeholder="// Search documents..." class="code-input" />
-                    <button onclick="refreshDocuments()" class="btn-primary">Refresh</button>
+            
+            <nav class="sidebar-nav">
+                <button class="nav-item active" data-tab="memories" onclick="switchTab('memories')">
+                    <svg class="nav-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M9 11a3 3 0 1 0 6 0a3 3 0 0 0-6 0z"></path>
+                        <path d="M17.657 16.657L13.414 20.9a1.998 1.998 0 0 1-2.827 0l-4.244-4.243a8 8 0 1 1 11.314 0z"></path>
+                    </svg>
+                    <span class="nav-label">Memories</span>
+                    <span class="nav-badge" id="memoriesCount">-</span>
+                </button>
+                <button class="nav-item" data-tab="documents" onclick="switchTab('documents')">
+                    <svg class="nav-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                        <polyline points="14 2 14 8 20 8"></polyline>
+                        <line x1="16" y1="13" x2="8" y2="13"></line>
+                        <line x1="16" y1="17" x2="8" y2="17"></line>
+                        <polyline points="10 9 9 9 8 9"></polyline>
+                    </svg>
+                    <span class="nav-label">Documents</span>
+                    <span class="nav-badge" id="documentsCount">-</span>
+                </button>
+            </nav>
+            
+            <div class="sidebar-footer">
+                <div class="stats-summary">
+                    <div class="stat-item">
+                        <span class="stat-value" id="totalMemories">-</span>
+                        <span class="stat-label">Memories</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-value" id="totalChannels">-</span>
+                        <span class="stat-label">Channels</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-value" id="totalDocuments">-</span>
+                        <span class="stat-label">Documents</span>
+                    </div>
                 </div>
-            </div>
-
-            <div class="documents-container">
-                <div id="documentsList" class="documents-list">
-                    <div class="loading">
-                        <span class="code-comment">// Loading documents...</span>
+                <div class="system-status" id="systemStatus">
+                    <div class="status-item">
+                        <span class="status-indicator" id="neo4jStatus" title="Neo4j Status">●</span>
+                        <span class="status-label">Neo4j</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-indicator" id="elasticsearchStatus" title="Elasticsearch Status">●</span>
+                        <span class="status-label">Elasticsearch</span>
                     </div>
                 </div>
             </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Top Bar -->
+            <header class="top-bar">
+                <div class="top-bar-left">
+                    <h1 class="page-title" id="pageTitle">Memories</h1>
+                    <p class="page-subtitle" id="pageSubtitle">View and manage conversation memories</p>
+                </div>
+                <div class="top-bar-right">
+                    <div class="search-wrapper-global">
+                        <svg class="search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="11" cy="11" r="8"></circle>
+                            <path d="m21 21-4.35-4.35"></path>
+                        </svg>
+                        <input type="text" id="globalSearch" placeholder="Search everything (Ctrl+K)" class="search-input-global" />
+                        <kbd class="search-shortcut">Ctrl+K</kbd>
+                    </div>
+                    <div class="action-buttons">
+                        <button class="action-btn-icon" onclick="refreshAll()" title="Refresh (Ctrl+R)">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="23 4 23 10 17 10"></polyline>
+                                <polyline points="1 20 1 14 7 14"></polyline>
+                                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                            </svg>
+                        </button>
+                        <button class="action-btn-icon" onclick="exportData()" title="Export Data">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                <polyline points="7 10 12 15 17 10"></polyline>
+                                <line x1="12" y1="15" x2="12" y2="3"></line>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+            </header>
+
+            <!-- Filters Bar -->
+            <div class="filters-bar" id="filtersBar">
+                <div class="filters-left">
+                    <div class="filter-group">
+                        <div class="search-box">
+                            <svg class="search-icon-small" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="11" cy="11" r="8"></circle>
+                                <path d="m21 21-4.35-4.35"></path>
+                            </svg>
+                            <input type="text" id="searchInput" placeholder="Search memories..." class="filter-input" />
+                            <button class="clear-btn" id="clearSearch" onclick="clearSearch()" style="display: none;" aria-label="Clear search">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <line x1="18" y1="6" x2="6" y2="18"></line>
+                                    <line x1="6" y1="6" x2="18" y2="18"></line>
+                                </svg>
+                            </button>
+                        </div>
+                        <select id="channelFilter" class="filter-select">
+                            <option value="">All Channels</option>
+                        </select>
+                        <select id="typeFilter" class="filter-select">
+                            <option value="">All Types</option>
+                            <option value="conversation">Conversation</option>
+                            <option value="bot_response">Bot Response</option>
+                            <option value="fact">Fact</option>
+                            <option value="preference">Preference</option>
+                        </select>
+                        <select id="sortFilter" class="filter-select">
+                            <option value="newest">Newest First</option>
+                            <option value="oldest">Oldest First</option>
+                            <option value="relevance">Most Relevant</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="filters-right">
+                    <div class="results-count">
+                        <span class="count-number" id="filteredCount">-</span>
+                        <span class="count-label">results</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Content Area -->
+            <div class="content-area">
+                <!-- Memories Tab -->
+                <div id="memoriesTab" class="tab-content active">
+                    <div class="content-container" id="memoriesContainer">
+                        <div id="memoriesList" class="memories-list" data-view-mode="grid">
+                            <div class="loading-state">
+                                <div class="spinner"></div>
+                                <p class="loading-text">Loading memories...</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Documents Tab -->
+                <div id="documentsTab" class="tab-content">
+                    <!-- Semantic Search Section -->
+                    <div class="semantic-search-section" id="semanticSearchSection" style="display: none;">
+                        <div class="semantic-search-header">
+                            <h3>Semantic Search</h3>
+                            <button class="close-btn" onclick="closeSemanticSearch()" aria-label="Close semantic search">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <line x1="18" y1="6" x2="6" y2="18"></line>
+                                    <line x1="6" y1="6" x2="18" y2="18"></line>
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="semantic-search-controls">
+                            <div class="search-box-large">
+                                <svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="11" cy="11" r="8"></circle>
+                                    <path d="m21 21-4.35-4.35"></path>
+                                </svg>
+                                <input type="text" id="semanticSearchInput" placeholder="Enter search query (e.g., 'better binary quantization')..." class="semantic-search-input" />
+                                <button class="search-btn" onclick="performSemanticSearch()">Search</button>
+                            </div>
+                            <div class="store-selector">
+                                <label>Search in:</label>
+                                <div class="store-buttons">
+                                    <button class="store-btn active" data-store="both" onclick="selectStore('both')">
+                                        <span class="store-icon">🔍</span>
+                                        <span>Both</span>
+                                    </button>
+                                    <button class="store-btn" data-store="elasticsearch" onclick="selectStore('elasticsearch')">
+                                        <span class="store-icon">⚡</span>
+                                        <span>Elasticsearch</span>
+                                    </button>
+                                    <button class="store-btn" data-store="neo4j" onclick="selectStore('neo4j')">
+                                        <span class="store-icon">🕸️</span>
+                                        <span>Neo4j</span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="semanticSearchResults" class="semantic-search-results"></div>
+                    </div>
+                    
+                    <div class="filters-bar" id="docFiltersBar">
+                        <div class="filters-left">
+                            <div class="filter-group">
+                                <div class="search-box">
+                                    <svg class="search-icon-small" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <circle cx="11" cy="11" r="8"></circle>
+                                        <path d="m21 21-4.35-4.35"></path>
+                                    </svg>
+                                    <input type="text" id="documentSearchInput" placeholder="Filter by name..." class="filter-input" />
+                                    <button class="clear-btn" id="clearDocSearch" onclick="clearDocSearch()" style="display: none;" aria-label="Clear search">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <line x1="18" y1="6" x2="6" y2="18"></line>
+                                            <line x1="6" y1="6" x2="18" y2="18"></line>
+                                        </svg>
+                                    </button>
+                                </div>
+                                <button class="semantic-search-toggle-btn" onclick="toggleSemanticSearch()" title="Open semantic search">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <circle cx="11" cy="11" r="8"></circle>
+                                        <path d="m21 21-4.35-4.35"></path>
+                                    </svg>
+                                    <span>Semantic Search</span>
+                                </button>
+                                <select id="docSortFilter" class="filter-select">
+                                    <option value="newest">Newest First</option>
+                                    <option value="oldest">Oldest First</option>
+                                    <option value="name">Name (A-Z)</option>
+                                    <option value="chunks">Most Chunks</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="filters-right">
+                            <div class="results-count">
+                                <span class="count-number" id="filteredDocCount">-</span>
+                                <span class="count-label">results</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="content-container" id="documentsContainer">
+                        <div id="documentsList" class="documents-list" data-view-mode="grid">
+                            <div class="loading-state">
+                                <div class="spinner"></div>
+                                <p class="loading-text">Loading documents...</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div id="loadingOverlay" class="loading-overlay" style="display: none;">
+        <div class="loading-content">
+            <div class="spinner large"></div>
+            <p class="loading-text">Processing...</p>
         </div>
     </div>
+
+    <!-- Toast Container -->
+    <div id="toastContainer" class="toast-container"></div>
 
     <script src="app.js"></script>
 </body>

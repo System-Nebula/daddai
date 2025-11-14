@@ -4,10 +4,10 @@ Main script for ingesting documents and querying the RAG system.
 import argparse
 import os
 import sys
-from document_processor import DocumentProcessor
-from embedding_generator import EmbeddingGenerator
-from neo4j_store import Neo4jStore
-from rag_pipeline import RAGPipeline
+from src.processors.document_processor import DocumentProcessor
+from src.processors.embedding_generator import EmbeddingGenerator
+from src.stores.neo4j_store import Neo4jStore
+from src.core.rag_pipeline import RAGPipeline
 from config import CHUNK_SIZE, CHUNK_OVERLAP, USE_GPU, EMBEDDING_BATCH_SIZE
 from logger_config import logger
 
