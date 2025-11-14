@@ -3,12 +3,12 @@ Meta Tools - Tools that allow the LLM to create and test its own tools.
 These are the foundational tools for self-extension.
 """
 from typing import Dict, Any, List, Optional
-from tool_sandbox import ToolSandbox, ToolStorage
+from src.tools.tool_sandbox import ToolSandbox, ToolStorage
 from src.tools.llm_tools import LLMTool, LLMToolRegistry
 from logger_config import logger
 
 
-def create_meta_tools(sandbox: ToolSandbox, storage: ToolStorage, registry: LLMToolRegistry) -> List[LLMTool]:
+def create_meta_tools(sandbox: ToolSandbox, storage: ToolStorage, registry: LLMToolRegistry, pipeline=None) -> List[LLMTool]:
     """
     Create meta-tools that allow LLM to create and test its own tools.
     
@@ -16,20 +16,41 @@ def create_meta_tools(sandbox: ToolSandbox, storage: ToolStorage, registry: LLMT
         sandbox: Tool sandbox for safe execution
         storage: Tool storage for persistence
         registry: Tool registry to add new tools to
+        pipeline: Enhanced pipeline instance (for accessing admin status)
         
     Returns:
         List of meta-tools
     """
     tools = []
     
+    # Helper to check if current user is admin
+    def is_admin_user() -> bool:
+        """Check if current user is admin."""
+        if pipeline and hasattr(pipeline, 'current_is_admin'):
+            return pipeline.current_is_admin
+        return False
+    
     # Tool: Write a new tool
     def write_tool(code: str, function_name: str, description: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
         """
         Write a new tool. The code should define a function with the given name.
         This tool is non-destructive - it only validates and stores the tool.
+        Admin users can create tools with network access (requests, urllib).
         """
-        # Validate code
-        validation = sandbox.validate_code(code)
+        # Check admin status for network requests
+        admin_user = is_admin_user()
+        
+        # Check if code uses network requests (for non-admin users)
+        uses_network = any(net in code.lower() for net in ['import requests', 'import urllib', 'requests.', 'urllib.'])
+        if uses_network and not admin_user:
+            return {
+                "success": False,
+                "error": "Network requests (requests, urllib) are only allowed for admin users. Please use API-less sources or contact an admin.",
+                "hint": "For weather data, consider using API-less sources or ask an admin to create the tool."
+            }
+        
+        # Validate code (allow network requests for admin users)
+        validation = sandbox.validate_code(code, allow_network=admin_user)
         if not validation["valid"]:
             return {
                 "success": False,
@@ -48,11 +69,13 @@ def create_meta_tools(sandbox: ToolSandbox, storage: ToolStorage, registry: LLMT
             }
         
         # Store tool (but don't register yet - needs testing first)
+        # Store admin status so network requests are allowed when testing/executing
         stored = storage.store_tool(
             tool_name=function_name,
             code=code,
             description=description,
-            parameters=parameters
+            parameters=parameters,
+            is_admin_tool=admin_user  # Store admin status
         )
         
         if not stored:
@@ -63,13 +86,14 @@ def create_meta_tools(sandbox: ToolSandbox, storage: ToolStorage, registry: LLMT
         
         return {
             "success": True,
-            "message": f"Tool '{function_name}' written and stored. Use test_tool to test it before registering.",
-            "tool_name": function_name
+            "message": f"Tool '{function_name}' written and stored. Use test_tool to test it before registering. After testing and registering, users can reference this tool by name.",
+            "tool_name": function_name,
+            "next_steps": "1. Use test_tool to test the tool, 2. Use register_tool to make it available, 3. Inform the user about the tool name so they can reference it later"
         }
     
     tools.append(LLMTool(
         name="write_tool",
-        description="Write a new tool/function. Provide Python code that defines a function. This is non-destructive - it only validates and stores the tool. Use test_tool to test it before using.",
+        description="Write a new tool/function. Provide Python code that defines a function. This is non-destructive - it only validates and stores the tool. Admin users can create tools with network access (requests, urllib). Non-admin users cannot use network requests. Use test_tool to test it before using. For weather tools, prefer API-less sources when possible.",
         parameters={
             "type": "object",
             "properties": {
@@ -115,12 +139,15 @@ def create_meta_tools(sandbox: ToolSandbox, storage: ToolStorage, registry: LLMT
             }
         
         code = tool_data["code"]
+        # Check if tool was created by admin (allows network requests)
+        is_admin_tool = tool_data.get("is_admin_tool", False)
         
-        # Run tests
+        # Run tests (allow network if admin tool)
         test_results = sandbox.test_tool(
             code=code,
             function_name=tool_name,
-            test_cases=test_cases
+            test_cases=test_cases,
+            allow_network=is_admin_tool
         )
         
         # Update storage with test results
@@ -193,8 +220,27 @@ def create_meta_tools(sandbox: ToolSandbox, storage: ToolStorage, registry: LLMT
         
         # Create executable function from stored code
         try:
-            # Execute code to get function
+            # Check if tool was created by admin (allows network requests)
+            is_admin_tool = tool_data.get("is_admin_tool", False)
+            
+            # Execute code to get function (allow network for admin tools)
             exec_globals = {}
+            if is_admin_tool:
+                # Allow network modules for admin tools
+                try:
+                    import requests
+                    exec_globals['requests'] = requests
+                except ImportError:
+                    pass
+                try:
+                    import urllib.request
+                    import urllib.parse
+                    exec_globals['urllib'] = type('urllib', (), {
+                        'request': urllib.request,
+                        'parse': urllib.parse
+                    })()
+                except ImportError:
+                    pass
             exec(tool_data["code"], exec_globals)
             
             if tool_name not in exec_globals:
@@ -218,8 +264,9 @@ def create_meta_tools(sandbox: ToolSandbox, storage: ToolStorage, registry: LLMT
             
             return {
                 "success": True,
-                "message": f"Tool '{tool_name}' registered successfully and is now available for use.",
-                "tool_name": tool_name
+                "message": f"Tool '{tool_name}' registered successfully and is now available for use. Users can reference this tool by name: '{tool_name}'.",
+                "tool_name": tool_name,
+                "user_message": f"✅ Tool '{tool_name}' is now available! Users can reference it by asking about '{tool_name}' or using it in queries."
             }
         
         except Exception as e:
@@ -289,10 +336,14 @@ def create_meta_tools(sandbox: ToolSandbox, storage: ToolStorage, registry: LLMT
             }
         
         # Execute in sandbox
+        # Check if tool was created by admin (allows network requests)
+        is_admin_tool = tool_data.get("is_admin_tool", False)
+        
         result = sandbox.execute_safely(
             code=tool_data["code"],
             function_name=tool_name,
-            arguments=arguments
+            arguments=arguments,
+            allow_network=is_admin_tool
         )
         
         return result
@@ -349,6 +400,54 @@ def create_meta_tools(sandbox: ToolSandbox, storage: ToolStorage, registry: LLMT
             "required": ["tool_name"]
         },
         function=get_tool_code
+    ))
+    
+    # Tool: List all available tools (registered + stored)
+    def list_all_tools() -> Dict[str, Any]:
+        """List all available tools (both registered and stored)."""
+        # Get registered tools
+        registered_tools = []
+        for tool_name, tool in registry.tools.items():
+            registered_tools.append({
+                "name": tool_name,
+                "description": tool.description,
+                "status": "registered",
+                "available": True
+            })
+        
+        # Get stored tools
+        stored_tool_names = storage.list_tools()
+        stored_tools = []
+        for name in stored_tool_names:
+            # Skip if already registered
+            if name in registry.tools:
+                continue
+            tool_data = storage.get_tool(name)
+            stored_tools.append({
+                "name": name,
+                "description": tool_data.get("description"),
+                "status": "stored",
+                "tested": tool_data.get("test_results") is not None,
+                "tests_passed": tool_data.get("test_results", {}).get("failed", 0) == 0 if tool_data.get("test_results") else None,
+                "available": False  # Not registered yet
+            })
+        
+        return {
+            "registered_tools": registered_tools,
+            "stored_tools": stored_tools,
+            "total_registered": len(registered_tools),
+            "total_stored": len(stored_tools),
+            "total": len(registered_tools) + len(stored_tools)
+        }
+    
+    tools.append(LLMTool(
+        name="list_all_tools",
+        description="List all available tools (both registered and stored). Registered tools are ready to use. Stored tools need to be tested and registered first. Use this to see what tools users can reference.",
+        parameters={
+            "type": "object",
+            "properties": {}
+        },
+        function=list_all_tools
     ))
     
     return tools

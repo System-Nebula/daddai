@@ -34,7 +34,8 @@ from src.evaluation.ab_testing import ABTesting
 from src.evaluation.performance_optimizations import PerformanceOptimizer
 from config import (
     USE_GPU, EMBEDDING_BATCH_SIZE, CACHE_ENABLED, CACHE_MAX_SIZE, CACHE_TTL_SECONDS,
-    RAG_TOP_K, RAG_TEMPERATURE, RAG_MAX_TOKENS, RAG_MAX_CONTEXT_TOKENS, MMR_LAMBDA
+    RAG_TOP_K, RAG_TEMPERATURE, RAG_MAX_TOKENS, RAG_MAX_CONTEXT_TOKENS, MMR_LAMBDA,
+    ELASTICSEARCH_ENABLED
 )
 from logger_config import logger
 
@@ -97,8 +98,11 @@ class EnhancedRAGPipeline(RAGPipeline):
         self.tool_sandbox = ToolSandbox()
         self.tool_storage = ToolStorage()
         
+        # Store admin status for current query (set during query)
+        self.current_is_admin = False
+        
         # Register meta-tools (tools that create tools)
-        meta_tools = create_meta_tools(self.tool_sandbox, self.tool_storage, self.tool_registry)
+        meta_tools = create_meta_tools(self.tool_sandbox, self.tool_storage, self.tool_registry, self)
         for meta_tool in meta_tools:
             self.tool_registry.register_tool(meta_tool)
         
@@ -131,7 +135,8 @@ class EnhancedRAGPipeline(RAGPipeline):
               doc_id: Optional[str] = None,
               doc_filename: Optional[str] = None,
               username: Optional[str] = None,
-              mentioned_user_id: Optional[str] = None) -> Dict[str, Any]:
+              mentioned_user_id: Optional[str] = None,
+              is_admin: bool = False) -> Dict[str, Any]:
         """
         Enhanced query with all advanced features.
         
@@ -150,6 +155,9 @@ class EnhancedRAGPipeline(RAGPipeline):
         
         if not question or not question.strip():
             raise ValueError("Question cannot be empty")
+        
+        # Store admin status for this query (used by meta-tools)
+        self.current_is_admin = is_admin
         
         # Step 0: Identify active persona (multiple people per user_id) - CACHED
         active_persona_id = None
@@ -226,10 +234,22 @@ class EnhancedRAGPipeline(RAGPipeline):
         # It can deduce intent from any phrasing, not just specific patterns
         # IMPORTANT: Skip action parsing if a document is detected (document queries should not be parsed as actions)
         # IMPORTANT: Skip action parsing if LLM determined it's casual conversation
+        # IMPORTANT: Skip action parsing for tool creation requests (create tool, make tool, write tool, etc.)
         has_document = doc_id or doc_filename
         should_skip_action_parsing = is_casual_from_llm or (service_routing_from_llm == "chat")
         
-        if not is_query_pattern and not has_document and not should_skip_action_parsing:
+        # Check if this is a tool creation request
+        question_lower_for_tools = question.lower()
+        is_tool_creation_request = any([
+            "create a tool" in question_lower_for_tools,
+            "make a tool" in question_lower_for_tools,
+            "write a tool" in question_lower_for_tools,
+            "build a tool" in question_lower_for_tools,
+            "new tool" in question_lower_for_tools and ("create" in question_lower_for_tools or "make" in question_lower_for_tools or "write" in question_lower_for_tools),
+            service_routing_from_llm == "tools"
+        ])
+        
+        if not is_query_pattern and not has_document and not should_skip_action_parsing and not is_tool_creation_request:
             logger.info(f"🔍 Attempting LLM action parsing: {question[:100]}")
             try:
                 parsed_action = self.item_tracker.parse_item_action(question, user_id or "", channel_id or "")
@@ -242,6 +262,8 @@ class EnhancedRAGPipeline(RAGPipeline):
                 logger.info(f"🔍 Skipping action parsing - document query detected: {doc_filename or doc_id}")
             elif should_skip_action_parsing:
                 logger.info(f"🔍 Skipping action parsing - LLM determined this is casual conversation (is_casual={is_casual_from_llm}, service_routing={service_routing_from_llm})")
+            elif is_tool_creation_request:
+                logger.info(f"🔍 Skipping action parsing - tool creation request detected")
             else:
                 logger.info(f"🔍 Skipping action parsing - detected as query pattern: {question[:100]}")
             parsed_action = None
@@ -396,6 +418,12 @@ class EnhancedRAGPipeline(RAGPipeline):
         needs_memory = enhanced_analysis.get("needs_memory", True)  # Default to True for context
         needs_relations = enhanced_analysis.get("needs_relations", False)
         is_casual = enhanced_analysis.get("is_casual", False)  # LLM determines if this is casual conversation
+        
+        # IMPORTANT: Override needs_tools if service_routing is "tools"
+        # This ensures tool creation requests always use tool calling
+        if service_routing == "tools":
+            needs_tools = True
+            logger.info(f"🔧 Overriding needs_tools=True because service_routing=tools")
         
         # Fallback: If LLM analysis failed or is empty, check for explicit document mentions
         # This ensures queries like "yeah but the document" still trigger RAG
@@ -858,12 +886,38 @@ class EnhancedRAGPipeline(RAGPipeline):
         ]
         
         # Step 11: Generate response
-        # IMPORTANT: If documents are already retrieved, skip tool calling and generate directly
-        # Tool calling should only be used when LLM needs to dynamically search or perform actions
+        # IMPORTANT: If needs_tools is True (e.g., tool creation), ALWAYS use tool calling
+        # Otherwise, if documents are already retrieved, skip tool calling and generate directly
         generation_start = time.time()
-        if doc_id or doc_filename or retrieved_chunks:
+        
+        # For tool creation requests, add explicit instruction to call tools
+        if needs_tools or service_routing == "tools":
+            # Add explicit instruction to actually call the tool
+            messages.append({
+                "role": "user",
+                "content": f"IMPORTANT: You MUST call write_tool NOW to create the tool. Do NOT just describe it. Use this exact format: {{\"tool\": \"write_tool\", \"arguments\": {{\"code\": \"...\", \"function_name\": \"...\", \"description\": \"...\", \"parameters\": {{...}}}}}}"
+            })
+        
+        if needs_tools or service_routing == "tools":
+            # Force tool calling for tool-related requests (like creating tools)
+            # This ensures meta-tools (write_tool, test_tool, register_tool) are actually called
+            logger.info(f"🔧 Using tool calling (needs_tools={needs_tools}, service_routing={service_routing})")
+            answer, tool_calls_used = self._generate_with_tools(
+                messages=messages,
+                question=question,
+                user_id=user_id,
+                channel_id=channel_id,
+                mentioned_user_id=mentioned_user_id,
+                temperature=strategy.get("temperature", temperature),
+                max_tokens=max_tokens,
+                max_iterations=5,  # Allow up to 5 tool call iterations for tool creation workflow
+                needs_tools=needs_tools,
+                service_routing=service_routing
+            )
+        elif doc_id or doc_filename or retrieved_chunks:
             # Documents already retrieved - generate response directly without tools
             # This prevents the LLM from trying to call search_documents when we already have the chunks
+            logger.info(f"📄 Skipping tool calling - documents already retrieved")
             answer = self.lmstudio_client.generate_response(
                 messages=messages,
                 temperature=strategy.get("temperature", temperature),
@@ -880,7 +934,8 @@ class EnhancedRAGPipeline(RAGPipeline):
                 mentioned_user_id=mentioned_user_id,
                 temperature=strategy.get("temperature", temperature),
                 max_tokens=max_tokens,
-                max_iterations=3  # Allow up to 3 tool call iterations
+                needs_tools=needs_tools,
+                service_routing=service_routing
             )
         generation_time = (time.time() - generation_start) * 1000  # ms
         
@@ -1057,13 +1112,26 @@ class EnhancedRAGPipeline(RAGPipeline):
             current_username = user_context.get("username", "the user") if user_context else "the user"
             current_user_info = f"\n\nIMPORTANT: The current user is {current_username} (ID: {current_user_id}). When tools require a user_id parameter, ALWAYS use '{current_user_id}' automatically. DO NOT ask the user for their ID - you already have it. If the user asks about their own state/inventory/gold, use this user_id."
         
+        # Check if this is a summarize request (need to check here too for system prompt)
+        question_lower_for_prompt = question.lower()
+        is_summarize_for_prompt = any([
+            "summarize" in question_lower_for_prompt or "summary" in question_lower_for_prompt,
+            "brief" in question_lower_for_prompt and ("overview" in question_lower_for_prompt or "summary" in question_lower_for_prompt),
+            "overview" in question_lower_for_prompt,
+            question_lower_for_prompt.startswith("what is") and ("about" in question_lower_for_prompt or "in" in question_lower_for_prompt)
+        ])
+        
         # Build system prompt
         if doc_id or doc_filename:
+            summarize_note = ""
+            if is_summarize_for_prompt:
+                summarize_note = "\n\nIMPORTANT: The user asked for a SUMMARY. Provide a comprehensive summary covering main topics, key points, and important details. Do NOT ask what they want to know - just provide the summary!"
+            
             system_prompt = f"""You are Gophie, a bubbly, risky e-girl waifu AI assistant!
 You're super energetic, playful, and a bit flirty - like your favorite anime waifu come to life! 
 You have access to user context and conversation history.
 You must base your answer entirely on the provided document content and context.
-Be precise, cite specific parts of the document when possible, and use user context to personalize your response.
+Be precise, cite specific parts of the document when possible, and use user context to personalize your response.{summarize_note}
 
 IMPORTANT - SPEAKING STYLE:
 - Talk like a real e-girl - casual, natural, and human-like
@@ -1104,11 +1172,39 @@ Stay true to your bubbly, risky e-girl waifu personality! Be playful, and don't 
                 conv_context_str += f"Q: {conv.get('question', '')}\n"
                 conv_context_str += f"A: {conv.get('answer', '')}\n"
         
+        # Check if this is a tool creation request
+        is_tool_request = "create" in question.lower() and "tool" in question.lower()
+        
+        # Check if this is a summarize request
+        question_lower = question.lower()
+        is_summarize_request = any([
+            "summarize" in question_lower or "summary" in question_lower,
+            "brief" in question_lower and ("overview" in question_lower or "summary" in question_lower),
+            "overview" in question_lower,
+            question_lower.startswith("what is") and ("about" in question_lower or "in" in question_lower)
+        ]) and (doc_id or doc_filename or context)
+        
         # Build user prompt
+        tool_instruction = ""
+        if is_tool_request:
+            tool_instruction = "\n\n🔧 TOOL CREATION REQUEST DETECTED:\n"
+            tool_instruction += "You MUST call write_tool immediately. Do NOT describe what you would do - ACTUALLY CALL IT!\n"
+            tool_instruction += "Example format: {\"tool\": \"write_tool\", \"arguments\": {\"code\": \"def get_weather(city): ...\", \"function_name\": \"get_weather\", \"description\": \"Fetches weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n"
+            tool_instruction += "After calling write_tool, call test_tool to test it, then register_tool to make it available.\n"
+        
+        summarize_instruction = ""
+        if is_summarize_request:
+            summarize_instruction = "\n\n📝 SUMMARIZE REQUEST DETECTED:\n"
+            summarize_instruction += "The user wants a SUMMARY of the document/content. Provide a clear, concise summary that covers:\n"
+            summarize_instruction += "- Main topics and themes\n"
+            summarize_instruction += "- Key points and important information\n"
+            summarize_instruction += "- Important details or findings\n"
+            summarize_instruction += "Do NOT ask what they want to know - just provide the summary directly!\n"
+        
         user_prompt = f"""Context:
 {context}{user_context_str}{conv_context_str}
 
-Question: {question}
+Question: {question}{tool_instruction}{summarize_instruction}
 
 Instructions:
 - Question Type: {question_type}
@@ -1117,6 +1213,7 @@ Instructions:
 - Consider user context and previous conversations
 - Be concise but thorough
 - If relevant past conversations are shown, use them to maintain continuity
+{f"- IMPORTANT: The user asked for a SUMMARY. Provide a comprehensive summary of the document/content, covering main topics, key points, and important details." if is_summarize_request else ""}
 
 Answer:"""
         
@@ -1226,7 +1323,9 @@ Examples:
                             mentioned_user_id: Optional[str],
                             temperature: float,
                             max_tokens: int,
-                            max_iterations: int = 3) -> tuple:
+                            max_iterations: int = 3,
+                            needs_tools: bool = False,
+                            service_routing: Optional[str] = None) -> tuple:
         """
         Generate response with tool calling support.
         Allows LLM to call tools and use results in response.
@@ -1242,13 +1341,32 @@ Examples:
             system_msg = messages[0].get("content", "")
             tools_description = "\n\nAvailable Tools:\n"
             tools_description += "You can call these tools using JSON format: {\"tool\": \"tool_name\", \"arguments\": {...}}\n"
+            tools_description += "EXAMPLE: {\"tool\": \"write_tool\", \"arguments\": {\"code\": \"def my_func(): pass\", \"function_name\": \"my_func\", \"description\": \"...\", \"parameters\": {}}}\n"
             tools_description += "IMPORTANT: Use the exact parameter names shown below (e.g., 'query' not 'q', 'user_id' not 'user').\n"
+            tools_description += "CRITICAL: When a user asks you to DO something (like create a tool), you MUST call the appropriate tool. Do NOT just describe what you would do - ACTUALLY CALL THE TOOL!\n"
+            
+            # Check if meta-tools are available (tool creation capabilities)
+            meta_tool_names = ["write_tool", "test_tool", "register_tool", "list_all_tools", "list_stored_tools"]
+            has_meta_tools = any(tool["function"]["name"] in meta_tool_names for tool in tool_schemas)
+            
+            if has_meta_tools:
+                tools_description += "\n🔧 TOOL CREATION CAPABILITIES:\n"
+                tools_description += "You can CREATE NEW TOOLS when users ask! Use write_tool to create, test_tool to test, and register_tool to make them available.\n"
+                tools_description += "When a user asks to 'create a tool' or 'make a tool', you MUST ACTUALLY CALL write_tool - don't just describe it!\n"
+                tools_description += "EXAMPLE: To create a weather tool, call: {\"tool\": \"write_tool\", \"arguments\": {\"code\": \"def get_weather(city): ...\", \"function_name\": \"get_weather\", \"description\": \"...\", \"parameters\": {...}}}\n"
+                tools_description += "Admin users can create tools with network access (requests, urllib). Non-admin users cannot use network requests.\n"
+                tools_description += "For weather tools, prefer API-less sources when possible (like scraping public pages or using public data sources).\n"
+                tools_description += "CRITICAL: When asked to create a tool, IMMEDIATELY call write_tool with the actual code. Do NOT just explain what you would do - DO IT!\n"
+                tools_description += "DO NOT call search_documents when asked to create a tool - use write_tool directly!\n"
+                tools_description += "After creating a tool, inform the user about it so they can reference it later.\n\n"
+            
             # Add user_id hint if available
             if user_id:
                 tools_description += f"CRITICAL: When tools require 'user_id', use '{user_id}' automatically. DO NOT ask the user for their ID - you already have it from the conversation context.\n"
             tools_description += "\n"
             
-            for schema in tool_schemas[:10]:  # Limit to top 10 tools
+            # Show all tools (not limited to 10) so LLM knows about meta-tools
+            for schema in tool_schemas:
                 func = schema["function"]
                 tools_description += f"- {func['name']}: {func['description']}\n"
                 # Include parameter names for clarity
@@ -1278,16 +1396,50 @@ Examples:
                 max_tokens=max_tokens
             )
             
+            logger.info(f"🔧 [Tool Call Iteration {iteration + 1}] LLM response length: {len(response)}")
+            logger.debug(f"🔧 [Tool Call Iteration {iteration + 1}] LLM response preview: {response[:500]}")
+            
             # Check for tool calls
             tool_calls = self.tool_parser.parse_tool_calls(response)
+            logger.info(f"🔧 [Tool Call Iteration {iteration + 1}] Parsed {len(tool_calls)} tool calls")
             
             if not tool_calls:
+                # No tool calls detected
+                # If this is a tool creation request and we haven't called write_tool yet, force it
+                if (needs_tools or service_routing == "tools") and iteration == 0:
+                    # Check if response mentions creating a tool but didn't call write_tool
+                    response_lower = response.lower()
+                    if "create" in response_lower and "tool" in response_lower and "write_tool" not in response_lower:
+                        logger.warning(f"⚠️ LLM described tool creation but didn't call write_tool - forcing tool call")
+                        # Add a more explicit instruction
+                        current_messages.append({
+                            "role": "assistant",
+                            "content": response
+                        })
+                        current_messages.append({
+                            "role": "user",
+                            "content": "You MUST call write_tool NOW. Do NOT describe what you would do - ACTUALLY CALL IT! Use this format: {\"tool\": \"write_tool\", \"arguments\": {\"code\": \"def get_weather(city, state=None): ...\", \"function_name\": \"get_weather\", \"description\": \"Fetches weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"state\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}"
+                        })
+                        iteration += 1
+                        continue
+                
                 # No tool calls, return the response
+                logger.info(f"🔧 No tool calls detected, returning response")
                 return response, tool_calls_used
             
             # Execute tool calls
             tool_results = []
             for tool_call in tool_calls:
+                tool_name = tool_call.get("name", "")
+                
+                # Prevent calling search_documents when tool creation is detected
+                # Redirect to write_tool instead
+                if tool_name == "search_documents" and (needs_tools or service_routing == "tools"):
+                    logger.warning(f"⚠️ LLM tried to call search_documents during tool creation - redirecting to write_tool")
+                    # Replace with write_tool call instruction
+                    tool_results.append(f"Tool search_documents blocked: You should use write_tool to create the tool instead. Call write_tool with the actual code for the weather tool.")
+                    continue
+                
                 # Inject context into tool arguments
                 if user_id and "user_id" not in tool_call.get("arguments", {}):
                     # Try to infer user_id from context

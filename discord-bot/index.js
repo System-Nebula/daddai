@@ -758,267 +758,47 @@ async function handleQuestion(message) {
         let response;
         let useRAG = false;
         
-        // Check for special "list all documents" or "summarize all documents" queries
-        const lowerQuestion = cleanedQuestion.toLowerCase();
-        // Distinguish between "list" (simple list) and "summarize" (detailed summaries)
-        const isSummarizeQuery = /(?:summarize|summary|summaries|brief|overview|describe).*(?:all|each|every|the).*(?:document|file|doc)/i.test(cleanedQuestion) ||
-                                 /(?:document|file|doc).*(?:summarize|summary|summaries|brief|overview|describe)/i.test(cleanedQuestion);
-        // Only match if explicitly asking for "all", "each", or "every" documents
-        // Don't match questions about specific documents like "what model is the kohya document training?"
+        // LLM-based document detection - no pattern matching
+        // The RAG pipeline uses LLM query analysis to detect document references automatically
+        // We only handle explicit "list all documents" queries and explicit filename comparisons here
+        
         const isListAllDocsQuery = /(?:list|show|what|which).*(?:all|each|every)\s+(?:document|file|doc)/i.test(cleanedQuestion) ||
                                    /(?:list|show)\s+(?:all|each|every)\s+(?:document|file|doc)/i.test(cleanedQuestion) ||
                                    /(?:what|which)\s+(?:document|file|doc)/i.test(cleanedQuestion) && /(?:all|each|every|available|have|you have|stored|do you have)/i.test(cleanedQuestion) ||
                                    /(?:document|file|doc).*(?:available|have|you have|stored|do you have)/i.test(cleanedQuestion);
         
-        // Detect if user is asking about a specific document
+        // Document detection variables (will be set by RAG pipeline via LLM analysis)
         let targetDocId = null;
         let targetDocFilename = null;
-        let isSummarizeSingleDoc = false;
+        
+        // Only handle explicit filename comparisons (e.g., "compare file1.pdf and file2.pdf")
         let isCompareDocs = false;
-        let isCompareMultipleDocs = false;
         let compareDoc1Id = null;
         let compareDoc1Filename = null;
         let compareDoc2Id = null;
         let compareDoc2Filename = null;
-        let compareDocPattern = null;
         
-        // Check for multi-document comparison patterns (e.g., "what changed from our build logs")
-        const multiComparePatterns = [
-            /(?:what changed|what's different|what are the differences|changes|compare|difference)\s+(?:from|in|across|between|in my|in our|in the)\s+(?:our|the|all|all of|all our|my)?\s*(?:build logs?|build-logs?|documents?|files?|logs?)/i,
-            /(?:what changed|what's different|what are the differences|changes|compare|difference)\s+(?:from|in|across|between|in my|in our|in the)\s+(?:our|the|all|all of|all our|my)?\s*([\w\-]+)\s*(?:logs?|documents?|files?)/i,
-            /(?:compare|difference|differences|changes)\s+(?:all|all of|all our|our|the|my)\s*(?:build logs?|build-logs?|documents?|files?|logs?)/i,
-            /(?:compare|difference|differences|changes)\s+(?:all|all of|all our|our|the|my)\s*([\w\-]+)\s*(?:logs?|documents?|files?)/i,
-            /(?:what are|what's|what)\s+(?:the\s+)?(?:differences?|changes?|different)\s+(?:in|from|between|across)\s+(?:my|our|the|all)?\s*(?:build logs?|build-logs?|documents?|files?|logs?)/i,
-            /(?:what are|what's|what)\s+(?:the\s+)?(?:differences?|changes?|different)\s+(?:in|from|between|across)\s+(?:my|our|the|all)?\s*([\w\-]+)\s*(?:logs?|documents?|files?)/i
+        const comparePatterns = [
+            /(?:compare|difference|different|changed|changes|what's different|what changed)\s+(?:between|in|from|to)?\s*([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))\s+(?:and|vs|versus|with|to)\s+([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))/i,
+            /(?:compare|difference|different|changed|changes|what's different|what changed)\s+([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))\s+(?:and|vs|versus|with|to)\s+([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))/i,
+            /([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))\s+(?:vs|versus)\s+([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))/i
         ];
         
-        for (const pattern of multiComparePatterns) {
+        for (const pattern of comparePatterns) {
             const match = cleanedQuestion.match(pattern);
-            if (match) {
-                isCompareMultipleDocs = true;
-                // Extract pattern if specified (e.g., "build logs" -> "build-logs")
-                if (match[1]) {
-                    compareDocPattern = match[1].toLowerCase().replace(/\s+/g, '-');
-                }
+            if (match && match[1] && match[2]) {
+                compareDoc1Filename = match[1];
+                compareDoc2Filename = match[2];
+                isCompareDocs = true;
                 break;
             }
         }
         
-        // Check for two-document comparison patterns (only if not multi-doc comparison)
-        if (!isCompareMultipleDocs) {
-            const comparePatterns = [
-                /(?:compare|difference|different|changed|changes|what's different|what changed)\s+(?:between|in|from|to)?\s*([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))\s+(?:and|vs|versus|with|to)\s+([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))/i,
-                /(?:compare|difference|different|changed|changes|what's different|what changed)\s+([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))\s+(?:and|vs|versus|with|to)\s+([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))/i,
-                /([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))\s+(?:vs|versus)\s+([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))/i
-            ];
-            
-            for (const pattern of comparePatterns) {
-                const match = cleanedQuestion.match(pattern);
-                if (match && match[1] && match[2]) {
-                    compareDoc1Filename = match[1];
-                    compareDoc2Filename = match[2];
-                    isCompareDocs = true;
-                    break;
-                }
-            }
-        }
-        
-        // Check for "summarize [filename]" pattern specifically
-        if (!isCompareDocs && !isCompareMultipleDocs) {
-            const summarizePattern = /^summarize\s+([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))$/i;
-            const summarizeMatch = cleanedQuestion.match(summarizePattern);
-            if (summarizeMatch && summarizeMatch[1]) {
-                targetDocFilename = summarizeMatch[1];
-                isSummarizeSingleDoc = true;
-            } else {
-                // Try to extract document filename from cleaned question (without mentions)
-                // Patterns: "in document X", "from X.pdf", "what does X say", "according to X"
-                const docFilenamePatterns = [
-                    /(?:in|from|about|according to|based on|in the document|in the file)\s+([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))/i,
-                    /(?:document|file|paper)\s+([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))/i,
-                    /"([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))"/i,
-                    /'([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))'/i,
-                    /\b([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))\b/i  // Any filename pattern
-                ];
-                
-                for (const pattern of docFilenamePatterns) {
-                    const match = cleanedQuestion.match(pattern);
-                    if (match && match[1]) {
-                        targetDocFilename = match[1];
-                        break;
-                    }
-                }
-            }
-        }
-        
-        // If comparing multiple documents, find all matching documents
-        if (isCompareMultipleDocs) {
-            try {
-                const allDocs = await documentService.getAllDocuments();
-                const documents = allDocs.documents || allDocs || [];
-                
-                // Filter documents by pattern if specified
-                let matchingDocs = documents;
-                if (compareDocPattern) {
-                    matchingDocs = documents.filter(doc => 
-                        doc.file_name.toLowerCase().includes(compareDocPattern)
-                    );
-                }
-                
-                // Sort by upload date (oldest first)
-                matchingDocs.sort((a, b) => {
-                    const dateA = new Date(a.uploaded_at || 0);
-                    const dateB = new Date(b.uploaded_at || 0);
-                    return dateA - dateB;
-                });
-                
-                console.log(`🎯 Found ${matchingDocs.length} documents to compare (sorted by date)`);
-                
-                if (matchingDocs.length < 2) {
-                    response = {
-                        answer: `I found ${matchingDocs.length} document(s) matching your query. I need at least 2 documents to compare.`,
-                        context_chunks: 0,
-                        memories_used: 0,
-                        source_documents: matchingDocs.map(d => d.file_name),
-                        source_memories: []
-                    };
-                } else {
-                    // Compare documents sequentially (doc1 vs doc2, doc2 vs doc3, etc.)
-                    const comparisons = [];
-                    
-                    for (let i = 0; i < matchingDocs.length - 1; i++) {
-                        const doc1 = matchingDocs[i];
-                        const doc2 = matchingDocs[i + 1];
-                        
-                        try {
-                            // Get chunks from both documents
-                            const chunks1Response = await documentService.getDocumentChunks(doc1.id);
-                            const chunks2Response = await documentService.getDocumentChunks(doc2.id);
-                            const chunks1 = chunks1Response.chunks || [];
-                            const chunks2 = chunks2Response.chunks || [];
-                            
-                            if (chunks1.length === 0 || chunks2.length === 0) {
-                                comparisons.push(`**${doc1.file_name} → ${doc2.file_name}**: Could not compare (one or both documents have no content)`);
-                                continue;
-                            }
-                            
-                            // Get full document text (no truncation - let the comparison service handle compression)
-                            const doc1Text = chunks1
-                                .map(chunk => chunk.text || '')
-                                .join('\n\n');
-                            
-                            const doc2Text = chunks2
-                                .map(chunk => chunk.text || '')
-                                .join('\n\n');
-                            
-                            // Use smart document comparison service for intelligent compression and comparison
-                            try {
-                                console.log(`🔄 Comparing ${doc1.file_name} (${doc1Text.length} chars) vs ${doc2.file_name} (${doc2Text.length} chars)...`);
-                                const comparisonResult = await compareDocuments(
-                                    doc1Text,
-                                    doc2Text,
-                                    doc1.file_name,
-                                    doc2.file_name
-                                );
-                                
-                                console.log(`✅ Comparison complete for ${doc1.file_name} → ${doc2.file_name}`);
-                                console.log(`   Comparison result keys: ${Object.keys(comparisonResult).join(', ')}`);
-                                console.log(`   Comparison length: ${comparisonResult.comparison?.length || 0} chars`);
-                                console.log(`   Has error: ${!!comparisonResult.error}`);
-                                if (comparisonResult.error) {
-                                    console.log(`   Error: ${comparisonResult.error}`);
-                                }
-                                // Log first 200 chars of comparison to see what we got
-                                if (comparisonResult.comparison) {
-                                    console.log(`   Comparison preview: ${comparisonResult.comparison.substring(0, 200)}...`);
-                                }
-                                
-                                // Check if comparison result indicates an error
-                                let comparison = comparisonResult.comparison || '';
-                                if (comparisonResult.error) {
-                                    console.warn(`   ⚠️ Comparison had an error: ${comparisonResult.error}`);
-                                    // If comparison is just an error message, use it; otherwise append error info
-                                    if (comparison.includes('Error comparing')) {
-                                        comparison = comparison; // Already has error message
-                                    } else {
-                                        comparison = `${comparison}\n\n⚠️ Note: Comparison encountered an issue: ${comparisonResult.error}`;
-                                    }
-                                }
-                                
-                                if (!comparison || comparison.length < 50) {
-                                    console.warn(`   ⚠️ Comparison result seems too short or empty (${comparison.length} chars), using fallback`);
-                                    comparison = comparisonResult.error 
-                                        ? `Error during comparison: ${comparisonResult.error}` 
-                                        : 'Could not generate detailed comparison. The documents may be too large or similar.';
-                                }
-                                const compressionInfo = comparisonResult.doc1_original_length && comparisonResult.doc2_original_length
-                                    ? `\n\n*[Compressed: ${Math.round(comparisonResult.compression_ratio_doc1 * 100)}% and ${Math.round(comparisonResult.compression_ratio_doc2 * 100)}% of original size]*`
-                                    : '';
-                                
-                                comparisons.push(`**${doc1.file_name} → ${doc2.file_name}**${compressionInfo}\n${comparison}`);
-                                console.log(`   Added comparison to array (total: ${comparisons.length})`);
-                            } catch (error) {
-                                console.error(`❌ Error in smart comparison: ${error.message}`);
-                                console.error(`   Stack: ${error.stack}`);
-                                // Fallback to simple comparison
-                                const doc1TextShort = doc1Text.substring(0, 3000);
-                                const doc2TextShort = doc2Text.substring(0, 3000);
-                                const comparisonPrompt = `Compare these two documents and identify what changed. Focus on errors, warnings, metrics, and key differences.
-
-Document 1 (older): ${doc1.file_name}
-${doc1TextShort}${doc1Text.length > 3000 ? '\n\n[Content truncated...]' : ''}
-
-Document 2 (newer): ${doc2.file_name}
-${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
-                                
-                                const comparisonResponse = await Promise.race([
-                                    chatService.chat(comparisonPrompt, []),
-                                    new Promise((_, reject) => 
-                                        setTimeout(() => reject(new Error('Comparison timeout')), 20000)
-                                    )
-                                ]);
-                                
-                                comparisons.push(`**${doc1.file_name} → ${doc2.file_name}**\n${comparisonResponse || 'Could not generate comparison'}`);
-                            }
-                            
-                        } catch (error) {
-                            console.error(`Error comparing ${doc1.file_name} and ${doc2.file_name}:`, error);
-                            comparisons.push(`**${doc1.file_name} → ${doc2.file_name}**: Error - ${error.message}`);
-                        }
-                    }
-                    
-                    if (comparisons.length > 0) {
-                        const comparisonText = comparisons.join('\n\n---\n\n');
-                        console.log(`📝 Setting response with ${comparisons.length} comparison(s), total length: ${comparisonText.length} chars`);
-                        response = {
-                            answer: `**Changes Across ${matchingDocs.length} Documents** (sorted oldest → newest):\n\n${comparisonText}`,
-                            context_chunks: matchingDocs.reduce((sum, d) => sum + (d.chunk_count || 0), 0),
-                            memories_used: 0,
-                            source_documents: matchingDocs.map(d => d.file_name),
-                            source_memories: []
-                        };
-                        console.log(`✅ Response set successfully`);
-                    } else {
-                        console.log(`⚠️ No comparisons generated (comparisons.length = ${comparisons.length})`);
-                        response = {
-                            answer: `I couldn't generate comparisons for the ${matchingDocs.length} documents found.`,
-                            context_chunks: 0,
-                            memories_used: 0,
-                            source_documents: matchingDocs.map(d => d.file_name),
-                            source_memories: []
-                        };
-                    }
-                }
-            } catch (error) {
-                console.error('Error comparing multiple documents:', error);
-                response = {
-                    answer: `I encountered an error while comparing documents: ${error.message}`,
-                    context_chunks: 0,
-                    memories_used: 0,
-                    source_documents: [],
-                    source_memories: []
-                };
-            }
+        // Also handle explicit filename mentions (e.g., "summarize file.pdf")
+        const explicitFilenamePattern = /\b([\w\-\.]+\.(?:pdf|docx?|txt|md|log|csv))\b/i;
+        const filenameMatch = cleanedQuestion.match(explicitFilenamePattern);
+        if (filenameMatch && filenameMatch[1] && !isCompareDocs) {
+            targetDocFilename = filenameMatch[1];
         }
         
         // If comparing two documents, find both document IDs
@@ -1079,128 +859,9 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
             }
         }
         
-        // Smart document detection: Try to find documents by name/content keywords OR semantic search
-        // This handles cases like "crowd strike 2025 threat report" or "what is the worst country in the report?"
-        if (!targetDocId && !targetDocFilename && !isListAllDocsQuery && !isCompareDocs && !isCompareMultipleDocs) {
-            try {
-                // First, try to extract explicit document name/keywords from question
-                // Look for patterns like "in [document name]", "from [document name]", "summarize the [name]", etc.
-                const docNamePatterns = [
-                    /(?:summarize|summary|summaries|brief|overview|describe|explain|tell me about)\s+(?:the|a|an)?\s*([a-z0-9\s\-]+?)(?:\s+(?:report|study|analysis|document|paper|guide|manual|handbook|file|doc|logs?))?$/i,
-                    /(?:in|from|about|according to|based on|in the)\s+([a-z0-9\s\-]+?)\s+(?:report|study|analysis|document|paper|guide|manual|handbook)/i,
-                    /(?:the|a|an)\s+([a-z0-9\s\-]+?)\s+(?:report|study|analysis|document|paper|guide|manual|handbook)/i,
-                    /([a-z0-9\s\-]+?)\s+(?:report|study|analysis|document|paper|guide|manual|handbook)/i,
-                    // Pattern for questions like "what model is the kohya document training?"
-                    /(?:what|which|who|when|where|how).*?(?:the|a|an)?\s*([a-z0-9\s\-]+?)\s+(?:document|file|doc|report|study|analysis|paper|guide|manual|handbook|logs?)/i,
-                    // Pattern for questions like "what model is kohya training?" (name before verb)
-                    /(?:what|which|who|when|where|how).*?(?:is|are|was|were|does|do|did|has|have|had)\s+([a-z0-9\s\-]+?)\s+(?:training|using|running|doing|working|processing|analyzing|generating|creating|building|compiling|executing|performing|doing|saying|showing|containing|mentioning)/i,
-                    // Pattern for questions like "what model is kohya training?" where name comes before the verb
-                    /(?:what|which|who|when|where|how)\s+[\w\s]+\s+(?:is|are|was|were|does|do|did|has|have|had)\s+([a-z0-9\s\-]+?)\s+\?/i
-                ];
-                
-                let detectedDocName = null;
-                let foundByName = false;
-                
-                for (const pattern of docNamePatterns) {
-                    const match = cleanedQuestion.match(pattern);
-                    if (match && match[1]) {
-                        detectedDocName = match[1].trim().toLowerCase();
-                        // Extract key terms (remove common words)
-                        const keyTerms = detectedDocName
-                            .split(/\s+/)
-                            .filter(term => term.length > 2 && !['the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'her', 'was', 'one', 'our', 'out', 'day', 'get', 'has', 'him', 'his', 'how', 'man', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 'boy', 'did', 'its', 'let', 'put', 'say', 'she', 'too', 'use'].includes(term))
-                            .slice(0, 5); // Take up to 5 key terms
-                        
-                        if (keyTerms.length > 0) {
-                            console.log(`🔍 Detected potential document name: "${detectedDocName}" (key terms: ${keyTerms.join(', ')})`);
-                            
-                            // Try to find matching documents by filename
-                            const allDocs = await documentService.getAllDocuments();
-                            const documents = allDocs.documents || allDocs || [];
-                            
-                            // Score documents by how many key terms they match
-                            const scoredDocs = documents.map(doc => {
-                                const fileNameLower = doc.file_name.toLowerCase();
-                                let score = 0;
-                                for (const term of keyTerms) {
-                                    if (fileNameLower.includes(term)) {
-                                        score += 1;
-                                    }
-                                }
-                                return { doc, score };
-                            }).filter(item => item.score > 0)
-                              .sort((a, b) => b.score - a.score);
-                            
-                            if (scoredDocs.length > 0 && scoredDocs[0].score >= 1) {
-                                // Found a document with at least 1 matching term (lowered threshold for partial matches like "kohya")
-                                targetDocId = scoredDocs[0].doc.id;
-                                targetDocFilename = scoredDocs[0].doc.file_name;
-                                console.log(`✅ Found matching document by name: "${targetDocFilename}" (ID: ${targetDocId}, score: ${scoredDocs[0].score})`);
-                                foundByName = true;
-                                // If it's a summarize query and we found a specific document, mark it as single doc summarize
-                                if (isSummarizeQuery && !isSummarizeSingleDoc) {
-                                    isSummarizeSingleDoc = true;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                // If no document found by name, try semantic search for:
-                // 1. Generic references like "the report"
-                // 2. Document-like terms (logs, files, etc.) that suggest a specific document
-                // This handles cases like "what is the worst country in the report?" or "what model was our kohyaa logs trained for?"
-                const hasGenericDocReference = (
-                    /(?:the|a|an|this|that|your|our)\s+(?:report|study|analysis|document|paper|guide|manual|handbook|file|document|logs?|files?)/i.test(cleanedQuestion) ||
-                    /(?:in|from|about|according to|based on)\s+(?:the|a|an|this|that|your|our)\s+(?:report|study|analysis|document|paper|guide|manual|handbook|logs?|files?)/i.test(cleanedQuestion)
-                );
-                
-                // Also check for questions that mention document-like terms (logs, files, etc.) that might refer to a specific document
-                const hasDocumentLikeTerms = /(?:our|my|the|a|an|this|that|your)\s+[\w\s\-]+\s+(?:logs?|files?|documents?|reports?|studies?|analyses?)/i.test(cleanedQuestion);
-                
-                if (!foundByName && (hasGenericDocReference || hasDocumentLikeTerms)) {
-                    console.log(`🔍 Detected generic document reference, using semantic search...`);
-                    
-                    try {
-                        // Use semantic search to find the most relevant document(s)
-                        const relevantDocsResponse = await documentService.findRelevantDocuments(cleanedQuestion, 3);
-                        const relevantDocs = relevantDocsResponse.documents || relevantDocsResponse || [];
-                        
-                        if (relevantDocs.length > 0 && relevantDocs[0].score >= 0.3) {
-                            // Found a relevant document with good semantic match
-                            targetDocId = relevantDocs[0].doc_id;
-                            targetDocFilename = relevantDocs[0].file_name;
-                            console.log(`✅ Found relevant document by semantic search: "${targetDocFilename}" (ID: ${targetDocId}, score: ${relevantDocs[0].score.toFixed(3)})`);
-                            
-                            // If it's a summarize query and we found a specific document, mark it as single doc summarize
-                            if (isSummarizeQuery && !isSummarizeSingleDoc) {
-                                isSummarizeSingleDoc = true;
-                            }
-                            
-                            // If multiple relevant documents found, log them for transparency
-                            if (relevantDocs.length > 1) {
-                                console.log(`   Also found ${relevantDocs.length - 1} other relevant document(s):`);
-                                for (let i = 1; i < Math.min(relevantDocs.length, 4); i++) {
-                                    console.log(`     - ${relevantDocs[i].file_name} (score: ${relevantDocs[i].score.toFixed(3)})`);
-                                }
-                            }
-                        } else {
-                            console.log(`⚠️ Semantic search found documents but none met minimum relevance threshold (0.3)`);
-                            // If it's a summarize query but no specific document found, only summarize all if explicitly requested
-                            if (isSummarizeQuery && !/(?:all|each|every)\s+(?:document|file|doc)/i.test(cleanedQuestion)) {
-                                // User asked to summarize but didn't specify "all", so don't summarize all documents
-                                console.log(`⚠️ Summarize query detected but no specific document found and user didn't request "all documents"`);
-                            }
-                        }
-                    } catch (error) {
-                        console.error('Error in semantic document search:', error);
-                    }
-                }
-            } catch (error) {
-                console.error('Error in smart document detection:', error);
-            }
-        }
+        // Document detection is now handled entirely by LLM query analysis in the RAG pipeline
+        // The LLM will detect document references and the pipeline will find matching documents
+        // No pattern matching needed here - just pass the query to RAG and let it handle detection
         
         // Special handling for document comparison queries
         if (isCompareDocs && compareDoc1Id && compareDoc2Id) {
@@ -1295,7 +956,8 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
         }
         
         // Special handling for "summarize [specific document]" queries
-        if (!response && isSummarizeSingleDoc && targetDocId) {
+        // Summarize handling removed - LLM will detect summarize requests automatically
+        if (false) {  // Disabled - let LLM handle summarization
             try {
                 // Get all chunks for this specific document
                 const chunksResponse = await documentService.getDocumentChunks(targetDocId);
@@ -1349,16 +1011,15 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
         }
         
         // Determine if we need RAG or simple chat (use cleaned question for detection)
-        console.log(`🔍 Response check: response=${response ? 'SET' : 'NOT SET'}, isCompareMultipleDocs=${isCompareMultipleDocs}, isCompareDocs=${isCompareDocs}`);
-        // IMPORTANT: Don't overwrite response if it's already set (e.g., from comparison or single doc summarize)
+        console.log(`🔍 Response check: response=${response ? 'SET' : 'NOT SET'}, isCompareDocs=${isCompareDocs}`);
+        // IMPORTANT: Don't overwrite response if it's already set (e.g., from comparison)
         // Use original question (with mentions) for needsRAG to detect state queries about other users
         if (!response && needsRAG(question)) {
             useRAG = true;
             
-            // Special handling for document listing/summarization queries
-            // IMPORTANT: Only summarize all documents if user explicitly asked for "all documents"
-            // If a specific document was found (targetDocId), skip the "summarize all" logic
-            if (isListAllDocsQuery || (isSummarizeQuery && !targetDocId && !isSummarizeSingleDoc)) {
+            // Special handling for document listing queries
+            // Document summarization is now handled by LLM detection in the RAG pipeline
+            if (isListAllDocsQuery) {
                 try {
                     // Get all documents first
                     const allDocs = await documentService.getAllDocuments();
@@ -1370,55 +1031,6 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
                             context_chunks: 0,
                             memories_used: 0,
                             source_documents: [],
-                            source_memories: []
-                        };
-                    } else if (isSummarizeQuery) {
-                        // User explicitly asked for summaries - generate them
-                        const summaries = [];
-                        for (const doc of documents.slice(0, 10)) { // Limit to 10 docs to avoid timeout
-                            try {
-                                // Get all chunks for this specific document
-                                const chunksResponse = await documentService.getDocumentChunks(doc.id);
-                                const chunks = chunksResponse.chunks || [];
-                                
-                                if (chunks.length === 0) {
-                                    summaries.push(`**${doc.file_name}**: No content available`);
-                                    continue;
-                                }
-                                
-                                // Combine chunks into document text (limit to first 5000 chars to avoid token limits)
-                                const documentText = chunks
-                                    .map(chunk => chunk.text || '')
-                                    .join('\n\n')
-                                    .substring(0, 5000);
-                                
-                                // Create a summary prompt with the actual document content
-                                const summaryPrompt = `Please provide a concise summary of the following document. Focus on the main topics, key points, and purpose of the document.\n\nDocument: ${doc.file_name}\n\nContent:\n${documentText}${chunks.length > 0 && documentText.length >= 5000 ? '\n\n[Content truncated...]' : ''}`;
-                                
-                                // Use chat service to generate summary (faster than RAG since we already have the content)
-                                const summaryResponse = await Promise.race([
-                                    chatService.chat(summaryPrompt, []),
-                                    new Promise((_, reject) => 
-                                        setTimeout(() => reject(new Error('Summary timeout')), 15000)
-                                    )
-                                ]);
-                                
-                                const summary = summaryResponse || 'Could not generate summary';
-                                summaries.push(`**${doc.file_name}** (${doc.chunk_count || chunks.length} chunks):\n${summary.substring(0, 400)}${summary.length > 400 ? '...' : ''}`);
-                            } catch (error) {
-                                summaries.push(`**${doc.file_name}**: Could not generate summary (${error.message})`);
-                            }
-                        }
-                        
-                        const summaryText = summaries.length > 0 
-                            ? summaries.join('\n\n')
-                            : 'No summaries could be generated.';
-                        
-                        response = {
-                            answer: `Here are summaries of the ${documents.length} available document(s):\n\n${summaryText}`,
-                            context_chunks: documents.reduce((sum, d) => sum + (d.chunk_count || 0), 0),
-                            memories_used: 0,
-                            source_documents: documents.map(d => d.file_name),
                             source_memories: []
                         };
                     } else {
@@ -1459,6 +1071,9 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
                     const mentionedUserMatch = question.match(/<@!?(\d+)>/);
                     const mentionedUserId = mentionedUserMatch ? mentionedUserMatch[1] : null;
                     
+                    // Check if user is admin (for tool creation permissions)
+                    const isAdmin = message.member && message.member.permissions.has('Administrator');
+                    
                     // For action commands, we need the original question with mentions
                     // For document search, we use cleaned question
                     // Pass original question to RAG - it will handle cleaning internally for document search
@@ -1471,7 +1086,8 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
                             targetDocId,  // doc_id filter
                             targetDocFilename,  // doc_filename filter
                             false,  // isPing
-                            mentionedUserId  // Pass mentioned user ID for state queries
+                            mentionedUserId,  // Pass mentioned user ID for state queries
+                            isAdmin  // Pass admin status for tool creation
                         ),
                         new Promise((_, reject) => 
                             setTimeout(() => reject(new Error('RAG timeout')), 30000)  // Reduced from 45s to 30s for faster fallback

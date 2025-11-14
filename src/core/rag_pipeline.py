@@ -106,7 +106,8 @@ class RAGPipeline:
               use_temporal_weighting: bool = True,
               doc_id: Optional[str] = None,  # Filter to specific document by ID
               doc_filename: Optional[str] = None,  # Filter to specific document by filename
-              mentioned_user_id: Optional[str] = None) -> Dict[str, Any]:  # Mentioned user ID for state queries
+              mentioned_user_id: Optional[str] = None,  # Mentioned user ID for state queries
+              is_admin: bool = False) -> Dict[str, Any]:  # Admin status for tool creation permissions
         """
         Query the RAG system with optimized retrieval.
         

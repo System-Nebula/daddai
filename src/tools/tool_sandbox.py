@@ -101,22 +101,35 @@ class ToolSandbox:
         """Initialize sandbox."""
         self.execution_history: List[Dict[str, Any]] = []
     
-    def validate_code(self, code: str) -> Dict[str, Any]:
+    def validate_code(self, code: str, allow_network: bool = False) -> Dict[str, Any]:
         """
         Validate code for safety before execution.
         Comprehensive validation to prevent any host system modifications.
+        
+        Args:
+            code: Python code to validate
+            allow_network: If True, allow network requests (requests, urllib) for admin users
         
         Returns:
             Dict with 'valid' (bool) and 'errors' (list)
         """
         errors = []
         
+        # Network-related imports that are allowed for admin users
+        ALLOWED_NETWORK_IMPORTS = ['requests', 'urllib', 'urllib.request', 'urllib.parse', 'http.client']
+        
         try:
             # Step 1: Pattern-based checks (before parsing)
             import re
             code_lower = code.lower()
             
-            for pattern in self.FORBIDDEN_PATTERNS:
+            # Filter patterns based on admin status
+            patterns_to_check = self.FORBIDDEN_PATTERNS.copy()
+            if allow_network:
+                # Remove network-related patterns for admin users
+                patterns_to_check = [p for p in patterns_to_check if not any(net in p for net in ['requests', 'urllib', 'http'])]
+            
+            for pattern in patterns_to_check:
                 if re.search(pattern, code, re.IGNORECASE):
                     errors.append(f"Forbidden pattern detected: {pattern}")
             
@@ -128,6 +141,9 @@ class ToolSandbox:
                 # Check imports
                 if isinstance(node, ast.Import):
                     for alias in node.names:
+                        # Allow network imports for admin users
+                        if allow_network and alias.name in ALLOWED_NETWORK_IMPORTS:
+                            continue
                         if alias.name in self.FORBIDDEN_IMPORTS:
                             errors.append(f"Forbidden import: {alias.name}")
                         # Check for partial matches (e.g., 'os.path')
@@ -136,6 +152,9 @@ class ToolSandbox:
                                 errors.append(f"Forbidden import: {alias.name}")
                 
                 elif isinstance(node, ast.ImportFrom):
+                    # Allow network imports for admin users
+                    if allow_network and node.module and node.module.split('.')[0] in ALLOWED_NETWORK_IMPORTS:
+                        continue
                     if node.module and node.module.split('.')[0] in self.FORBIDDEN_IMPORTS:
                         errors.append(f"Forbidden import from: {node.module}")
                 
@@ -207,7 +226,8 @@ class ToolSandbox:
                       code: str,
                       function_name: str,
                       arguments: Dict[str, Any],
-                      timeout: float = 5.0) -> Dict[str, Any]:
+                      timeout: float = 5.0,
+                      allow_network: bool = False) -> Dict[str, Any]:
         """
         Execute code safely in sandbox.
         
@@ -216,14 +236,15 @@ class ToolSandbox:
             function_name: Name of function to call
             arguments: Arguments to pass to function
             timeout: Execution timeout in seconds
+            allow_network: If True, allow network requests (for admin tools)
             
         Returns:
             Dict with 'success', 'result', 'error', 'execution_time'
         """
         start_time = datetime.now()
         
-        # Validate code first
-        validation = self.validate_code(code)
+        # Validate code first (allow network for admin tools)
+        validation = self.validate_code(code, allow_network=allow_network)
         if not validation["valid"]:
             return {
                 "success": False,
@@ -274,6 +295,23 @@ class ToolSandbox:
             safe_globals['time'] = safe_time
         except:
             pass
+        
+        # Allow network modules for admin tools
+        if allow_network:
+            try:
+                import requests
+                safe_globals['requests'] = requests
+            except ImportError:
+                pass
+            try:
+                import urllib.request
+                import urllib.parse
+                safe_globals['urllib'] = type('urllib', (), {
+                    'request': urllib.request,
+                    'parse': urllib.parse
+                })()
+            except ImportError:
+                pass
         
         safe_locals = {}
         
@@ -348,7 +386,8 @@ class ToolSandbox:
     def test_tool(self,
                  code: str,
                  function_name: str,
-                 test_cases: List[Dict[str, Any]]) -> Dict[str, Any]:
+                 test_cases: List[Dict[str, Any]],
+                 allow_network: bool = False) -> Dict[str, Any]:
         """
         Test a tool with multiple test cases.
         
@@ -356,6 +395,7 @@ class ToolSandbox:
             code: Python code
             function_name: Function name
             test_cases: List of test cases with 'arguments' and 'expected_result'
+            allow_network: If True, allow network requests (for admin tools)
             
         Returns:
             Test results
@@ -371,7 +411,7 @@ class ToolSandbox:
             arguments = test_case.get("arguments", {})
             expected = test_case.get("expected_result")
             
-            execution_result = self.execute_safely(code, function_name, arguments)
+            execution_result = self.execute_safely(code, function_name, arguments, allow_network=allow_network)
             
             test_result = {
                 "test_case": i + 1,
@@ -454,7 +494,8 @@ class ToolStorage:
                   code: str,
                   description: str,
                   parameters: Dict[str, Any],
-                  test_results: Optional[Dict[str, Any]] = None) -> bool:
+                  test_results: Optional[Dict[str, Any]] = None,
+                  is_admin_tool: bool = False) -> bool:
         """
         Store a new tool.
         
@@ -470,7 +511,8 @@ class ToolStorage:
             "parameters": parameters,
             "test_results": test_results,
             "created_at": datetime.now().isoformat(),
-            "usage_count": 0
+            "usage_count": 0,
+            "is_admin_tool": is_admin_tool  # Track if tool was created by admin (allows network)
         }
         
         self._save_tools()

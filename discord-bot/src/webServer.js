@@ -148,7 +148,8 @@ class WebServer {
                 // Call Python status API
                 // Use python3 on Unix, python on Windows
                 const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-                const { stdout, stderr } = await execAsync(`${pythonCmd} system_status_api.py`, {
+                const scriptPath = path.join(__dirname, '..', '..', 'src', 'api', 'system_status_api.py');
+                const { stdout, stderr } = await execAsync(`${pythonCmd} "${scriptPath}"`, {
                     cwd: path.join(__dirname, '../..'),
                     timeout: 10000,
                     maxBuffer: 1024 * 1024 // 1MB buffer

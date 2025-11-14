@@ -77,7 +77,8 @@ class RAGServer:
                     use_temporal_weighting=params.get('use_temporal_weighting', True),
                     doc_id=doc_id,  # Filter to specific document by ID
                     doc_filename=doc_filename,  # Filter to specific document by filename
-                    mentioned_user_id=params.get('mentioned_user_id')  # Pass mentioned user ID for state queries
+                    mentioned_user_id=params.get('mentioned_user_id'),  # Pass mentioned user ID for state queries
+                    is_admin=params.get('is_admin', False)  # Pass admin status for tool creation
                 )
                 
                 response = {

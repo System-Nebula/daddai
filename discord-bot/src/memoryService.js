@@ -263,35 +263,85 @@ class MemoryService {
                     console.log(`getAllMemories stdout length: ${cleanedStdout.length}`);
                     console.log(`getAllMemories stdout preview: ${cleanedStdout.substring(0, 200)}`);
                     
+                    // Try to parse the entire stdout as JSON first
+                    let response;
+                    try {
+                        response = JSON.parse(cleanedStdout);
+                        console.log(`getAllMemories parsed directly: ${response.memories?.length || 0} memories found`);
+                        resolve(response);
+                        return;
+                    } catch (directParseError) {
+                        // If direct parse fails, try to extract JSON more intelligently
+                        console.log('Direct parse failed, trying to extract JSON...');
+                    }
+                    
                     // Find JSON object by finding first { and matching closing }
                     const firstBrace = cleanedStdout.indexOf('{');
                     if (firstBrace === -1) {
-                        console.error('No JSON object found - stdout:', cleanedStdout);
+                        console.error('No JSON object found - stdout:', cleanedStdout.substring(0, 500));
                         throw new Error('No JSON object found in stdout');
                     }
                     
-                    // Find the matching closing brace by counting braces
+                    // Find the matching closing brace by counting braces and brackets
+                    // Need to handle nested objects and arrays
                     let braceCount = 0;
+                    let bracketCount = 0;
+                    let inString = false;
+                    let escapeNext = false;
                     let lastBrace = -1;
+                    
                     for (let i = firstBrace; i < cleanedStdout.length; i++) {
-                        if (cleanedStdout[i] === '{') braceCount++;
-                        if (cleanedStdout[i] === '}') {
+                        const char = cleanedStdout[i];
+                        
+                        if (escapeNext) {
+                            escapeNext = false;
+                            continue;
+                        }
+                        
+                        if (char === '\\') {
+                            escapeNext = true;
+                            continue;
+                        }
+                        
+                        if (char === '"' && !escapeNext) {
+                            inString = !inString;
+                            continue;
+                        }
+                        
+                        if (inString) {
+                            continue;
+                        }
+                        
+                        if (char === '{') braceCount++;
+                        if (char === '}') {
                             braceCount--;
-                            if (braceCount === 0) {
+                            if (braceCount === 0 && bracketCount === 0) {
                                 lastBrace = i;
                                 break;
                             }
                         }
+                        if (char === '[') bracketCount++;
+                        if (char === ']') bracketCount--;
                     }
                     
                     if (lastBrace === -1) {
                         console.error('Incomplete JSON - firstBrace:', firstBrace, 'stdout length:', cleanedStdout.length);
-                        throw new Error('Incomplete JSON object in stdout');
+                        console.error('Brace count at end:', braceCount, 'Bracket count:', bracketCount);
+                        // Try to parse what we have anyway (might be valid JSON with trailing content)
+                        const partialJson = cleanedStdout.substring(firstBrace);
+                        try {
+                            response = JSON.parse(partialJson);
+                            console.log(`getAllMemories parsed partial JSON: ${response.memories?.length || 0} memories found`);
+                            resolve(response);
+                            return;
+                        } catch (partialError) {
+                            throw new Error('Incomplete JSON object in stdout');
+                        }
                     }
                     
                     const jsonStr = cleanedStdout.substring(firstBrace, lastBrace + 1);
                     console.log(`Extracted JSON length: ${jsonStr.length}`);
-                    const response = JSON.parse(jsonStr);
+                    response = JSON.parse(jsonStr);
                     console.log(`getAllMemories parsed: ${response.memories?.length || 0} memories found`);
                     console.log(`Response keys: ${Object.keys(response).join(', ')}`);
                     resolve(response);

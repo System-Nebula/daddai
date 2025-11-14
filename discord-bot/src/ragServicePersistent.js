@@ -186,7 +186,7 @@ class PersistentRAGService extends EventEmitter {
         });
     }
     
-    queryWithContext(question, conversationHistory = [], userId = null, channelId = null, docId = null, docFilename = null, isPing = false, mentionedUserId = null) {
+    queryWithContext(question, conversationHistory = [], userId = null, channelId = null, docId = null, docFilename = null, isPing = false, mentionedUserId = null, isAdmin = false) {
         return new Promise((resolve, reject) => {
             const requestId = ++this.requestId;
             
@@ -220,6 +220,7 @@ class PersistentRAGService extends EventEmitter {
                     doc_id: docId,  // Filter to specific document by ID
                     doc_filename: docFilename,  // Filter to specific document by filename
                     mentioned_user_id: extractedMentionedUserId,  // Pass mentioned user ID for state queries
+                    is_admin: isAdmin,  // Pass admin status for tool creation permissions
                     use_memory: true,  // Memory system will retrieve relevant context
                     use_shared_docs: true,
                     use_hybrid_search: true,

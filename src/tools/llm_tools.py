@@ -258,8 +258,9 @@ class LLMToolParser:
         """
         tool_calls = []
         
-        # Try JSON format first
-        json_pattern = r'\{"tool":\s*"([^"]+)",\s*"arguments":\s*(\{.*?\})\}'
+        # Try JSON format first - be more lenient with whitespace
+        # Pattern 1: {"tool": "name", "arguments": {...}}
+        json_pattern = r'\{"tool"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{.*?\})\}'
         json_matches = re.finditer(json_pattern, text, re.DOTALL)
         for match in json_matches:
             tool_name = match.group(1)
@@ -269,6 +270,40 @@ class LLMToolParser:
                     "name": tool_name,
                     "arguments": arguments
                 })
+            except:
+                pass
+        
+        # Pattern 2: {"tool":"name","arguments":{...}} (no spaces)
+        json_pattern2 = r'\{"tool":"([^"]+)","arguments":(\{.*?\})\}'
+        json_matches2 = re.finditer(json_pattern2, text, re.DOTALL)
+        for match in json_matches2:
+            tool_name = match.group(1)
+            try:
+                arguments = json.loads(match.group(2))
+                tool_calls.append({
+                    "name": tool_name,
+                    "arguments": arguments
+                })
+            except:
+                pass
+        
+        # Pattern 3: Look for JSON blocks that might be tool calls (more lenient)
+        # Try to find any JSON object that has "tool" and "arguments" keys
+        json_block_pattern = r'\{[^{}]*"tool"\s*:\s*"([^"]+)"[^{}]*"arguments"\s*:\s*(\{.*?\})[^{}]*\}'
+        json_block_matches = re.finditer(json_block_pattern, text, re.DOTALL)
+        for match in json_block_matches:
+            tool_name = match.group(1)
+            try:
+                # Try to extract the full JSON object
+                start = match.start()
+                end = text.find('}', start) + 1
+                json_str = text[start:end]
+                parsed = json.loads(json_str)
+                if "tool" in parsed and "arguments" in parsed:
+                    tool_calls.append({
+                        "name": parsed["tool"],
+                        "arguments": parsed["arguments"]
+                    })
             except:
                 pass
         
