@@ -32,33 +32,39 @@ class EnhancedQueryUnderstanding:
         except:
             return False
     
-    def analyze_query(self, query: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
+    def analyze_query(self, query: str, context: Dict[str, Any] = None, use_llm: bool = True) -> Dict[str, Any]:
         """
         Analyze query with enhanced understanding.
+        Optimized: Can skip LLM for simple queries.
         
         Args:
             query: User query
             context: Optional context (channel_id, user_id, etc.)
+            use_llm: Whether to use LLM analysis (default: True, but can be disabled for speed)
             
         Returns:
             Enhanced analysis dictionary
         """
-        # Start with pattern-based analysis
+        # Start with pattern-based analysis (fast)
         base_analysis = self.query_analyzer.analyze(query)
         
-        # Enhance with LLM if available
-        if self.use_llm:
-            try:
-                llm_analysis = self._llm_analyze(query, context)
-                # Merge LLM insights with pattern-based analysis
-                enhanced = self._merge_analyses(base_analysis, llm_analysis)
-            except Exception as e:
-                logger.warning(f"LLM analysis failed, using pattern-based: {e}")
+        # Enhance with LLM if available and requested
+        if self.use_llm and use_llm:
+            # Skip LLM for very short queries (likely simple)
+            if len(query.split()) < 4:
                 enhanced = base_analysis
+            else:
+                try:
+                    llm_analysis = self._llm_analyze(query, context)
+                    # Merge LLM insights with pattern-based analysis
+                    enhanced = self._merge_analyses(base_analysis, llm_analysis)
+                except Exception as e:
+                    logger.warning(f"LLM analysis failed, using pattern-based: {e}")
+                    enhanced = base_analysis
         else:
             enhanced = base_analysis
         
-        # Add context-aware enhancements
+        # Add context-aware enhancements (fast, no LLM)
         if context:
             enhanced = self._add_context_insights(enhanced, context)
         
@@ -73,8 +79,8 @@ class EnhancedQueryUnderstanding:
 Query: "{query}"
 
 Provide a JSON response with:
-1. "intent": Primary intent (factual, analytical, comparative, procedural, conversational)
-2. "entities": List of entities mentioned (people, places, concepts, etc.)
+1. "intent": Primary intent (factual, analytical, comparative, procedural, conversational, action, state_query)
+2. "entities": List of entities mentioned (people, places, concepts, items, etc.)
 3. "relationships": Relationships between entities (if any)
 4. "key_concepts": Main concepts/topics
 5. "query_type": Specific type (question, command, statement, etc.)
@@ -82,6 +88,11 @@ Provide a JSON response with:
 7. "suggested_rewrite": Improved version of the query for better retrieval
 8. "complexity": Simple, moderate, or complex
 9. "answer_format": Expected answer format (list, paragraph, number, etc.)
+10. "service_routing": Which service to use - one of: "rag" (needs document search), "chat" (general conversation), "tools" (needs tool calls), "memory" (needs past conversations), "state" (user state query), "action" (state modification)
+11. "needs_rag": Whether RAG/document search is needed (true/false)
+12. "needs_tools": Whether tool calls are likely needed (true/false)
+13. "needs_memory": Whether past conversations are needed (true/false)
+14. "needs_relations": Whether user relations are relevant (true/false)
 
 Respond ONLY with valid JSON, no other text."""
 
@@ -174,10 +185,16 @@ Respond ONLY with valid JSON, no other text."""
     
     def rewrite_query(self,
                      query: str,
-                     analysis: Dict[str, Any] = None) -> str:
+                     analysis: Dict[str, Any] = None,
+                     use_llm_rewrite: bool = True) -> str:
         """
         Rewrite query for better retrieval.
-        Uses LLM if available, otherwise uses rule-based rewriting.
+        Uses LLM-based rewriting for state-of-the-art query improvement.
+        
+        Args:
+            query: Original query
+            analysis: Optional pre-computed analysis
+            use_llm_rewrite: Whether to use LLM for rewriting (default: True)
         """
         if analysis is None:
             analysis = self.analyze_query(query)
@@ -186,7 +203,34 @@ Respond ONLY with valid JSON, no other text."""
         if analysis.get("suggested_rewrite"):
             return analysis["suggested_rewrite"]
         
-        # Rule-based rewriting
+        # Enhanced LLM-based rewriting
+        if use_llm_rewrite and self.use_llm:
+            try:
+                rewrite_prompt = f"""Rewrite the following query to improve retrieval accuracy.
+The rewritten query should:
+- Be more specific and clear
+- Include key concepts and entities
+- Use synonyms and related terms
+- Maintain the original intent
+
+Original query: "{query}"
+
+Provide ONLY the rewritten query, no explanation."""
+                
+                response = self.lmstudio_client.generate_response(
+                    messages=[{"role": "user", "content": rewrite_prompt}],
+                    temperature=0.3,
+                    max_tokens=150
+                )
+                
+                rewritten = response.strip().strip('"').strip("'")
+                if rewritten and len(rewritten) > 10:
+                    logger.debug(f"LLM rewrote query: {query} -> {rewritten}")
+                    return rewritten
+            except Exception as e:
+                logger.warning(f"LLM query rewriting failed: {e}")
+        
+        # Rule-based rewriting (fallback)
         rewritten = query
         
         # Expand abbreviations

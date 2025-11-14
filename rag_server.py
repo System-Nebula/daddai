@@ -1,11 +1,20 @@
 """
 Persistent RAG server that keeps models loaded in memory.
 Communicates via stdin/stdout JSON-RPC style for fast responses.
+Uses EnhancedRAGPipeline for advanced features.
 """
 import json
 import sys
 import signal
-from rag_pipeline import RAGPipeline
+try:
+    from enhanced_rag_pipeline import EnhancedRAGPipeline
+    USE_ENHANCED = True
+except ImportError:
+    # Fallback to basic pipeline if enhanced is not available
+    from rag_pipeline import RAGPipeline as EnhancedRAGPipeline
+    USE_ENHANCED = False
+
+from conversation_store import ConversationStore
 
 class RAGServer:
     def __init__(self):
@@ -13,7 +22,20 @@ class RAGServer:
         print("Initializing RAG server...", file=sys.stderr)
         print("Loading embedding model (this may take a moment)...", file=sys.stderr)
         
-        self.pipeline = RAGPipeline()
+        if USE_ENHANCED:
+            print("Using Enhanced RAG Pipeline with intelligent features...", file=sys.stderr)
+            self.pipeline = EnhancedRAGPipeline()
+        else:
+            print("Using basic RAG Pipeline (enhanced not available)...", file=sys.stderr)
+            from rag_pipeline import RAGPipeline
+            self.pipeline = RAGPipeline()
+        
+        # Initialize conversation store with embedding generator for semantic search
+        print("Initializing conversation store...", file=sys.stderr)
+        embedding_gen = None
+        if hasattr(self.pipeline, 'embedding_generator'):
+            embedding_gen = self.pipeline.embedding_generator
+        self.conversation_store = ConversationStore(embedding_generator=embedding_gen)
         
         print("RAG server ready!", file=sys.stderr)
         sys.stderr.flush()
@@ -63,6 +85,64 @@ class RAGServer:
                 return {"id": request_id, "result": response, "error": None}
             elif method == 'ping':
                 return {"id": request_id, "result": {"status": "ok"}, "error": None}
+            elif method == 'get_conversation':
+                # Get conversation history for a user (all messages by default, or limit if specified)
+                user_id = params.get('user_id')
+                limit = params.get('limit')  # None = all messages
+                if not user_id:
+                    return {"id": request_id, "result": None, "error": "user_id required"}
+                messages = self.conversation_store.get_conversation(user_id, limit)
+                return {"id": request_id, "result": {"messages": messages}, "error": None}
+            elif method == 'get_recent_conversation':
+                # Get recent conversation messages (for context, still limited for performance)
+                user_id = params.get('user_id')
+                max_messages = params.get('max_messages', 5)
+                days = params.get('days')  # Optional: filter by days
+                if not user_id:
+                    return {"id": request_id, "result": None, "error": "user_id required"}
+                messages = self.conversation_store.get_recent_conversation(user_id, max_messages, days)
+                return {"id": request_id, "result": {"messages": messages}, "error": None}
+            elif method == 'get_conversation_stats':
+                # Get conversation statistics
+                user_id = params.get('user_id')
+                if not user_id:
+                    return {"id": request_id, "result": None, "error": "user_id required"}
+                stats = self.conversation_store.get_conversation_stats(user_id)
+                return {"id": request_id, "result": stats, "error": None}
+            elif method == 'add_conversation':
+                # Add a conversation message
+                user_id = params.get('user_id')
+                question = params.get('question')
+                answer = params.get('answer')
+                channel_id = params.get('channel_id')
+                embedding = params.get('embedding')  # Optional embedding
+                if not user_id or not question or not answer:
+                    return {"id": request_id, "result": None, "error": "user_id, question, and answer required"}
+                message_id = self.conversation_store.add_message(user_id, question, answer, channel_id, embedding)
+                return {"id": request_id, "result": {"message_id": message_id}, "error": None}
+            elif method == 'get_relevant_conversations':
+                # Get semantically relevant conversations
+                user_id = params.get('user_id')
+                query = params.get('query', '')
+                query_embedding = params.get('query_embedding')
+                top_k = params.get('top_k', 5)
+                if not user_id:
+                    return {"id": request_id, "result": None, "error": "user_id required"}
+                if not query_embedding and hasattr(self.pipeline, 'embedding_generator'):
+                    # Generate embedding if not provided
+                    try:
+                        query_embedding = self.pipeline.embedding_generator.generate_embedding(query)
+                    except:
+                        query_embedding = None
+                messages = self.conversation_store.get_relevant_conversations(user_id, query, query_embedding or [], top_k)
+                return {"id": request_id, "result": {"messages": messages}, "error": None}
+            elif method == 'clear_conversation':
+                # Clear conversation history for a user
+                user_id = params.get('user_id')
+                if not user_id:
+                    return {"id": request_id, "result": None, "error": "user_id required"}
+                success = self.conversation_store.clear_conversation(user_id)
+                return {"id": request_id, "result": {"success": success}, "error": None}
             else:
                 return {"id": request_id, "result": None, "error": f"Unknown method: {method}"}
         except Exception as e:
@@ -74,13 +154,20 @@ class RAGServer:
     def run(self):
         """Run the server loop."""
         # Handle graceful shutdown
-        def signal_handler(sig, frame):
-            print("\nShutting down RAG server...", file=sys.stderr)
-            self.pipeline.close()
+        def cleanup_handler(sig, frame):
+            print("\nCleaning up and shutting down RAG server...", file=sys.stderr)
+            try:
+                self.conversation_store.close()
+            except:
+                pass
+            try:
+                self.pipeline.close()
+            except:
+                pass
             sys.exit(0)
         
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, cleanup_handler)
+        signal.signal(signal.SIGTERM, cleanup_handler)
         
         # Main loop: read JSON from stdin, process, write JSON to stdout
         while True:

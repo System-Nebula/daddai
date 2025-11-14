@@ -35,8 +35,8 @@ const client = new Client({
 });
 
 // Initialize services
-const conversationManager = new ConversationManager();
 const ragService = new PersistentRAGService(); // Use persistent RAG service
+const conversationManager = new ConversationManager(ragService); // Pass RAG service for Neo4j storage
 const chatService = new ChatService();
 const memoryService = new MemoryService();
 const documentService = new DocumentService();
@@ -142,17 +142,28 @@ async function preloadData() {
 // Command handler
 client.commands = new Collection();
 const commandsPath = path.join(__dirname, 'src', 'commands');
+// Only exclude deploy.js - sync.js should be included!
 const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js') && file !== 'deploy.js');
+
+console.log(`📂 Loading commands from: ${commandsPath}`);
+console.log(`📋 Found ${commandFiles.length} command file(s): ${commandFiles.join(', ')}`);
 
 // Load commands for execution
 for (const file of commandFiles) {
     const filePath = path.join(commandsPath, file);
-    const command = require(filePath);
-    if ('data' in command && 'execute' in command) {
-        // Handle subcommands
-        if (command.data.name) {
-            client.commands.set(command.data.name, command);
+    try {
+        const command = require(filePath);
+        if ('data' in command && 'execute' in command) {
+            // Handle subcommands
+            if (command.data.name) {
+                client.commands.set(command.data.name, command);
+                console.log(`   ✅ Loaded command: /${command.data.name} (from ${file})`);
+            }
+        } else {
+            console.log(`   ⚠️  Skipping ${file}: missing 'data' or 'execute'`);
         }
+    } catch (error) {
+        console.error(`   ❌ Error loading ${file}: ${error.message}`);
     }
 }
 
@@ -160,11 +171,19 @@ for (const file of commandFiles) {
 const commands = [];
 for (const file of commandFiles) {
     const filePath = path.join(commandsPath, file);
-    const command = require(filePath);
-    if ('data' in command) {
-        commands.push(command.data.toJSON());
+    try {
+        const command = require(filePath);
+        if ('data' in command) {
+            commands.push(command.data.toJSON());
+            console.log(`   ✅ Prepared for registration: /${command.data.name} (from ${file})`);
+        }
+    } catch (error) {
+        console.error(`   ❌ Error preparing ${file} for registration: ${error.message}`);
     }
 }
+
+console.log(`\n📊 Total commands loaded: ${client.commands.size}`);
+console.log(`📊 Total commands for registration: ${commands.length}\n`);
 
 // REST client for command management
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
@@ -176,10 +195,50 @@ async function refreshCommandsForGuild(guildId) {
         const application = await rest.get(Routes.oauth2CurrentApplication());
         const CLIENT_ID = application.id;
         
-        console.log(`🔄 Clearing existing commands for guild ${guildId}...`);
+        console.log(`🔄 Step 1: Clearing global commands...`);
         
-        // Clear all existing commands
+        // First, clear all global commands (from previous bot version)
         try {
+            const globalCommands = await rest.get(Routes.applicationCommands(CLIENT_ID));
+            if (globalCommands && globalCommands.length > 0) {
+                console.log(`   Found ${globalCommands.length} global command(s) to remove:`);
+                globalCommands.forEach(cmd => {
+                    console.log(`   - /${cmd.name} (ID: ${cmd.id})`);
+                });
+                
+                // Delete each global command individually
+                for (const cmd of globalCommands) {
+                    try {
+                        await rest.delete(Routes.applicationCommand(CLIENT_ID, cmd.id));
+                        console.log(`   ✅ Deleted global command: /${cmd.name}`);
+                    } catch (error) {
+                        console.log(`   ⚠️  Error deleting global command /${cmd.name}: ${error.message}`);
+                    }
+                    // Small delay between deletions to avoid rate limits
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                }
+            } else {
+                console.log(`   ✅ No global commands found`);
+            }
+        } catch (error) {
+            console.log(`   ⚠️  Error fetching/clearing global commands: ${error.message}`);
+        }
+        
+        // Small delay to avoid rate limits
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        console.log(`🔄 Step 2: Clearing existing guild commands for guild ${guildId}...`);
+        
+        // Clear all existing guild commands
+        try {
+            const guildCommands = await rest.get(Routes.applicationGuildCommands(CLIENT_ID, guildId));
+            if (guildCommands && guildCommands.length > 0) {
+                console.log(`   Found ${guildCommands.length} guild command(s) to remove:`);
+                guildCommands.forEach(cmd => {
+                    console.log(`   - /${cmd.name} (ID: ${cmd.id})`);
+                });
+            }
+            
             await rest.put(
                 Routes.applicationGuildCommands(CLIENT_ID, guildId),
                 { body: [] }
@@ -190,7 +249,7 @@ async function refreshCommandsForGuild(guildId) {
                 console.log(`⚠️  Guild ${guildId} not found or bot not in server`);
                 return;
             }
-            console.log(`⚠️  Error clearing commands: ${error.message}`);
+            console.log(`⚠️  Error clearing guild commands: ${error.message}`);
             // Don't return, try to register anyway
         }
         
@@ -222,6 +281,16 @@ async function refreshCommandsForGuild(guildId) {
             console.log('');
         });
         
+        // Debug: Verify sync command is included
+        const syncCmd = commands.find(cmd => cmd.name === 'sync');
+        if (syncCmd) {
+            console.log(`✅ Sync command found in registration list: /${syncCmd.name}`);
+        } else {
+            console.log(`⚠️  WARNING: Sync command NOT found in registration list!`);
+            console.log(`   Available commands: ${commands.map(c => c.name).join(', ')}`);
+        }
+        
+        console.log(`🔄 Step 3: Registering ${commands.length} new commands...`);
         const data = await rest.put(
             Routes.applicationGuildCommands(CLIENT_ID, guildId),
             { body: commands }
@@ -230,8 +299,21 @@ async function refreshCommandsForGuild(guildId) {
         console.log(`✅ Successfully registered ${data.length} commands for guild ${guildId}`);
         console.log('\n📋 Registered commands:');
         data.forEach((cmd, index) => {
-            console.log(`   ${index + 1}. /${cmd.name} - ${cmd.description || 'No description'}`);
+            console.log(`   ${index + 1}. /${cmd.name} (ID: ${cmd.id}) - ${cmd.description || 'No description'}`);
         });
+        console.log('');
+        
+        // Verify commands were registered
+        console.log(`🔄 Step 4: Verifying commands...`);
+        try {
+            const verifyCommands = await rest.get(Routes.applicationGuildCommands(CLIENT_ID, guildId));
+            console.log(`✅ Verification: Found ${verifyCommands.length} command(s) registered:`);
+            verifyCommands.forEach(cmd => {
+                console.log(`   - /${cmd.name} (ID: ${cmd.id})`);
+            });
+        } catch (error) {
+            console.log(`⚠️  Error verifying commands: ${error.message}`);
+        }
         console.log('');
     } catch (error) {
         console.error(`❌ Error refreshing commands for guild ${guildId}:`, error.message);
@@ -263,37 +345,80 @@ client.on(Events.ClientReady, async () => {
         // Preload data for faster web interface
         preloadData();
         
-        // Clear and register commands for all guilds the bot is in
+        // Clear and register commands for specific test guild only
         // Run this asynchronously so it doesn't block the bot from starting
-        (async () => {
+        // Wait a bit for guilds to be fully loaded
+        setTimeout(async () => {
             try {
-                logger.info(`🔄 Refreshing commands for all guilds...`);
-                const guilds = Array.from(client.guilds.cache.values());
+                const TEST_GUILD_ID = '549642809574162458';
+                logger.info(`🔄 Refreshing commands for test guild ${TEST_GUILD_ID}...`);
                 
-                for (const guild of guilds) {
-                    await refreshCommandsForGuild(guild.id);
-                    // Small delay between guilds to avoid rate limits
-                    await new Promise(resolve => setTimeout(resolve, 500));
+                // Verify sync command is in the commands array before registration
+                const syncCmdExists = commands.find(cmd => cmd.name === 'sync');
+                if (!syncCmdExists) {
+                    logger.error(`❌ CRITICAL: Sync command not found in commands array!`);
+                    logger.error(`   Available commands: ${commands.map(c => c.name).join(', ')}`);
+                    logger.error(`   Command files: ${commandFiles.join(', ')}`);
+                } else {
+                    logger.info(`✅ Sync command verified in commands array: /${syncCmdExists.name}`);
                 }
-                logger.info(`✅ Command refresh complete!`);
+                
+                const guild = client.guilds.cache.get(TEST_GUILD_ID);
+                
+                if (!guild) {
+                    logger.warn(`⚠️  Test guild ${TEST_GUILD_ID} not found in cache. Commands will sync when bot joins the guild.`);
+                    return;
+                }
+                
+                logger.info(`🔄 Syncing commands to ${guild.name} (${guild.id})...`);
+                await refreshCommandsForGuild(TEST_GUILD_ID);
+                logger.info(`✅ Command refresh complete for test guild ${guild.name}!`);
+                
+                // Final verification - check what Discord actually has registered
+                try {
+                    const application = await rest.get(Routes.oauth2CurrentApplication());
+                    const CLIENT_ID = application.id;
+                    const registered = await rest.get(Routes.applicationGuildCommands(CLIENT_ID, TEST_GUILD_ID));
+                    logger.info(`📋 Final verification: ${registered.length} command(s) registered in Discord:`);
+                    registered.forEach(cmd => {
+                        logger.info(`   - /${cmd.name} (ID: ${cmd.id})`);
+                    });
+                    const syncRegistered = registered.find(cmd => cmd.name === 'sync');
+                    if (syncRegistered) {
+                        logger.info(`✅ Sync command successfully registered: /${syncRegistered.name} (ID: ${syncRegistered.id})`);
+                    } else {
+                        logger.error(`❌ Sync command NOT found in Discord's registered commands!`);
+                    }
+                } catch (error) {
+                    logger.error(`⚠️  Error verifying registered commands: ${error.message}`);
+                }
             } catch (error) {
                 logger.error('❌ Error during command refresh:', { error: error.message, stack: error.stack });
                 // Don't crash the bot if command registration fails
             }
-        })();
+        }, 2000); // Wait 2 seconds for guilds to be fully loaded
     } else {
         logger.info('🔄 Bot reconnected - skipping command refresh');
     }
 });
 
-// Handle bot joining a new guild
+// Handle bot joining a new guild (only sync to test guild)
 client.on(Events.GuildCreate, async (guild) => {
+    const TEST_GUILD_ID = '549642809574162458';
     logger.info(`🆕 Bot joined new guild: ${guild.name} (${guild.id})`);
-    try {
-        await refreshCommandsForGuild(guild.id);
-    } catch (error) {
-        logger.error(`❌ Error refreshing commands for new guild ${guild.id}:`, { error: error.message, stack: error.stack });
-        // Don't crash - bot should stay online
+    
+    // Only sync commands if it's the test guild
+    if (guild.id === TEST_GUILD_ID) {
+        try {
+            logger.info(`🔄 Syncing commands to test guild ${guild.name}...`);
+            await refreshCommandsForGuild(guild.id);
+            logger.info(`✅ Commands synced to test guild ${guild.name}!`);
+        } catch (error) {
+            logger.error(`❌ Error refreshing commands for test guild ${guild.id}:`, { error: error.message, stack: error.stack });
+            // Don't crash - bot should stay online
+        }
+    } else {
+        logger.info(`⏭️  Skipping command sync for guild ${guild.name} (not test guild)`);
     }
 });
 
@@ -1402,7 +1527,7 @@ Answer:`;
         }
         
         // Save conversation turn (use original question with mentions preserved for context)
-        await conversationManager.addMessage(userId, question, response.answer);
+        await conversationManager.addMessage(userId, question, response.answer, message.channel.id);
         
         // Store bot response as separate memory so it can reference itself (non-blocking)
         if (response.answer && response.answer.length > 20) {

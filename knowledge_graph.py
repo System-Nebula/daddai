@@ -287,14 +287,17 @@ class KnowledgeGraph:
                                   limit: int = 20) -> List[Dict[str, Any]]:
         """Get user's document interaction history."""
         with self.driver.session() as session:
+            # Use OPTIONAL MATCH to avoid warnings when relationships don't exist yet
             result = session.run("""
-                MATCH (u:User {id: $user_id})-[r:VIEWED|UPLOADED|QUERIED]->(d:SharedDocument)
+                MATCH (u:User {id: $user_id})
+                OPTIONAL MATCH (u)-[r:VIEWED|UPLOADED|QUERIED]->(d:SharedDocument)
+                WHERE r IS NOT NULL AND d IS NOT NULL
                 RETURN d.id AS doc_id,
                        d.file_name AS file_name,
                        type(r) AS interaction_type,
-                       toString(r.last_interaction) AS last_interaction,
-                       r.count AS interaction_count
-                ORDER BY r.last_interaction DESC
+                       toString(COALESCE(r.last_interaction, datetime())) AS last_interaction,
+                       COALESCE(r.count, 0) AS interaction_count
+                ORDER BY r.last_interaction DESC NULLS LAST
                 LIMIT $limit
             """,
                 user_id=user_id,

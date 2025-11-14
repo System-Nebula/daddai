@@ -108,6 +108,20 @@ class LLMToolExecutor:
                 "tool_name": tool_name
             }
         
+        # Map common parameter aliases
+        arguments = self._map_parameter_aliases(tool_name, arguments)
+        
+        # Validate required parameters
+        required_params = tool.parameters.get("required", [])
+        missing_params = [p for p in required_params if p not in arguments]
+        if missing_params:
+            return {
+                "error": f"Missing required parameters: {', '.join(missing_params)}",
+                "tool_name": tool_name,
+                "required": required_params,
+                "provided": list(arguments.keys())
+            }
+        
         try:
             result = tool.execute(**arguments)
             
@@ -123,6 +137,26 @@ class LLMToolExecutor:
                 "tool_name": tool_name,
                 "result": result
             }
+        except TypeError as e:
+            # Parameter mismatch error - provide helpful message
+            import inspect
+            try:
+                sig = inspect.signature(tool.function)
+                expected_params = list(sig.parameters.keys())
+                error_msg = f"Parameter mismatch. Expected: {', '.join(expected_params)}, Got: {', '.join(arguments.keys())}"
+                logger.error(f"Parameter mismatch for tool {tool_name}: {e}. {error_msg}")
+                return {
+                    "error": error_msg,
+                    "tool_name": tool_name,
+                    "expected": expected_params,
+                    "provided": list(arguments.keys())
+                }
+            except:
+                logger.error(f"Error executing tool {tool_name}: {e}", exc_info=True)
+                return {
+                    "error": str(e),
+                    "tool_name": tool_name
+                }
         except Exception as e:
             logger.error(f"Error executing tool {tool_name}: {e}", exc_info=True)
             return {
@@ -137,6 +171,59 @@ class LLMToolExecutor:
             result = self.execute_tool_call(tool_call)
             results.append(result)
         return results
+    
+    def _map_parameter_aliases(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Map common parameter aliases to correct parameter names.
+        Handles cases where LLM uses different parameter names.
+        """
+        mapped = arguments.copy()
+        
+        # Parameter alias mappings
+        aliases = {
+            "search_documents": {
+                "q": "query",
+                "question": "query",
+                "search": "query"
+            },
+            "get_memories": {
+                "q": "query",
+                "question": "query",
+                "search": "query"
+            },
+            "get_user_state": {
+                "user": "user_id",
+                "uid": "user_id"
+            },
+            "get_user_profile": {
+                "user": "user_id",
+                "uid": "user_id"
+            },
+            "get_user_relationships": {
+                "user": "user_id",
+                "uid": "user_id"
+            },
+            "transfer_state": {
+                "from_user": "from_user_id",
+                "to_user": "to_user_id",
+                "from": "from_user_id",
+                "to": "to_user_id"
+            },
+            "transfer_item": {
+                "from_user": "from_user_id",
+                "to_user": "to_user_id",
+                "from": "from_user_id",
+                "to": "to_user_id"
+            }
+        }
+        
+        # Apply aliases for this tool
+        if tool_name in aliases:
+            for alias, correct_name in aliases[tool_name].items():
+                if alias in mapped and correct_name not in mapped:
+                    mapped[correct_name] = mapped.pop(alias)
+        
+        return mapped
 
 
 class LLMToolParser:

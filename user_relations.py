@@ -32,9 +32,14 @@ class UserRelations:
                 # User constraints
                 session.run("CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE")
                 
+                # Persona constraints (multiple personas per user_id)
+                session.run("CREATE CONSTRAINT persona_id IF NOT EXISTS FOR (p:Persona) REQUIRE p.id IS UNIQUE")
+                
                 # Create indexes for faster queries
                 session.run("CREATE INDEX user_username IF NOT EXISTS FOR (u:User) ON (u.username)")
                 session.run("CREATE INDEX user_last_active IF NOT EXISTS FOR (u:User) ON (u.last_active)")
+                session.run("CREATE INDEX persona_name IF NOT EXISTS FOR (p:Persona) ON (p.name)")
+                session.run("CREATE INDEX persona_user IF NOT EXISTS FOR (p:Persona) ON (p.user_id)")
             except Exception as e:
                 logger.debug(f"Schema initialization (may already exist): {e}")
     
@@ -85,10 +90,10 @@ class UserRelations:
                 OPTIONAL MATCH (u)-[:INTERACTS_WITH]->(other:User)
                 RETURN u.id AS id,
                        u.username AS username,
-                       u.preferences AS preferences,
-                       u.metadata AS metadata,
-                       toString(u.last_active) AS last_active,
-                       toString(u.created_at) AS created_at,
+                       COALESCE(u.preferences, "{}") AS preferences,
+                       COALESCE(u.metadata, "{}") AS metadata,
+                       toString(COALESCE(u.last_active, datetime())) AS last_active,
+                       toString(COALESCE(u.created_at, datetime())) AS created_at,
                        count(DISTINCT m) AS memory_count,
                        count(DISTINCT d) AS document_count,
                        count(DISTINCT other) AS interaction_count
@@ -172,14 +177,17 @@ class UserRelations:
             List of related users with interaction metrics
         """
         with self.driver.session() as session:
+            # Use OPTIONAL MATCH to avoid warnings when relationships don't exist yet
             result = session.run("""
-                MATCH (u:User {id: $user_id})-[r:INTERACTS_WITH]->(other:User)
+                MATCH (u:User {id: $user_id})
+                OPTIONAL MATCH (u)-[r:INTERACTS_WITH]->(other:User)
+                WHERE r IS NOT NULL AND other IS NOT NULL
                 RETURN other.id AS user_id,
                        other.username AS username,
-                       r.strength AS strength,
-                       toString(r.last_interaction) AS last_interaction,
-                       r.total_interactions AS total_interactions
-                ORDER BY r.strength DESC, r.last_interaction DESC
+                       COALESCE(r.strength, 0) AS strength,
+                       toString(COALESCE(r.last_interaction, datetime())) AS last_interaction,
+                       COALESCE(r.total_interactions, 0) AS total_interactions
+                ORDER BY r.strength DESC NULLS LAST, r.last_interaction DESC NULLS LAST
                 LIMIT $top_n
             """,
                 user_id=user_id,
@@ -323,11 +331,12 @@ class UserRelations:
         user_scores = defaultdict(float)
         
         with self.driver.session() as session:
-            # Find users mentioned in recent channel memories
+            # Find users mentioned in recent channel memories (OPTIONAL MATCH to avoid warnings)
             result = session.run("""
                 MATCH (c:Channel {id: $channel_id})-[:HAS_MEMORY]->(m:Memory)
                 WHERE m.created_at > datetime() - duration({days: 7})
-                MATCH (u:User)-[:MENTIONED_IN]->(m)
+                OPTIONAL MATCH (u:User)-[:MENTIONED_IN]->(m)
+                WHERE u IS NOT NULL
                 RETURN DISTINCT u.id AS user_id, u.username AS username
             """,
                 channel_id=channel_id
@@ -335,40 +344,43 @@ class UserRelations:
             
             for record in result:
                 user_id = record.get("user_id")
-                relevant_users.add(user_id)
-                user_scores[user_id] += 2.0  # High weight for recent mentions
+                if user_id:  # Only process if user_id exists
+                    relevant_users.add(user_id)
+                    user_scores[user_id] += 2.0  # High weight for recent mentions
             
-            # Find users with expertise in query topics
+            # Find users with expertise in query topics (OPTIONAL MATCH to avoid warnings)
             for topic in potential_topics[:5]:  # Limit to top 5 topics
                 result = session.run("""
-                    MATCH (u:User)-[e:EXPERT_IN]->(t:Topic)
-                    WHERE t.name CONTAINS $topic
-                    RETURN u.id AS user_id, e.confidence AS confidence
+                    OPTIONAL MATCH (u:User)-[e:EXPERT_IN]->(t:Topic)
+                    WHERE t.name CONTAINS $topic AND u IS NOT NULL
+                    RETURN u.id AS user_id, COALESCE(e.confidence, 0) AS confidence
                 """,
                     topic=topic
                 )
                 
                 for record in result:
                     user_id = record.get("user_id")
-                    confidence = record.get("confidence", 0)
-                    relevant_users.add(user_id)
-                    user_scores[user_id] += confidence * 1.5
+                    if user_id:  # Only process if user_id exists
+                        confidence = record.get("confidence", 0)
+                        relevant_users.add(user_id)
+                        user_scores[user_id] += confidence * 1.5
             
-            # Find users with matching interests
+            # Find users with matching interests (OPTIONAL MATCH to avoid warnings)
             for topic in potential_topics[:5]:
                 result = session.run("""
-                    MATCH (u:User)-[r:INTERESTED_IN]->(i:Interest)
-                    WHERE i.name CONTAINS $topic
-                    RETURN u.id AS user_id, r.strength AS strength
+                    OPTIONAL MATCH (u:User)-[r:INTERESTED_IN]->(i:Interest)
+                    WHERE i.name CONTAINS $topic AND u IS NOT NULL
+                    RETURN u.id AS user_id, COALESCE(r.strength, 0) AS strength
                 """,
                     topic=topic
                 )
                 
                 for record in result:
                     user_id = record.get("user_id")
-                    strength = record.get("strength", 0)
-                    relevant_users.add(user_id)
-                    user_scores[user_id] += strength * 0.5
+                    if user_id:  # Only process if user_id exists
+                        strength = record.get("strength", 0)
+                        relevant_users.add(user_id)
+                        user_scores[user_id] += strength * 0.5
         
         # Sort by score and return top_n
         sorted_users = sorted(user_scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
@@ -402,6 +414,276 @@ class UserRelations:
         """Get user preferences."""
         profile = self.get_user_profile(user_id)
         return profile.get("preferences", {})
+    
+    def create_or_update_persona(self,
+                                user_id: str,
+                                persona_name: str,
+                                persona_id: Optional[str] = None,
+                                metadata: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Create or update a persona (identity) for a user.
+        Each user_id can have multiple personas (different people talking to the bot).
+        
+        Args:
+            user_id: User ID (Discord user ID, etc.)
+            persona_name: Name/identifier for this persona (e.g., "Alice", "Bob", "Work Persona")
+            persona_id: Optional unique persona ID (auto-generated if not provided)
+            metadata: Persona-specific metadata (preferences, context, etc.)
+            
+        Returns:
+            Persona ID
+        """
+        if not persona_id:
+            persona_id = f"{user_id}_{persona_name}_{datetime.now().timestamp()}"
+        
+        with self.driver.session() as session:
+            # Ensure user exists
+            session.run("MERGE (u:User {id: $user_id})", user_id=user_id)
+            
+            metadata_json = json.dumps(metadata) if metadata else "{}"
+            
+            # Create or update persona
+            session.run("""
+                MERGE (p:Persona {id: $persona_id})
+                SET p.name = $persona_name,
+                    p.user_id = $user_id,
+                    p.metadata = $metadata_json,
+                    p.last_active = datetime(),
+                    p.created_at = COALESCE(p.created_at, datetime())
+                WITH p
+                MATCH (u:User {id: $user_id})
+                MERGE (u)-[:HAS_PERSONA]->(p)
+            """,
+                persona_id=persona_id,
+                persona_name=persona_name,
+                user_id=user_id,
+                metadata_json=metadata_json
+            )
+        
+        logger.debug(f"Created/updated persona {persona_name} for user {user_id}")
+        return persona_id
+    
+    def get_personas_for_user(self, user_id: str) -> List[Dict[str, Any]]:
+        """
+        Get all personas for a user.
+        
+        Args:
+            user_id: User ID
+            
+        Returns:
+            List of persona dictionaries
+        """
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (u:User {id: $user_id})-[:HAS_PERSONA]->(p:Persona)
+                RETURN p.id AS id,
+                       p.name AS name,
+                       p.metadata AS metadata,
+                       toString(p.last_active) AS last_active,
+                       toString(p.created_at) AS created_at
+                ORDER BY p.last_active DESC
+            """,
+                user_id=user_id
+            )
+            
+            personas = []
+            for record in result:
+                metadata_str = record.get("metadata", "{}")
+                try:
+                    metadata = json.loads(metadata_str) if isinstance(metadata_str, str) else (metadata_str or {})
+                except:
+                    metadata = {}
+                
+                personas.append({
+                    "id": record.get("id"),
+                    "name": record.get("name"),
+                    "metadata": metadata,
+                    "last_active": record.get("last_active"),
+                    "created_at": record.get("created_at")
+                })
+            
+            return personas
+    
+    def track_persona_interaction(self,
+                                 persona_id_1: str,
+                                 persona_id_2: str,
+                                 interaction_type: str = "mentioned",
+                                 context: Optional[str] = None,
+                                 channel_id: Optional[str] = None):
+        """
+        Track interaction between two personas.
+        This tracks relationships between different people (personas) talking to the bot.
+        
+        Args:
+            persona_id_1: First persona ID
+            persona_id_2: Second persona ID
+            interaction_type: Type of interaction (mentioned, collaborated, etc.)
+            context: Context of the interaction
+            channel_id: Channel where interaction occurred
+        """
+        with self.driver.session() as session:
+            # Ensure personas exist
+            session.run("MERGE (p1:Persona {id: $persona_id_1})", persona_id_1=persona_id_1)
+            session.run("MERGE (p2:Persona {id: $persona_id_2})", persona_id_2=persona_id_2)
+            
+            # Create or update interaction relationship
+            session.run("""
+                MATCH (p1:Persona {id: $persona_id_1})
+                MATCH (p2:Persona {id: $persona_id_2})
+                MERGE (p1)-[r:INTERACTS_WITH_PERSONA]->(p2)
+                SET r.interaction_type = $interaction_type,
+                    r.strength = COALESCE(r.strength, 0) + 1,
+                    r.last_interaction = datetime(),
+                    r.total_interactions = COALESCE(r.total_interactions, 0) + 1,
+                    r.context = COALESCE(r.context, []) + [$context],
+                    r.channel_id = $channel_id
+            """,
+                persona_id_1=persona_id_1,
+                persona_id_2=persona_id_2,
+                interaction_type=interaction_type,
+                context=context,
+                channel_id=channel_id
+            )
+    
+    def get_persona_relationships(self, persona_id: str, top_n: int = 10) -> List[Dict[str, Any]]:
+        """
+        Get relationships for a persona (relationships with other personas).
+        
+        Args:
+            persona_id: Persona ID
+            top_n: Number of relationships to return
+            
+        Returns:
+            List of related personas with interaction metrics
+        """
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (p1:Persona {id: $persona_id})-[r:INTERACTS_WITH_PERSONA]->(p2:Persona)
+                RETURN p2.id AS persona_id,
+                       p2.name AS persona_name,
+                       p2.user_id AS user_id,
+                       r.interaction_type AS interaction_type,
+                       r.strength AS strength,
+                       toString(r.last_interaction) AS last_interaction,
+                       r.total_interactions AS total_interactions
+                ORDER BY r.strength DESC, r.last_interaction DESC
+                LIMIT $top_n
+            """,
+                persona_id=persona_id,
+                top_n=top_n
+            )
+            
+            relationships = []
+            for record in result:
+                relationships.append({
+                    "persona_id": record.get("persona_id"),
+                    "persona_name": record.get("persona_name"),
+                    "user_id": record.get("user_id"),
+                    "interaction_type": record.get("interaction_type"),
+                    "strength": record.get("strength", 0),
+                    "last_interaction": record.get("last_interaction"),
+                    "total_interactions": record.get("total_interactions", 0)
+                })
+            
+            return relationships
+    
+    def identify_active_persona(self,
+                               user_id: str,
+                               message_text: str,
+                               channel_id: Optional[str] = None,
+                               username: Optional[str] = None) -> Optional[str]:
+        """
+        Identify which persona is currently speaking based on context.
+        Uses heuristics and LLM to determine persona identity.
+        
+        Args:
+            user_id: User ID
+            message_text: Message text
+            channel_id: Channel ID
+            username: Username
+            
+        Returns:
+            Persona ID if identified, None otherwise
+        """
+        # Get existing personas for this user
+        personas = self.get_personas_for_user(user_id)
+        
+        if not personas:
+            # Create default persona
+            return self.create_or_update_persona(
+                user_id=user_id,
+                persona_name=username or "Default",
+                metadata={"auto_created": True}
+            )
+        
+        # Simple heuristic: use most recently active persona
+        # In production, could use LLM to analyze message style, context, etc.
+        if len(personas) == 1:
+            return personas[0]["id"]
+        
+        # Return most recently active persona
+        return personas[0]["id"] if personas else None
+    
+    def track_user_mention(self,
+                          user_id: str,
+                          mentioned_user_id: str,
+                          context: str,
+                          channel_id: str,
+                          memory_id: str = None,
+                          persona_id: Optional[str] = None,
+                          mentioned_persona_id: Optional[str] = None):
+        """
+        Track when one user mentions another user.
+        Enhanced to also track persona-level interactions.
+        
+        Args:
+            user_id: User ID who mentioned
+            mentioned_user_id: User ID who was mentioned
+            context: Context of mention
+            channel_id: Channel ID
+            memory_id: Memory ID (optional)
+            persona_id: Persona ID of user who mentioned (optional)
+            mentioned_persona_id: Persona ID of user who was mentioned (optional)
+        """
+        # Original user-level tracking
+        with self.driver.session() as session:
+            # Create both user nodes if they don't exist
+            session.run("MERGE (u1:User {id: $user_id})", user_id=user_id)
+            session.run("MERGE (u2:User {id: $mentioned_user_id})", mentioned_user_id=mentioned_user_id)
+            
+            # Create or update INTERACTS_WITH relationship
+            session.run("""
+                MATCH (u1:User {id: $user_id})
+                MATCH (u2:User {id: $mentioned_user_id})
+                MERGE (u1)-[r:INTERACTS_WITH]->(u2)
+                SET r.strength = COALESCE(r.strength, 0) + 1,
+                    r.last_interaction = datetime(),
+                    r.total_interactions = COALESCE(r.total_interactions, 0) + 1
+            """,
+                user_id=user_id,
+                mentioned_user_id=mentioned_user_id
+            )
+            
+            # Link to memory if provided
+            if memory_id:
+                session.run("""
+                    MATCH (u:User {id: $mentioned_user_id})
+                    MATCH (m:Memory {id: $memory_id})
+                    MERGE (u)-[:MENTIONED_IN]->(m)
+                """,
+                    mentioned_user_id=mentioned_user_id,
+                    memory_id=memory_id
+                )
+        
+        # Persona-level tracking (if personas provided)
+        if persona_id and mentioned_persona_id:
+            self.track_persona_interaction(
+                persona_id_1=persona_id,
+                persona_id_2=mentioned_persona_id,
+                interaction_type="mentioned",
+                context=context,
+                channel_id=channel_id
+            )
     
     def close(self):
         """Close connection."""

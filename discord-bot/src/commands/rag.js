@@ -14,20 +14,22 @@ module.exports = {
         
         const question = interaction.options.getString('question');
         const userId = interaction.user.id;
+        const channelId = interaction.channel.id;
         
         try {
             // Get conversation history
             const conversationHistory = await conversationManager.getRecentConversation(userId, 3);
             
-            // Query RAG system
+            // Query RAG system with channel_id for enhanced features
             const response = await ragService.queryWithContext(
                 question,
                 conversationHistory,
-                userId
+                userId,
+                channelId  // Pass channel_id for enhanced memory and user relations
             );
             
             // Save conversation
-            await conversationManager.addMessage(userId, question, response.answer);
+            await conversationManager.addMessage(userId, question, response.answer, channelId);
             
             // Send response
             await interaction.editReply({

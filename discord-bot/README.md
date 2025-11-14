@@ -116,7 +116,7 @@ The web interface will automatically start at `http://localhost:3000` (or the po
 
 ### Conversation Memory
 
-The bot remembers each user's conversation history and uses it to provide context-aware answers. Each user's conversation is stored separately in `discord-bot/data/conversations/`.
+The bot remembers each user's conversation history and uses it to provide context-aware answers. Conversations are stored in Neo4j with semantic search capabilities for long-term memory.
 
 ### Channel Configuration
 
@@ -160,8 +160,8 @@ discord-bot/
 │       ├── admin.js
 │       └── config.js
 ├── data/
-│   ├── conversations/    # User conversation files
 │   └── config.json       # Bot configuration (channel settings)
+│   # Note: Conversations are stored in Neo4j, not local files
 └── package.json
 ```
 
@@ -178,8 +178,9 @@ discord-bot/
 - Check LMStudio is running
 
 ### Conversation not working
-- Check `discord-bot/data/conversations/` directory exists
-- Verify file permissions
+- Verify Neo4j is running and accessible
+- Check RAG server is running (conversations are stored via RAG server)
+- Check bot logs for Neo4j connection errors
 
 ## Advanced Configuration
 

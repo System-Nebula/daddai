@@ -140,6 +140,52 @@ class PersistentRAGService extends EventEmitter {
         this.serverProcess.stdin.write(requestJson);
     }
     
+    /**
+     * Send a conversation management request to the RAG server
+     * @param {Object} request - Request object with method and params
+     * @returns {Promise<Object>} Response from server
+     */
+    sendConversationRequest(request) {
+        return new Promise((resolve, reject) => {
+            const requestId = ++this.requestId;
+            
+            const fullRequest = {
+                id: requestId,
+                method: request.method,
+                params: request.params || {}
+            };
+            
+            // Store pending request
+            this.pendingRequests.set(requestId, { resolve, reject });
+            
+            // Set timeout (10 seconds for conversation requests - Neo4j queries can take time)
+            const timeout = setTimeout(() => {
+                if (this.pendingRequests.has(requestId)) {
+                    this.pendingRequests.delete(requestId);
+                    logger.warn('[RAG] Conversation request timeout', { requestId, method: request.method });
+                    reject(new Error('Conversation request timeout'));
+                }
+            }, 10000);
+            
+            // Override resolve/reject to clear timeout
+            const originalResolve = resolve;
+            const originalReject = reject;
+            this.pendingRequests.set(requestId, {
+                resolve: (result) => {
+                    clearTimeout(timeout);
+                    originalResolve(result);
+                },
+                reject: (error) => {
+                    clearTimeout(timeout);
+                    originalReject(error);
+                }
+            });
+            
+            // Send request
+            this.sendRequest(fullRequest);
+        });
+    }
+    
     queryWithContext(question, conversationHistory = [], userId = null, channelId = null, docId = null, docFilename = null, isPing = false) {
         return new Promise((resolve, reject) => {
             const requestId = ++this.requestId;

@@ -81,8 +81,9 @@ In Discord:
 - Verify `PYTHON_PATH` in `.env` is correct
 
 ### Conversation not saving
-- Check `discord-bot/data/conversations/` directory exists
-- Verify file permissions
+- Verify Neo4j is running and accessible
+- Check RAG server is running (conversations are stored via RAG server)
+- Check bot logs for Neo4j connection errors
 
 ## Features
 
