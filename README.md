@@ -157,7 +157,10 @@ This will start an interactive session where you can ask multiple questions.
 └── deps/                  # Dependencies
 ```
 
-See the `docs/` directory for detailed documentation on specific features.
+See the `docs/` directory for detailed documentation:
+- `QUICK_START.md` - Quick start guide
+- `docs/COMMANDS_REFERENCE.md` - Complete commands reference
+- `docs/GOPHER_AGENT.md` - Gopher agent documentation
 
 ## How It Works
 

@@ -895,39 +895,73 @@ def create_rag_tools(pipeline) -> LLMToolRegistry:
                     def process_document(self, file_path: str):
                         """Process markdown file without docling (perfect for website/YouTube content)."""
                         import os
+                        import re
                         from datetime import datetime
                         
                         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                             text = f.read()
                         
-                        # Simple chunking by paragraphs
+                        # Better chunking: handle both double newlines and single newlines
+                        # Also handle YouTube transcripts which might be continuous text
                         chunks = []
-                        paragraphs = text.split('\n\n')
+                        
+                        # First try splitting by double newlines (paragraphs)
+                        paragraphs = re.split(r'\n\s*\n', text)
+                        
+                        # If that doesn't create enough chunks, also split by single newlines
+                        if len(paragraphs) < 3 and len(text) > self.chunk_size * 2:
+                            # Split by single newlines or periods followed by space
+                            paragraphs = re.split(r'(?<=[.!?])\s+|\n+', text)
+                        
                         current_chunk = ""
                         chunk_index = 0
                         
                         for para in paragraphs:
                             para = para.strip()
-                            if not para:
+                            if not para or len(para) < 10:  # Skip very short paragraphs
                                 continue
                             
-                            if len(current_chunk) + len(para) + 2 > self.chunk_size and current_chunk:
-                                chunks.append({
-                                    'text': current_chunk.strip(),
-                                    'chunk_index': chunk_index
-                                })
-                                chunk_index += 1
-                                # Start new chunk with overlap
-                                overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
-                                current_chunk = overlap_text + '\n\n' + para
+                            # If paragraph itself is larger than chunk_size, split it further
+                            if len(para) > self.chunk_size:
+                                # Split large paragraph by sentences
+                                sentences = re.split(r'(?<=[.!?])\s+', para)
+                                for sentence in sentences:
+                                    sentence = sentence.strip()
+                                    if not sentence:
+                                        continue
+                                    
+                                    if len(current_chunk) + len(sentence) + 2 > self.chunk_size and current_chunk:
+                                        chunks.append({
+                                            'text': current_chunk.strip(),
+                                            'chunk_index': chunk_index
+                                        })
+                                        chunk_index += 1
+                                        # Start new chunk with overlap
+                                        overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
+                                        current_chunk = overlap_text + ' ' + sentence
+                                    else:
+                                        current_chunk += ' ' + sentence if current_chunk else sentence
                             else:
-                                current_chunk += '\n\n' + para if current_chunk else para
+                                # Normal paragraph processing
+                                if len(current_chunk) + len(para) + 2 > self.chunk_size and current_chunk:
+                                    chunks.append({
+                                        'text': current_chunk.strip(),
+                                        'chunk_index': chunk_index
+                                    })
+                                    chunk_index += 1
+                                    # Start new chunk with overlap
+                                    overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
+                                    current_chunk = overlap_text + '\n\n' + para
+                                else:
+                                    current_chunk += '\n\n' + para if current_chunk else para
                         
                         if current_chunk:
                             chunks.append({
                                 'text': current_chunk.strip(),
                                 'chunk_index': chunk_index
                             })
+                        
+                        logger.info(f"📝 Created {len(chunks)} chunks from document ({len(text)} chars)")
                         
                         return {
                             'text': text,
@@ -1059,39 +1093,73 @@ def create_rag_tools(pipeline) -> LLMToolRegistry:
                     def process_document(self, file_path: str):
                         """Process markdown file without docling (perfect for YouTube transcripts)."""
                         import os
+                        import re
                         from datetime import datetime
                         
                         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                             text = f.read()
                         
-                        # Simple chunking by paragraphs
+                        # Better chunking: handle both double newlines and single newlines
+                        # Also handle YouTube transcripts which might be continuous text
                         chunks = []
-                        paragraphs = text.split('\n\n')
+                        
+                        # First try splitting by double newlines (paragraphs)
+                        paragraphs = re.split(r'\n\s*\n', text)
+                        
+                        # If that doesn't create enough chunks, also split by single newlines
+                        if len(paragraphs) < 3 and len(text) > self.chunk_size * 2:
+                            # Split by single newlines or periods followed by space
+                            paragraphs = re.split(r'(?<=[.!?])\s+|\n+', text)
+                        
                         current_chunk = ""
                         chunk_index = 0
                         
                         for para in paragraphs:
                             para = para.strip()
-                            if not para:
+                            if not para or len(para) < 10:  # Skip very short paragraphs
                                 continue
                             
-                            if len(current_chunk) + len(para) + 2 > self.chunk_size and current_chunk:
-                                chunks.append({
-                                    'text': current_chunk.strip(),
-                                    'chunk_index': chunk_index
-                                })
-                                chunk_index += 1
-                                # Start new chunk with overlap
-                                overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
-                                current_chunk = overlap_text + '\n\n' + para
+                            # If paragraph itself is larger than chunk_size, split it further
+                            if len(para) > self.chunk_size:
+                                # Split large paragraph by sentences
+                                sentences = re.split(r'(?<=[.!?])\s+', para)
+                                for sentence in sentences:
+                                    sentence = sentence.strip()
+                                    if not sentence:
+                                        continue
+                                    
+                                    if len(current_chunk) + len(sentence) + 2 > self.chunk_size and current_chunk:
+                                        chunks.append({
+                                            'text': current_chunk.strip(),
+                                            'chunk_index': chunk_index
+                                        })
+                                        chunk_index += 1
+                                        # Start new chunk with overlap
+                                        overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
+                                        current_chunk = overlap_text + ' ' + sentence
+                                    else:
+                                        current_chunk += ' ' + sentence if current_chunk else sentence
                             else:
-                                current_chunk += '\n\n' + para if current_chunk else para
+                                # Normal paragraph processing
+                                if len(current_chunk) + len(para) + 2 > self.chunk_size and current_chunk:
+                                    chunks.append({
+                                        'text': current_chunk.strip(),
+                                        'chunk_index': chunk_index
+                                    })
+                                    chunk_index += 1
+                                    # Start new chunk with overlap
+                                    overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
+                                    current_chunk = overlap_text + '\n\n' + para
+                                else:
+                                    current_chunk += '\n\n' + para if current_chunk else para
                         
                         if current_chunk:
                             chunks.append({
                                 'text': current_chunk.strip(),
                                 'chunk_index': chunk_index
                             })
+                        
+                        logger.info(f"📝 Created {len(chunks)} chunks from document ({len(text)} chars)")
                         
                         return {
                             'text': text,
