@@ -1,88 +1,207 @@
-# Quick Start Guide - Neo4j Setup
+# Quick Start Guide
 
-## Step 1: Start Your Database in Neo4j Desktop
+## Prerequisites
 
-1. **Open Neo4j Desktop** (from Start Menu)
+1. **Neo4j** - Running on `bolt://localhost:7687`
+2. **LMStudio** - Running with a model loaded on `http://localhost:1234`
+3. **Python 3.8+** with dependencies installed
+4. **Node.js** (for Discord bot, optional)
 
-2. **Create a Project** (if you haven't already):
-   - Click "New Project"
-   - Name it (e.g., "RAG System")
-   - Click "Create"
+## Installation
 
-3. **Create a Database** (if you haven't already):
-   - Click "Add" → "Local DBMS"
-   - Set a **Name** (e.g., "rag-database")
-   - Set a **Password** (remember this!)
-   - Choose Neo4j version (5.x recommended)
-   - Click "Create"
+```bash
+# Install Python dependencies
+pip install -r requirements.txt
+```
 
-4. **Start the Database**:
-   - Click the **"Start"** button on your database
-   - Wait for it to turn **green** (running status)
-   - The status should show "Running"
+## Running the RAG System
 
-## Step 2: Configure Your .env File
+### 1. Ingest Documents
 
-Create or edit `.env` file in your project root with:
+```bash
+# Process a single file
+python main.py ingest --path path/to/document.pdf
+
+# Process all documents in a directory
+python main.py ingest --path path/to/documents/
+```
+
+Supported formats: PDF, DOCX, DOC, TXT, MD, CSV, JSON, IPYNB
+
+### 2. Query the System
+
+#### Single Query
+```bash
+python main.py query --question "What is the main topic of the documents?"
+```
+
+#### Interactive Mode (Recommended)
+```bash
+python main.py interactive
+```
+
+This starts an interactive session where you can ask multiple questions. Type `exit` or `quit` to stop.
+
+### 3. Advanced Query Options
+
+```bash
+# Retrieve more chunks
+python main.py query --question "Your question" --top-k 20
+```
+
+## Running the Discord Bot (Optional)
+
+### Setup
+
+1. Navigate to discord-bot directory:
+```bash
+cd discord-bot
+```
+
+2. Install Node.js dependencies:
+```bash
+npm install
+```
+
+3. Create `.env` file:
+```env
+DISCORD_TOKEN=your_discord_bot_token_here
+PYTHON_PATH=python
+DEBUG=false
+```
+
+4. Start the bot:
+```bash
+npm start
+```
+
+The bot will automatically start the RAG server and be ready to answer questions.
+
+## Running the RAG Server (Standalone)
+
+For persistent RAG server (used by Discord bot):
+
+```bash
+python src/api/rag_server.py
+```
+
+This starts a persistent server that handles multiple requests efficiently.
+
+## Running Individual APIs
+
+### Document API
+```bash
+python src/api/document_api.py --action list
+python src/api/document_api.py --action upload --file path/to/file.pdf
+```
+
+### Memory API
+```bash
+python src/api/memory_api.py --action list --user-id user123
+python src/api/memory_api.py --action add --user-id user123 --content "User likes Python"
+```
+
+### Chat API
+```bash
+python src/api/chat_api.py --message "Hello, how are you?"
+```
+
+### Search API
+```bash
+python src/api/search_api.py --query "search term" --store documents --top-k 10
+```
+
+## Utility Scripts
+
+All utility scripts are in the `scripts/` directory:
+
+```bash
+# Setup Neo4j
+python scripts/setup_neo4j.py
+
+# List all documents
+python scripts/list_all_documents.py
+
+# Clear all data (use with caution!)
+python scripts/clear_all_documents_and_memories.py
+
+# Migrate to Elasticsearch
+python scripts/migrate_to_elasticsearch.py
+```
+
+## Configuration
+
+Edit `config.py` or create a `.env` file in the project root:
 
 ```env
+# Neo4j
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
-NEO4J_PASSWORD=your_password_here
+NEO4J_PASSWORD=your_password
+
+# LMStudio
+LMSTUDIO_BASE_URL=http://localhost:1234/v1
+LMSTUDIO_MODEL=local-model
+
+# Embedding
+EMBEDDING_MODEL=all-MiniLM-L6-v2
+USE_GPU=auto
+EMBEDDING_BATCH_SIZE=64
+
+# RAG Settings
+RAG_TOP_K=10
+RAG_TEMPERATURE=0.7
+CHUNK_SIZE=1000
+CHUNK_OVERLAP=200
 ```
-
-**Important**: Replace `your_password_here` with the password you set when creating the database!
-
-## Step 3: Test the Connection
-
-Run:
-```bash
-python setup_neo4j.py
-```
-
-If successful, you'll see:
-- Connection successful message
-- Database schema initialized
-- Ready to use!
-
-## Step 4: Start Using Your RAG System
-
-Once Neo4j is connected:
-
-1. **Ingest documents**:
-   ```bash
-   python main.py ingest --path your_documents/
-   ```
-
-2. **Query the system**:
-   ```bash
-   python main.py query --question "What is this document about?"
-   ```
-
-3. **Interactive mode**:
-   ```bash
-   python main.py interactive
-   ```
 
 ## Troubleshooting
 
-### "Connection refused" error
-- Make sure Neo4j Desktop is open
-- Make sure your database is **STARTED** (green status)
-- Check the password in `.env` matches Neo4j Desktop
+### Import Errors
+If you see import errors, make sure you're running from the project root directory:
+```bash
+cd C:\Users\jovan\OneDrive\Desktop\docling
+python main.py query --question "test"
+```
 
-### "Authentication failed" error
-- Check your password in `.env` file
-- Reset password in Neo4j Desktop if needed
-- Update `.env` with the new password
+### Neo4j Connection Issues
+- Ensure Neo4j is running
+- Check connection details in `config.py` or `.env`
+- Test connection: `cypher-shell -u neo4j -p your_password`
 
-### Database won't start
-- Check if port 7687 is already in use
-- Try stopping and restarting the database
-- Check Neo4j Desktop logs for errors
+### LMStudio Connection Issues
+- Ensure LMStudio is running with a model loaded
+- Check that local server is enabled in LMStudio settings
+- Verify API URL: `http://localhost:1234/v1`
 
-## Need Help?
+### Discord Bot Issues
+- Make sure Python RAG system works first: `python main.py query --question "test"`
+- Check that `PYTHON_PATH` in `.env` points to correct Python executable
+- Verify Discord bot token is correct
 
-- Neo4j Desktop docs: https://neo4j.com/developer/neo4j-desktop/
-- Check `NEO4J_SETUP.md` for detailed instructions
+## Example Workflow
+
+1. **Start services:**
+   ```bash
+   # Terminal 1: Start Neo4j (if not running as service)
+   # Terminal 2: Start LMStudio and load a model
+   ```
+
+2. **Ingest documents:**
+   ```bash
+   python main.py ingest --path documents/
+   ```
+
+3. **Query:**
+   ```bash
+   python main.py interactive
+   # Then ask questions interactively
+   ```
+
+4. **Or use Discord bot:**
+   ```bash
+   cd discord-bot
+   npm start
+   # Then use /rag command in Discord
+   ```
 

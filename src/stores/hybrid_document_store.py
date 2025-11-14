@@ -219,6 +219,18 @@ class HybridDocumentStore:
         """Get all shared documents (from Neo4j - source of truth)."""
         return self.neo4j_store.get_all_shared_documents()
     
+    def find_document_by_url(self, url: str):
+        """Find a document by its source URL (delegates to Neo4j store)."""
+        return self.neo4j_store.find_document_by_url(url)
+    
+    def find_document_by_video_id(self, video_id: str):
+        """Find a document by YouTube video ID (delegates to Neo4j store)."""
+        return self.neo4j_store.find_document_by_video_id(video_id)
+    
+    def get_document_content(self, doc_id: str):
+        """Get full document content including chunks (delegates to Neo4j store)."""
+        return self.neo4j_store.get_document_content(doc_id)
+    
     def get_document_chunks(self, doc_id: str) -> List[Dict[str, Any]]:
         """
         Get all chunks for a specific document.

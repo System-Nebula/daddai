@@ -3,10 +3,21 @@ neo4j>=5.0.0
 sentence-transformers>=2.2.0
 torch>=2.0.0
 requests>=2.31.0
+beautifulsoup4>=4.12.0  # Optional but recommended for better website content extraction
+youtube-transcript-api>=0.6.0  # For fetching YouTube video transcripts
+# Note: youtube-transcript-api may show a warning about defusedxml>=0.8.0rc2,
+# but it works fine with newer versions. The constraint is conservative.
 python-dotenv>=1.0.0
 numpy>=1.24.0,<2.0.0
 cachetools>=5.3.0
 tenacity>=8.2.0
+flask>=2.3.0
+flask-cors>=4.0.0
+# Testing dependencies
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-mock>=3.11.0
+pytest-asyncio>=0.21.0
 # State-of-the-art RAG components
 # Cross-encoder reranking is included in sentence-transformers
 # No additional dependencies needed for multi-query, evaluation, monitoring, A/B testing

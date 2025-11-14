@@ -241,14 +241,25 @@ class PersistentRAGService extends EventEmitter {
             // Store pending request
             this.pendingRequests.set(requestId, { resolve, reject });
             
-            // Set timeout
+            // Check if this is a URL request (YouTube or website) - these take longer
+            const hasUrl = question && (
+                question.includes('http://') || 
+                question.includes('https://') || 
+                question.includes('youtube.com') || 
+                question.includes('youtu.be') ||
+                question.includes('www.')
+            );
+            
+            // Set timeout - longer for URL requests (90s) since they need to fetch transcript, chunk it, and summarize multiple chunks
+            // YouTube summarization can take 30-60 seconds for chunk processing alone
+            const timeoutDuration = isPing ? 5000 : (hasUrl ? 90000 : 30000);
             const timeout = setTimeout(() => {
                 if (this.pendingRequests.has(requestId)) {
                     this.pendingRequests.delete(requestId);
-                    logger.warn('[RAG] Request timeout', { requestId, question: question.substring(0, 50) });
+                    logger.warn('[RAG] Request timeout', { requestId, question: question.substring(0, 50), timeoutDuration });
                     reject(new Error('RAG service timeout'));
                 }
-            }, isPing ? 5000 : 30000);  // Reduced from 60s to 30s for faster timeout and fallback
+            }, timeoutDuration);
             
             // Override resolve/reject to clear timeout
             const originalResolve = resolve;

@@ -1,7 +1,7 @@
 """
 Shared document storage - documents uploaded by users are shared across all users.
 """
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from neo4j import GraphDatabase
 from datetime import datetime
 from config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
@@ -11,9 +11,24 @@ class DocumentStore:
     """Store shared documents uploaded by users."""
     
     def __init__(self, uri: str = NEO4J_URI, user: str = NEO4J_USER, password: str = NEO4J_PASSWORD):
-        """Initialize document store."""
-        self.driver = GraphDatabase.driver(uri, auth=(user, password))
+        """
+        Initialize document store with optimized connection pooling.
+        """
+        from config import NEO4J_MAX_CONNECTION_POOL_SIZE, NEO4J_MAX_CONNECTION_LIFETIME
+        
+        # Optimize connection pool settings
+        self.driver = GraphDatabase.driver(
+            uri, 
+            auth=(user, password),
+            max_connection_lifetime=NEO4J_MAX_CONNECTION_LIFETIME,
+            max_connection_pool_size=NEO4J_MAX_CONNECTION_POOL_SIZE
+        )
         self._initialize_schema()
+        
+        # Cache for frequently accessed documents
+        from cachetools import TTLCache
+        from config import CACHE_MAX_SIZE, CACHE_TTL_SECONDS
+        self._document_cache = TTLCache(maxsize=min(CACHE_MAX_SIZE, 100), ttl=CACHE_TTL_SECONDS)
     
     def _initialize_schema(self):
         """Initialize document schema."""
@@ -44,8 +59,22 @@ class DocumentStore:
             # Create user node
             session.run("MERGE (u:User {id: $user_id})", user_id=uploaded_by)
             
+            # Extract source_url if available (for website documents)
+            source_url = document_data['metadata'].get('source_url')
+            # Extract video_id if available (for YouTube documents)
+            video_id = document_data['metadata'].get('video_id')
+            
             # Create shared document node
-            session.run("""
+            create_params = {
+                "doc_id": doc_id,
+                "file_name": document_data['metadata']['file_name'],
+                "file_path": document_data['metadata']['file_path'],
+                "file_type": document_data['metadata']['file_type'],
+                "uploaded_by": uploaded_by,
+                "text": document_data['text'][:10000]
+            }
+            
+            create_query = """
                 CREATE (d:SharedDocument {
                     id: $doc_id,
                     file_name: $file_name,
@@ -58,36 +87,59 @@ class DocumentStore:
                 WITH d
                 MATCH (u:User {id: $uploaded_by})
                 CREATE (u)-[:UPLOADED]->(d)
-            """,
-                doc_id=doc_id,
-                file_name=document_data['metadata']['file_name'],
-                file_path=document_data['metadata']['file_path'],
-                file_type=document_data['metadata']['file_type'],
-                uploaded_by=uploaded_by,
-                text=document_data['text'][:10000]
-            )
+            """
             
-            # Create chunks (shared across all users)
-            for i, (chunk, embedding) in enumerate(zip(document_data['chunks'], embeddings)):
-                chunk_id = f"{doc_id}_chunk_{i}"
+            # Add source_url and/or video_id if they exist
+            additional_props = []
+            if source_url:
+                additional_props.append("source_url: $source_url")
+                create_params["source_url"] = source_url
+            if video_id:
+                additional_props.append("video_id: $video_id")
+                create_params["video_id"] = video_id
+            
+            if additional_props:
+                create_query = create_query.replace(
+                    "text: $text",
+                    "text: $text, " + ", ".join(additional_props)
+                )
+            
+            session.run(create_query, **create_params)
+            
+            # Create chunks in batches for better performance (batch size: 50)
+            batch_size = 50
+            chunks = list(zip(document_data['chunks'], embeddings))
+            
+            for batch_start in range(0, len(chunks), batch_size):
+                batch = chunks[batch_start:batch_start + batch_size]
                 
+                # Build batch query for better performance
+                batch_params = {
+                    "doc_id": doc_id,
+                    "chunks": [
+                        {
+                            "chunk_id": f"{doc_id}_chunk_{batch_start + i}",
+                            "text": chunk['text'],
+                            "chunk_index": chunk['chunk_index'],
+                            "embedding": embedding
+                        }
+                        for i, (chunk, embedding) in enumerate(batch)
+                    ]
+                }
+                
+                # Use UNWIND for batch creation (much faster than individual CREATE statements)
                 session.run("""
+                    UNWIND $chunks AS chunk_data
                     CREATE (c:SharedChunk {
-                        id: $chunk_id,
-                        text: $text,
-                        chunk_index: $chunk_index,
-                        embedding: $embedding
+                        id: chunk_data.chunk_id,
+                        text: chunk_data.text,
+                        chunk_index: chunk_data.chunk_index,
+                        embedding: chunk_data.embedding
                     })
-                    WITH c
+                    WITH c, chunk_data
                     MATCH (d:SharedDocument {id: $doc_id})
                     CREATE (d)-[:CONTAINS]->(c)
-                """,
-                    chunk_id=chunk_id,
-                    text=chunk['text'],
-                    chunk_index=chunk['chunk_index'],
-                    embedding=embedding,
-                    doc_id=doc_id
-                )
+                """, **batch_params)
         
         return doc_id
     
@@ -109,7 +161,8 @@ class DocumentStore:
         
         # Similar to neo4j_store.py but for SharedChunk nodes
         with self.driver.session() as session:
-            # Build query with optional document filter
+            # Build optimized query with optional document filter
+            # Use parameters to avoid query plan cache issues
             cypher = """
                 MATCH (c:SharedChunk)<-[:CONTAINS]-(d:SharedDocument)
                 WHERE c.embedding IS NOT NULL
@@ -123,7 +176,10 @@ class DocumentStore:
                 cypher += " AND d.file_name = $doc_filename"
                 params["doc_filename"] = doc_filename
             
-            cypher += """
+            # Limit results early for better performance (we'll take top_k anyway)
+            # Get more than top_k to account for filtering, but not too many
+            limit_multiplier = 3
+            cypher += f"""
                 RETURN c.text AS text,
                        c.chunk_index AS chunk_index,
                        c.id AS chunk_id,
@@ -131,13 +187,14 @@ class DocumentStore:
                        d.file_name AS file_name,
                        d.id AS doc_id,
                        d.uploaded_by AS uploaded_by
+                LIMIT {top_k * limit_multiplier}
             """
             
             result = session.run(cypher, **params)
             
             import numpy as np
             
-            # Batch process for speed
+            # Batch process for speed - convert to list once
             records = list(result)
             if not records:
                 return []
@@ -184,8 +241,17 @@ class DocumentStore:
             return [similarities[i] for i in top_indices]
     
     def get_all_shared_documents(self) -> List[Dict[str, Any]]:
-        """Get all shared documents (for admin)."""
+        """
+        Get all shared documents (for admin).
+        Uses optimized query with LIMIT for better performance.
+        """
+        # Check cache first
+        cache_key = "all_documents"
+        if cache_key in self._document_cache:
+            return self._document_cache[cache_key]
+        
         with self.driver.session() as session:
+            # Optimized query - use aggregation more efficiently
             result = session.run("""
                 MATCH (d:SharedDocument)
                 OPTIONAL MATCH (d)-[:CONTAINS]->(c:SharedChunk)
@@ -196,6 +262,7 @@ class DocumentStore:
                        toString(d.uploaded_at) AS uploaded_at,
                        chunk_count
                 ORDER BY d.uploaded_at DESC
+                LIMIT 1000
             """)
             
             documents = []
@@ -209,11 +276,22 @@ class DocumentStore:
                 }
                 documents.append(doc)
             
+            # Cache result
+            self._document_cache[cache_key] = documents
             return documents
     
     def get_document_chunks(self, doc_id: str) -> List[Dict[str, Any]]:
-        """Get all chunks for a specific shared document."""
+        """
+        Get all chunks for a specific shared document.
+        Uses caching for frequently accessed documents.
+        """
+        # Check cache first
+        cache_key = f"chunks_{doc_id}"
+        if cache_key in self._document_cache:
+            return self._document_cache[cache_key]
+        
         with self.driver.session() as session:
+            # Optimized query - use index hint if available
             result = session.run("""
                 MATCH (d:SharedDocument {id: $doc_id})-[:CONTAINS]->(c:SharedChunk)
                 RETURN c.id AS chunk_id,
@@ -230,6 +308,10 @@ class DocumentStore:
                     'chunk_index': record.get('chunk_index', 0)
                 }
                 chunks.append(chunk)
+            
+            # Cache result (only cache if reasonable size)
+            if len(chunks) <= 1000:  # Don't cache huge documents
+                self._document_cache[cache_key] = chunks
             
             return chunks
     
@@ -332,339 +414,128 @@ class DocumentStore:
     def close(self):
         """Close connection."""
         self.driver.close()
-
-"""
-Shared document storage - documents uploaded by users are shared across all users.
-"""
-from typing import List, Dict, Any
-from neo4j import GraphDatabase
-from datetime import datetime
-from config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
-
-
-class DocumentStore:
-    """Store shared documents uploaded by users."""
     
-    def __init__(self, uri: str = NEO4J_URI, user: str = NEO4J_USER, password: str = NEO4J_PASSWORD):
-        """Initialize document store."""
-        self.driver = GraphDatabase.driver(uri, auth=(user, password))
-        self._initialize_schema()
-    
-    def _initialize_schema(self):
-        """Initialize document schema."""
-        with self.driver.session() as session:
-            try:
-                session.run("CREATE CONSTRAINT shared_doc_id IF NOT EXISTS FOR (d:SharedDocument) REQUIRE d.id IS UNIQUE")
-            except:
-                pass
-    
-    def store_document(self,
-                     uploaded_by: str,
-                     document_data: Dict[str, Any],
-                     embeddings: List[List[float]]) -> str:
+    def find_document_by_url(self, url: str) -> Optional[Dict[str, Any]]:
         """
-        Store a shared document.
+        Find a document by its source URL.
         
         Args:
-            uploaded_by: User ID who uploaded
-            document_data: Document data (from document_processor)
-            embeddings: Embeddings for chunks
+            url: Source URL to search for
             
         Returns:
-            Document ID
+            Document dict if found, None otherwise
         """
-        doc_id = f"shared_doc_{datetime.now().timestamp()}"
-        
         with self.driver.session() as session:
-            # Create user node
-            session.run("MERGE (u:User {id: $user_id})", user_id=uploaded_by)
+            # Use EXISTS() to check property existence and avoid schema warnings
+            # This pattern works even if source_url property doesn't exist on all nodes
+            try:
+                result = session.run("""
+                    MATCH (d:SharedDocument)
+                    WHERE EXISTS(d.source_url) AND d.source_url = $url
+                    OPTIONAL MATCH (d)-[:CONTAINS]->(c:SharedChunk)
+                    WITH d, count(c) AS chunk_count
+                    RETURN d.id AS id,
+                           d.file_name AS file_name,
+                           d.uploaded_by AS uploaded_by,
+                           toString(d.uploaded_at) AS uploaded_at,
+                           chunk_count
+                    LIMIT 1
+                """, url=url)
+            except Exception as e:
+                # If query fails (e.g., property doesn't exist in schema), return None
+                logger.debug(f"Could not query document by URL (property may not exist): {e}")
+                return None
             
-            # Create shared document node
-            session.run("""
-                CREATE (d:SharedDocument {
-                    id: $doc_id,
-                    file_name: $file_name,
-                    file_path: $file_path,
-                    file_type: $file_type,
-                    uploaded_by: $uploaded_by,
-                    uploaded_at: datetime(),
-                    text: $text
-                })
-                WITH d
-                MATCH (u:User {id: $uploaded_by})
-                CREATE (u)-[:UPLOADED]->(d)
-            """,
-                doc_id=doc_id,
-                file_name=document_data['metadata']['file_name'],
-                file_path=document_data['metadata']['file_path'],
-                file_type=document_data['metadata']['file_type'],
-                uploaded_by=uploaded_by,
-                text=document_data['text'][:10000]
-            )
-            
-            # Create chunks (shared across all users)
-            for i, (chunk, embedding) in enumerate(zip(document_data['chunks'], embeddings)):
-                chunk_id = f"{doc_id}_chunk_{i}"
-                
-                session.run("""
-                    CREATE (c:SharedChunk {
-                        id: $chunk_id,
-                        text: $text,
-                        chunk_index: $chunk_index,
-                        embedding: $embedding
-                    })
-                    WITH c
-                    MATCH (d:SharedDocument {id: $doc_id})
-                    CREATE (d)-[:CONTAINS]->(c)
-                """,
-                    chunk_id=chunk_id,
-                    text=chunk['text'],
-                    chunk_index=chunk['chunk_index'],
-                    embedding=embedding,
-                    doc_id=doc_id
-                )
-        
-        return doc_id
-    
-    def similarity_search_shared(self,
-                                query_embedding: List[float],
-                                top_k: int = 5,
-                                doc_id: str = None,
-                                doc_filename: str = None) -> List[Dict[str, Any]]:
-        """
-        Search shared documents using similarity.
-        
-        Args:
-            query_embedding: Query embedding vector
-            top_k: Number of results to return
-            doc_id: Optional document ID to filter by
-            doc_filename: Optional document filename to filter by
-        """
-        import numpy as np
-        
-        # Similar to neo4j_store.py but for SharedChunk nodes
-        with self.driver.session() as session:
-            # Build query with optional document filter
-            cypher = """
-                MATCH (c:SharedChunk)<-[:CONTAINS]-(d:SharedDocument)
-                WHERE c.embedding IS NOT NULL
-            """
-            
-            params = {}
-            if doc_id:
-                cypher += " AND d.id = $doc_id"
-                params["doc_id"] = doc_id
-            elif doc_filename:
-                cypher += " AND d.file_name = $doc_filename"
-                params["doc_filename"] = doc_filename
-            
-            cypher += """
-                RETURN c.text AS text,
-                       c.chunk_index AS chunk_index,
-                       c.id AS chunk_id,
-                       c.embedding AS embedding,
-                       d.file_name AS file_name,
-                       d.id AS doc_id,
-                       d.uploaded_by AS uploaded_by
-            """
-            
-            result = session.run(cypher, **params)
-            
-            import numpy as np
-            
-            # Batch process for speed
-            records = list(result)
-            if not records:
-                return []
-            
-            # Vectorized cosine similarity calculation
-            query_vec = np.array(query_embedding, dtype=np.float32)
-            chunk_embeddings = np.array([record["embedding"] for record in records], dtype=np.float32)
-            
-            # Normalize query vector once
-            query_norm = np.linalg.norm(query_vec)
-            if query_norm == 0:
-                query_norm = 1.0
-            
-            # Compute dot products (vectorized)
-            dot_products = np.dot(chunk_embeddings, query_vec)
-            
-            # Compute norms (vectorized)
-            chunk_norms = np.linalg.norm(chunk_embeddings, axis=1)
-            chunk_norms = np.where(chunk_norms == 0, 1.0, chunk_norms)
-            
-            # Cosine similarity (vectorized)
-            similarities_scores = dot_products / (chunk_norms * query_norm)
-            
-            # Create results with scores
-            similarities = []
-            for i, record in enumerate(records):
-                similarities.append({
-                    "text": record["text"],
-                    "chunk_index": record["chunk_index"],
-                    "chunk_id": record["chunk_id"],
-                    "file_name": record["file_name"],
-                    "doc_id": record["doc_id"],
-                    "uploaded_by": record["uploaded_by"],
-                    "score": float(similarities_scores[i])
-                })
-            
-            # Ensure top_k is an integer (handle None, float, etc.)
-            if top_k is None:
-                top_k = 5
-            top_k = int(top_k)
-            
-            # Sort by similarity and return top_k (use numpy argsort for speed)
-            top_indices = np.argsort(similarities_scores)[::-1][:top_k]
-            return [similarities[i] for i in top_indices]
-    
-    def get_all_shared_documents(self) -> List[Dict[str, Any]]:
-        """Get all shared documents (for admin)."""
-        with self.driver.session() as session:
-            result = session.run("""
-                MATCH (d:SharedDocument)
-                OPTIONAL MATCH (d)-[:CONTAINS]->(c:SharedChunk)
-                WITH d, count(c) AS chunk_count
-                RETURN d.id AS id,
-                       d.file_name AS file_name,
-                       d.uploaded_by AS uploaded_by,
-                       toString(d.uploaded_at) AS uploaded_at,
-                       chunk_count
-                ORDER BY d.uploaded_at DESC
-            """)
-            
-            documents = []
-            for record in result:
-                doc = {
+            record = result.single()
+            if record:
+                return {
                     'id': record.get('id', ''),
                     'file_name': record.get('file_name', 'Unknown'),
                     'uploaded_by': record.get('uploaded_by', 'Unknown'),
                     'uploaded_at': record.get('uploaded_at', ''),
                     'chunk_count': record.get('chunk_count', 0)
                 }
-                documents.append(doc)
-            
-            return documents
+            return None
     
-    def get_document_chunks(self, doc_id: str) -> List[Dict[str, Any]]:
-        """Get all chunks for a specific shared document."""
-        with self.driver.session() as session:
-            result = session.run("""
-                MATCH (d:SharedDocument {id: $doc_id})-[:CONTAINS]->(c:SharedChunk)
-                RETURN c.id AS chunk_id,
-                       c.text AS text,
-                       c.chunk_index AS chunk_index
-                ORDER BY c.chunk_index ASC
-            """, doc_id=doc_id)
-            
-            chunks = []
-            for record in result:
-                chunk = {
-                    'chunk_id': record.get('chunk_id', ''),
-                    'text': record.get('text', ''),
-                    'chunk_index': record.get('chunk_index', 0)
-                }
-                chunks.append(chunk)
-            
-            return chunks
-    
-    def find_relevant_documents(self,
-                                query_embedding: List[float],
-                                top_k: int = 3,
-                                min_score: float = 0.3) -> List[Dict[str, Any]]:
+    def find_document_by_video_id(self, video_id: str) -> Optional[Dict[str, Any]]:
         """
-        Find the most relevant documents based on semantic similarity to the query.
-        This searches through all document chunks and returns documents that have
-        highly relevant chunks.
+        Find a document by YouTube video ID.
         
         Args:
-            query_embedding: Query embedding vector
-            top_k: Maximum number of documents to return
-            min_score: Minimum average similarity score for a document to be considered
+            video_id: YouTube video ID to search for
             
         Returns:
-            List of documents with relevance scores, sorted by relevance
+            Document dict if found, None otherwise
         """
-        import numpy as np
-        
         with self.driver.session() as session:
-            # Get all chunks with their document info
-            result = session.run("""
-                MATCH (c:SharedChunk)<-[:CONTAINS]-(d:SharedDocument)
-                WHERE c.embedding IS NOT NULL
-                RETURN c.text AS text,
-                       c.embedding AS embedding,
-                       d.id AS doc_id,
-                       d.file_name AS file_name,
-                       d.uploaded_at AS uploaded_at
-            """)
+            try:
+                result = session.run("""
+                    MATCH (d:SharedDocument)
+                    WHERE EXISTS(d.video_id) AND d.video_id = $video_id
+                    OPTIONAL MATCH (d)-[:CONTAINS]->(c:SharedChunk)
+                    WITH d, count(c) AS chunk_count
+                    RETURN d.id AS id,
+                           d.file_name AS file_name,
+                           d.uploaded_by AS uploaded_by,
+                           toString(d.uploaded_at) AS uploaded_at,
+                           chunk_count
+                    LIMIT 1
+                """, video_id=video_id)
+            except Exception as e:
+                logger.debug(f"Could not query document by video_id (property may not exist): {e}")
+                return None
             
-            records = list(result)
-            if not records:
-                return []
-            
-            # Group chunks by document
-            doc_chunks = {}
-            for record in records:
-                doc_id = record["doc_id"]
-                if doc_id not in doc_chunks:
-                    doc_chunks[doc_id] = {
-                        'doc_id': doc_id,
-                        'file_name': record["file_name"],
-                        'uploaded_at': record["uploaded_at"],
-                        'chunks': []
-                    }
-                doc_chunks[doc_id]['chunks'].append({
-                    'text': record["text"],
-                    'embedding': record["embedding"]
-                })
-            
-            # Calculate relevance score for each document
-            query_vec = np.array(query_embedding, dtype=np.float32)
-            query_norm = np.linalg.norm(query_vec)
-            if query_norm == 0:
-                query_norm = 1.0
-            
-            scored_documents = []
-            for doc_id, doc_data in doc_chunks.items():
-                # Calculate similarity for each chunk in this document
-                chunk_similarities = []
-                for chunk in doc_data['chunks']:
-                    chunk_embedding = np.array(chunk['embedding'], dtype=np.float32)
-                    chunk_norm = np.linalg.norm(chunk_embedding)
-                    if chunk_norm == 0:
-                        continue
-                    
-                    similarity = np.dot(chunk_embedding, query_vec) / (chunk_norm * query_norm)
-                    chunk_similarities.append(float(similarity))
-                
-                if not chunk_similarities:
-                    continue
-                
-                # Use max similarity (best matching chunk) as document relevance score
-                # This ensures documents with at least one highly relevant chunk are prioritized
-                max_similarity = max(chunk_similarities)
-                avg_similarity = sum(chunk_similarities) / len(chunk_similarities)
-                
-                # Combined score: 70% max, 30% avg (prioritize documents with at least one great match)
-                combined_score = (max_similarity * 0.7) + (avg_similarity * 0.3)
-                
-                if combined_score >= min_score:
-                    scored_documents.append({
-                        'doc_id': doc_id,
-                        'file_name': doc_data['file_name'],
-                        'uploaded_at': str(doc_data['uploaded_at']) if doc_data['uploaded_at'] else '',
-                        'score': combined_score,
-                        'max_chunk_score': max_similarity,
-                        'avg_chunk_score': avg_similarity,
-                        'chunk_count': len(doc_data['chunks'])
-                    })
-            
-            # Sort by score (descending) and return top_k
-            scored_documents.sort(key=lambda x: x['score'], reverse=True)
-            return scored_documents[:top_k]
+            record = result.single()
+            if record:
+                return {
+                    'id': record.get('id', ''),
+                    'file_name': record.get('file_name', 'Unknown'),
+                    'uploaded_by': record.get('uploaded_by', 'Unknown'),
+                    'uploaded_at': record.get('uploaded_at', ''),
+                    'chunk_count': record.get('chunk_count', 0)
+                }
+            return None
     
-    def close(self):
-        """Close connection."""
-        self.driver.close()
+    def get_document_content(self, doc_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get full document content including chunks.
+        
+        Args:
+            doc_id: Document ID
+            
+        Returns:
+            Dict with document content and chunks, or None if not found
+        """
+        with self.driver.session() as session:
+            try:
+                result = session.run("""
+                    MATCH (d:SharedDocument {id: $doc_id})
+                    OPTIONAL MATCH (d)-[:CONTAINS]->(c:SharedChunk)
+                    WITH d, collect({
+                        text: c.text,
+                        chunk_index: c.chunk_index,
+                        chunk_id: c.id
+                    }) AS chunks
+                    RETURN d.id AS id,
+                           d.file_name AS file_name,
+                           d.text AS text,
+                           d.source_url AS source_url,
+                           d.video_id AS video_id,
+                           chunks
+                """, doc_id=doc_id)
+                
+                record = result.single()
+                if record:
+                    return {
+                        'id': record.get('id', ''),
+                        'file_name': record.get('file_name', 'Unknown'),
+                        'text': record.get('text', ''),
+                        'source_url': record.get('source_url'),
+                        'video_id': record.get('video_id'),
+                        'chunks': record.get('chunks', [])
+                    }
+                return None
+            except Exception as e:
+                logger.error(f"Error getting document content: {e}")
+                return None
 

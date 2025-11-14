@@ -14,6 +14,7 @@ const ConfigManager = require('./src/configManager');
 const logger = require('./src/logger');
 const rateLimiter = require('./src/rateLimiter');
 const userContext = require('./src/userContext');
+const gopherAgent = require('./src/gopherAgent');
 
 // Create Discord client with reconnection settings
 const client = new Client({
@@ -440,8 +441,68 @@ client.on(Events.MessageCreate, async (message) => {
     }
     
     try {
-        // Auto-detect: Check if message has attachments (document upload)
-        if (message.attachments.size > 0) {
+        // 🤖 AGENTIC ROUTING: Use GopherAgent to intelligently route messages
+        const isMentioned = message.mentions.has(client.user);
+        const hasAttachments = message.attachments.size > 0;
+        
+        // Get recent messages for context (last 3 messages)
+        let recentMessages = [];
+        try {
+            const messages = await message.channel.messages.fetch({ limit: 3 });
+            recentMessages = Array.from(messages.values())
+                .filter(m => !m.author.bot && m.id !== message.id)
+                .slice(0, 3)
+                .map(m => ({
+                    author: m.author.username,
+                    content: m.content.substring(0, 200) // Limit length
+                }));
+        } catch (error) {
+            logger.debug('Could not fetch recent messages for context:', error.message);
+        }
+        
+        // Build context for GopherAgent
+        const context = {
+            hasAttachments,
+            isMentioned,
+            recentMessages,
+            userId,
+            channelId,
+            username: message.author.username
+        };
+        
+        // Use GopherAgent to classify intent and route message
+        let routingResult;
+        try {
+            routingResult = await gopherAgent.routeMessage(message.content, context);
+            logger.debug(`🤖 GopherAgent routing: handler=${routingResult.handler}, intent=${routingResult.intent?.intent}, confidence=${routingResult.routing_confidence}`);
+        } catch (error) {
+            // Check if it's a timeout - gopherAgent should handle this internally now
+            if (error.message && error.message.includes('timeout')) {
+                logger.warn('GopherAgent timeout, using fallback routing');
+            } else {
+                logger.error('GopherAgent error, falling back to pattern matching:', error.message);
+            }
+            // Fallback to pattern-based routing
+            const hasUrl = /https?:\/\//.test(message.content) || /youtube\.com|youtu\.be/.test(message.content.toLowerCase());
+            routingResult = {
+                handler: hasAttachments ? 'upload' : (hasUrl ? 'tools' : (isMentioned || message.content.includes('?') ? 'rag' : 'ignore')),
+                intent: { intent: 'question', should_respond: true, needs_tools: hasUrl, needs_rag: !hasUrl },
+                routing_confidence: 0.5,
+                fallback: true
+            };
+        }
+        
+        const handler = routingResult.handler;
+        const shouldRespond = routingResult.intent?.should_respond !== false;
+        
+        // Route to appropriate handler
+        if (!shouldRespond || handler === 'ignore') {
+            // Don't respond
+            return;
+        }
+        
+        if (handler === 'upload' || hasAttachments) {
+            // Handle file upload
             if (!rateLimiter.checkUserLimit(userId, 'uploads')) {
                 await message.reply({
                     content: '⏳ You\'re uploading files too quickly. Please wait a moment.',
@@ -453,28 +514,28 @@ client.on(Events.MessageCreate, async (message) => {
             return;
         }
         
-        // Auto-detect: Check if message is a question (contains question mark or mentions bot)
-        const isMentioned = message.mentions.has(client.user);
-        const hasQuestionMark = message.content.includes('?');
-        const isQuestion = message.content.trim().length > 10; // Reasonable length for a question
-        
-        if (isMentioned || (hasQuestionMark && isQuestion)) {
-            if (!rateLimiter.checkUserLimit(userId, 'commands')) {
-                const remaining = rateLimiter.getRemaining(userId, 'commands');
-                const resetTime = rateLimiter.getResetTime(userId, 'commands');
-                const waitSeconds = Math.ceil((resetTime - Date.now()) / 1000);
-                await message.reply({
-                    content: `⏳ Rate limit exceeded. You can ask ${remaining} more question(s) in ${waitSeconds} seconds.`,
-                    allowedMentions: { repliedUser: false }
-                });
-                return;
-            }
-            await handleQuestion(message);
+        // For all other handlers, check command rate limit
+        if (!rateLimiter.checkUserLimit(userId, 'commands')) {
+            const remaining = rateLimiter.getRemaining(userId, 'commands');
+            const resetTime = rateLimiter.getResetTime(userId, 'commands');
+            const waitSeconds = Math.ceil((resetTime - Date.now()) / 1000);
+            await message.reply({
+                content: `⏳ Rate limit exceeded. You can ask ${remaining} more question(s) in ${waitSeconds} seconds.`,
+                allowedMentions: { repliedUser: false }
+            });
             return;
         }
         
-        // Ignore short messages that aren't questions
-        if (message.content.trim().length < 10) return;
+        // Route based on handler
+        if (handler === 'rag' || handler === 'tools' || handler === 'memory' || handler === 'action') {
+            await handleQuestion(message, routingResult);
+        } else if (handler === 'chat') {
+            await handleQuestion(message, routingResult);
+        } else {
+            // Unknown handler, default to question handling
+            await handleQuestion(message, routingResult);
+        }
+        
     } catch (error) {
         logger.error('Error handling message:', { 
             userId, 
@@ -719,7 +780,7 @@ function needsRAG(question) {
     return true;
 }
 
-async function handleQuestion(message) {
+async function handleQuestion(message, routingResult = null) {
     const userId = message.author.id;
     const channelId = message.channel.id;
     const username = message.author.username;
@@ -741,6 +802,20 @@ async function handleQuestion(message) {
                 allowedMentions: { repliedUser: false }
             });
             return;
+        }
+        
+        // Use routing result from GopherAgent if available
+        const intent = routingResult?.intent || {};
+        let handler = routingResult?.handler || 'rag';
+        
+        // CRITICAL: Check for URLs - URLs ALWAYS need tools, even if GopherAgent says casual
+        const hasUrl = /(?:https?:\/\/|www\.|youtube\.com|youtu\.be)/i.test(question);
+        if (hasUrl) {
+            handler = 'tools';
+            intent.needs_tools = true;
+            intent.needs_rag = false;
+            intent.is_casual = false;
+            logger.debug('🌐 URL detected - forcing tools handler (overriding GopherAgent routing)');
         }
         
         // Remove all Discord user/role/channel mentions for filename detection
@@ -1012,9 +1087,21 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
         
         // Determine if we need RAG or simple chat (use cleaned question for detection)
         console.log(`🔍 Response check: response=${response ? 'SET' : 'NOT SET'}, isCompareDocs=${isCompareDocs}`);
+        
+        // 🤖 AGENTIC ROUTING: Use GopherAgent's routing decision
+        // Override pattern-based detection with agentic routing if available
+        // CRITICAL: URLs always need tools, even if GopherAgent says casual
+        if (hasUrl) {
+            useRAG = true;  // URLs need RAG pipeline for tool calling
+            logger.debug(`🌐 URL detected - forcing RAG pipeline for tool calling`);
+        } else if (routingResult && intent) {
+            useRAG = intent.needs_rag === true || handler === 'rag' || handler === 'tools';
+            logger.debug(`🤖 Using GopherAgent routing: needs_rag=${intent.needs_rag}, handler=${handler}`);
+        }
+        
         // IMPORTANT: Don't overwrite response if it's already set (e.g., from comparison)
         // Use original question (with mentions) for needsRAG to detect state queries about other users
-        if (!response && needsRAG(question)) {
+        if (!response && (useRAG || needsRAG(question))) {
             useRAG = true;
             
             // Special handling for document listing queries
@@ -1077,6 +1164,12 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
                     // For action commands, we need the original question with mentions
                     // For document search, we use cleaned question
                     // Pass original question to RAG - it will handle cleaning internally for document search
+                    // Check if this is a URL request - YouTube/website summaries take longer
+                    const hasUrl = /(?:https?:\/\/|www\.|youtube\.com|youtu\.be)/i.test(question);
+                    // Use longer timeout for URL requests (90s) since they need to fetch and summarize content
+                    // Regular requests use 30s timeout for faster fallback
+                    const timeoutDuration = hasUrl ? 90000 : 30000;
+                    
                     response = await Promise.race([
                         ragService.queryWithContext(
                             question,  // Pass original question (with mentions) for action parsing
@@ -1090,7 +1183,7 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
                             isAdmin  // Pass admin status for tool creation
                         ),
                         new Promise((_, reject) => 
-                            setTimeout(() => reject(new Error('RAG timeout')), 30000)  // Reduced from 45s to 30s for faster fallback
+                            setTimeout(() => reject(new Error('RAG timeout')), timeoutDuration)
                         )
                     ]);
                     
@@ -1140,11 +1233,19 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
         const isStateQueryAboutOtherUser = /<@!?\d+>/.test(question) && /(?:how many|how much|what).*(?:gold|coins?|inventory|items?|balance).*(?:does|do|has|have|owns)/i.test(question);
         const isRAGConversationalResponse = response && (response.is_casual_conversation === true || response.service_routing === 'chat');
         
+        // CRITICAL: URLs should NEVER be treated as casual conversation - they need tool calling
+        // Override casual response if URL is present
+        if (hasUrl && isRAGConversationalResponse) {
+            logger.warning(`🌐 URL detected but RAG returned casual response - this should not happen, forcing tool calling`);
+            // Don't skip - force tool calling by not treating as casual
+            // The response will be regenerated with tool calling
+        }
+        
         // CRITICAL: If RAG already returned a conversational response, skip all memory retrieval
-        if (isRAGConversationalResponse) {
+        if (isRAGConversationalResponse && !hasUrl) {
             logger.info(`⏭️ Skipping memory retrieval - RAG already returned conversational response`);
             // Skip to the end - don't do memory retrieval or simple chat
-        } else if (!response && !needsRAG(question) && !targetDocId && !targetDocFilename && !isCasualConversation && !isStatementOrRequest && !isStateQueryAboutOtherUser) {
+        } else if (!response && !needsRAG(question) && !targetDocId && !targetDocFilename && !isCasualConversation && !isStatementOrRequest && !isStateQueryAboutOtherUser && !hasUrl) {
             // Use original question (with mentions) for needsRAG to detect state queries about other users
             // Only do memory retrieval if we don't have a response yet
             try {
@@ -1389,8 +1490,20 @@ Answer:`;
         // Send response using embeds with pagination
         let answer = response.answer || '';
         const MAX_EMBED_DESCRIPTION = 4096; // Discord embed description limit
+        const PAGINATION_THRESHOLD = 2000; // Use pagination for responses longer than this (better UX)
         
-        if (answer.length > MAX_EMBED_DESCRIPTION) {
+        // Check if this is a YouTube response - detect by checking if URL was YouTube-specific
+        // Only check for actual YouTube URLs, not just any tool handler
+        const isYouTubeResponse = hasUrl && (
+            /youtube\.com|youtu\.be/i.test(question) || 
+            (response.source_documents && response.source_documents.some(doc => /youtube\.com|youtu\.be/i.test(String(doc))))
+        );
+        
+        // Check if this is a website response (any URL that's not YouTube)
+        const isWebsiteResponse = hasUrl && !isYouTubeResponse;
+        
+        // Use pagination if response is long OR if it's a YouTube/website URL response
+        if (answer.length > PAGINATION_THRESHOLD || ((isYouTubeResponse || isWebsiteResponse) && answer.length > 500)) {
             // Split into pages for embed pagination
             const pages = [];
             let remaining = answer;
@@ -1420,13 +1533,22 @@ Answer:`;
             let currentPage = 0;
             const createEmbed = (pageIndex) => {
                 const embed = new EmbedBuilder()
-                    .setColor(0x5865F2) // Discord blurple
+                    .setColor(isYouTubeResponse ? 0xFF0000 : 0x5865F2) // Red for YouTube, blurple for others
                     .setDescription(pages[pageIndex])
                     .setFooter({ 
                         text: `Page ${pageIndex + 1} of ${pages.length}`,
                         iconURL: client.user.displayAvatarURL()
                     })
                     .setTimestamp();
+                
+                // Add title for URL responses
+                if (pageIndex === 0) {
+                    if (isYouTubeResponse) {
+                        embed.setTitle('📺 YouTube Video Summary');
+                    } else if (isWebsiteResponse) {
+                        embed.setTitle('🌐 Website Summary');
+                    }
+                }
                 
                 // Add source information as fields (only on first page)
                 if (pageIndex === 0) {
@@ -1553,13 +1675,20 @@ Answer:`;
         } else {
             // Single page embed
             const embed = new EmbedBuilder()
-                .setColor(0x5865F2)
+                .setColor(isYouTubeResponse ? 0xFF0000 : 0x5865F2) // Red for YouTube, blurple for others
                 .setDescription(answer)
                 .setFooter({ 
                     text: 'Response',
                     iconURL: client.user.displayAvatarURL()
                 })
                 .setTimestamp();
+            
+            // Add title for URL responses
+            if (isYouTubeResponse) {
+                embed.setTitle('📺 YouTube Video Summary');
+            } else if (isWebsiteResponse) {
+                embed.setTitle('🌐 Website Summary');
+            }
             
             // Add source information as fields
             if (response.source_documents && response.source_documents.length > 0) {

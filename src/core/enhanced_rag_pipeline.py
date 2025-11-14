@@ -26,6 +26,7 @@ from src.tools.llm_item_tracker import LLMItemTracker
 from src.tools.llm_tools import create_rag_tools, LLMToolExecutor, LLMToolParser
 from src.tools.tool_sandbox import ToolSandbox, ToolStorage
 from src.tools.meta_tools import create_meta_tools
+from src.agents.gopher_agent import get_gopher_agent
 from src.utils.cross_encoder_reranker import CrossEncoderReranker, FallbackReranker
 from src.search.multi_query_retrieval import MultiQueryRetrieval
 from src.evaluation.rag_evaluator import RAGEvaluator
@@ -91,33 +92,97 @@ class EnhancedRAGPipeline(RAGPipeline):
         self.ab_testing = ABTesting()  # A/B testing framework
         self.performance_optimizer = PerformanceOptimizer()  # Performance optimizations
         
-        # Initialize LLM tools
-        self.tool_registry = create_rag_tools(self)
+        # Initialize GopherAgent as central orchestrator (lazy singleton)
+        self.gopher_agent = get_gopher_agent()
+        logger.info("🤖 GopherAgent initialized as central orchestrator")
         
-        # Initialize tool sandbox and storage for self-extending tools
-        self.tool_sandbox = ToolSandbox()
-        self.tool_storage = ToolStorage()
+        # Initialize LLM tools (lazy - only when needed)
+        self._tool_registry = None
+        self._tool_executor = None
+        self._tool_parser = None
+        self._tool_sandbox = None
+        self._tool_storage = None
         
         # Store admin status for current query (set during query)
         self.current_is_admin = False
+        self.current_user_id = None
         
-        # Register meta-tools (tools that create tools)
-        meta_tools = create_meta_tools(self.tool_sandbox, self.tool_storage, self.tool_registry, self)
-        for meta_tool in meta_tools:
-            self.tool_registry.register_tool(meta_tool)
+        # Initialize conversation store for semantic conversation retrieval (lazy)
+        self._conversation_store = None
         
-        self.tool_executor = LLMToolExecutor(self.tool_registry)
-        self.tool_parser = LLMToolParser()
+        # Enhanced caching for query results and embeddings
+        if CACHE_ENABLED:
+            # Larger cache for embeddings (frequently reused)
+            self._enhanced_embedding_cache = TTLCache(maxsize=CACHE_MAX_SIZE * 2, ttl=CACHE_TTL_SECONDS)
+            # Cache for query analysis results
+            self._query_analysis_cache = TTLCache(maxsize=CACHE_MAX_SIZE, ttl=CACHE_TTL_SECONDS // 2)
+        else:
+            self._enhanced_embedding_cache = {}
+            self._query_analysis_cache = {}
         
-        # Initialize conversation store for semantic conversation retrieval
-        try:
-            from src.memory.conversation_store import ConversationStore
-            self.conversation_store = ConversationStore(embedding_generator=self.embedding_generator)
-        except Exception as e:
-            logger.warning(f"Could not initialize conversation store: {e}")
-            self.conversation_store = None
+        logger.info("Enhanced RAG Pipeline initialized with optimized lazy loading")
+    
+    @property
+    def tool_registry(self):
+        """Lazy-load tool registry."""
+        if self._tool_registry is None:
+            self._tool_registry = create_rag_tools(self)
+            # Initialize tool sandbox and storage for self-extending tools
+            self._tool_sandbox = ToolSandbox()
+            self._tool_storage = ToolStorage()
+            # Register meta-tools (tools that create tools)
+            meta_tools = create_meta_tools(self._tool_sandbox, self._tool_storage, self._tool_registry, self)
+            for meta_tool in meta_tools:
+                self._tool_registry.register_tool(meta_tool)
+        return self._tool_registry
+    
+    @property
+    def tool_executor(self):
+        """Lazy-load tool executor."""
+        if self._tool_executor is None:
+            self._tool_executor = LLMToolExecutor(self.tool_registry)
+        return self._tool_executor
+    
+    @property
+    def tool_parser(self):
+        """Lazy-load tool parser."""
+        if self._tool_parser is None:
+            self._tool_parser = LLMToolParser()
+        return self._tool_parser
+    
+    @property
+    def conversation_store(self):
+        """Lazy-load conversation store."""
+        if self._conversation_store is None:
+            try:
+                from src.memory.conversation_store import ConversationStore
+                self._conversation_store = ConversationStore(embedding_generator=self.embedding_generator)
+            except Exception as e:
+                logger.warning(f"Could not initialize conversation store: {e}")
+                self._conversation_store = None
+        return self._conversation_store
+    
+    def _get_cached_embedding(self, query: str) -> List[float]:
+        """
+        Enhanced embedding cache with better hit rates.
+        Overrides base class method to use enhanced cache.
+        """
+        # Normalize query for better cache hits (trim, lowercase for exact matches)
+        query_normalized = query.strip().lower()[:500]  # Limit length for cache key
         
-        logger.info("Enhanced RAG Pipeline initialized with all advanced features including self-extending tools")
+        # Check enhanced cache first
+        if CACHE_ENABLED and query_normalized in self._enhanced_embedding_cache:
+            logger.debug(f"Enhanced cache hit for query embedding: {query[:50]}...")
+            return self._enhanced_embedding_cache[query_normalized]
+        
+        # Fall back to base class method (which also checks its cache)
+        embedding = super()._get_cached_embedding(query)
+        
+        # Store in enhanced cache
+        if CACHE_ENABLED:
+            self._enhanced_embedding_cache[query_normalized] = embedding
+        
+        return embedding
     
     def query(self,
               question: str,
@@ -158,25 +223,37 @@ class EnhancedRAGPipeline(RAGPipeline):
         
         # Store admin status for this query (used by meta-tools)
         self.current_is_admin = is_admin
+        self.current_user_id = user_id
         
         # Step 0: Identify active persona (multiple people per user_id) - CACHED
+        # Optimize: Skip persona identification if not needed (most queries don't need it)
         active_persona_id = None
-        if user_id:
+        if user_id and hasattr(self.user_relations, 'identify_active_persona'):
             # Cache persona identification for speed
             import hashlib
             message_hash = hashlib.md5(question[:50].encode()).hexdigest()
-            cached_persona = self.performance_optimizer.get_cached_persona(user_id, message_hash)
-            if cached_persona:
-                active_persona_id = cached_persona
+            cache_key = f"persona_{user_id}_{message_hash}"
+            
+            # Check enhanced cache first
+            if CACHE_ENABLED and cache_key in self._query_analysis_cache:
+                active_persona_id = self._query_analysis_cache[cache_key]
             else:
-                active_persona_id = self.user_relations.identify_active_persona(
-                    user_id=user_id,
-                    message_text=question,
-                    channel_id=channel_id,
-                    username=username
-                )
-                if active_persona_id:
-                    self.performance_optimizer.cache_persona(user_id, message_hash, active_persona_id)
+                cached_persona = self.performance_optimizer.get_cached_persona(user_id, message_hash)
+                if cached_persona:
+                    active_persona_id = cached_persona
+                else:
+                    # Only identify persona if really needed (skip for simple queries)
+                    if len(question) > 20:  # Only for substantial queries
+                        active_persona_id = self.user_relations.identify_active_persona(
+                            user_id=user_id,
+                            message_text=question,
+                            channel_id=channel_id,
+                            username=username
+                        )
+                        if active_persona_id:
+                            self.performance_optimizer.cache_persona(user_id, message_hash, active_persona_id)
+                            if CACHE_ENABLED:
+                                self._query_analysis_cache[cache_key] = active_persona_id
         
         # Step 0.0: Quick check - skip action parsing if this is clearly a query (not an action)
         # State queries should be handled by state query handler, not action parser
@@ -207,27 +284,102 @@ class EnhancedRAGPipeline(RAGPipeline):
         if state_set_result:
             return state_set_result
         
-        # Step 0.3: Run LLM query understanding FIRST to determine if this is casual conversation
-        # The LLM will determine if this is casual conversation, which should skip action parsing
-        context_for_analysis = {
+        # 🤖 AGENTIC ORCHESTRATION: Use GopherAgent for routing decisions
+        # GopherAgent is the central orchestrator for all routing and tool decisions
+        context_for_gopher = {
             "user_id": user_id,
             "channel_id": channel_id,
             "doc_id": doc_id,
             "doc_filename": doc_filename,
-            "mentioned_user_id": mentioned_user_id
+            "mentioned_user_id": mentioned_user_id,
+            "username": username,
+            "is_admin": is_admin
         }
         
-        # Quick LLM analysis to check if this is casual conversation (before action parsing)
-        quick_analysis = None
+        # Use GopherAgent to classify intent and route
+        gopher_intent = None
+        gopher_routing = None
+        is_casual_from_llm = False
+        service_routing_from_llm = "rag"
+        needs_rag_from_gopher = True
+        needs_tools_from_gopher = False
+        needs_memory_from_gopher = False
+        
         try:
-            quick_analysis = self.query_understanding.analyze_query(question, context_for_analysis)
-            is_casual_from_llm = quick_analysis.get("is_casual", False)
-            service_routing_from_llm = quick_analysis.get("service_routing", "rag")
-            logger.info(f"🔍 LLM quick analysis: is_casual={is_casual_from_llm}, service_routing={service_routing_from_llm}")
+            gopher_intent = self.gopher_agent.classify_intent(question, context_for_gopher)
+            gopher_routing = self.gopher_agent.route_message(question, context_for_gopher, gopher_intent)
+            
+            is_casual_from_llm = gopher_intent.get("is_casual", False)
+            service_routing_from_llm = gopher_routing.get("handler", "rag")
+            needs_rag_from_gopher = gopher_intent.get("needs_rag", False)
+            needs_tools_from_gopher = gopher_intent.get("needs_tools", False)
+            needs_memory_from_gopher = gopher_intent.get("needs_memory", False)
+            
+            logger.info(f"🤖 GopherAgent routing: handler={service_routing_from_llm}, intent={gopher_intent.get('intent')}, needs_rag={needs_rag_from_gopher}, needs_tools={needs_tools_from_gopher}")
         except Exception as e:
-            logger.warning(f"⚠️ LLM quick analysis failed: {e}, proceeding with action parsing")
+            logger.warning(f"⚠️ GopherAgent routing failed: {e}, falling back to query understanding")
+            # Fallback to query understanding
+            try:
+                fallback_analysis = self.query_understanding.analyze_query(question, context_for_gopher)
+                is_casual_from_llm = fallback_analysis.get("is_casual", False)
+                service_routing_from_llm = fallback_analysis.get("service_routing", "rag")
+                needs_rag_from_gopher = fallback_analysis.get("needs_rag", False)
+                needs_tools_from_gopher = fallback_analysis.get("needs_tools", False)
+                needs_memory_from_gopher = fallback_analysis.get("needs_memory", False)
+                
+                # Create fallback gopher_intent and gopher_routing for compatibility
+                gopher_intent = {
+                    "intent": fallback_analysis.get("intent", "question"),
+                    "is_casual": is_casual_from_llm,
+                    "needs_rag": needs_rag_from_gopher,
+                    "needs_tools": needs_tools_from_gopher,
+                    "needs_memory": needs_memory_from_gopher,
+                    "document_references": fallback_analysis.get("document_references", []),
+                    "confidence": 0.5
+                }
+                gopher_routing = {
+                    "handler": service_routing_from_llm,
+                    "intent": gopher_intent,
+                    "routing_confidence": 0.5
+                }
+            except Exception as e2:
+                logger.warning(f"⚠️ Query understanding fallback also failed: {e2}")
+                is_casual_from_llm = False
+                service_routing_from_llm = "rag"
+                needs_rag_from_gopher = True
+                needs_tools_from_gopher = False
+                needs_memory_from_gopher = False
+                
+                # Create minimal fallback structures
+                gopher_intent = {
+                    "intent": "question",
+                    "is_casual": False,
+                    "needs_rag": True,
+                    "needs_tools": False,
+                    "needs_memory": False,
+                    "document_references": [],
+                    "confidence": 0.3
+                }
+                gopher_routing = {
+                    "handler": "rag",
+                    "intent": gopher_intent,
+                    "routing_confidence": 0.3
+                }
+        
+        # Check for URLs (website or YouTube) - should skip action parsing AND document retrieval
+        has_url = any([
+            "http://" in question or "https://" in question,
+            "www." in question and ("." in question.split("www.")[1][:50] if "www." in question else False),
+            "youtube.com" in question_lower or "youtu.be" in question_lower,
+        ])
+        
+        # IMPORTANT: Override if URL is detected - URLs require tool calling, not casual conversation
+        if has_url:
             is_casual_from_llm = False
-            service_routing_from_llm = None
+            service_routing_from_llm = "tools"  # URLs need tool calling
+            needs_rag_from_gopher = False
+            needs_tools_from_gopher = True
+            logger.info(f"🌐 URL detected - overriding routing to tools")
         
         # Step 0.4: Only try action parsing if it's NOT a query pattern AND NOT a document query AND NOT casual conversation (as determined by LLM)
         # The LLM understands what items are, where they go, and to whom they belong
@@ -236,6 +388,14 @@ class EnhancedRAGPipeline(RAGPipeline):
         # IMPORTANT: Skip action parsing if LLM determined it's casual conversation
         # IMPORTANT: Skip action parsing for tool creation requests (create tool, make tool, write tool, etc.)
         has_document = doc_id or doc_filename
+        
+        # If URL detected, skip document retrieval - the URL tool will fetch the content
+        if has_url:
+            logger.info(f"🌐 URL detected in query - skipping document retrieval (URL tool will fetch content)")
+            should_search_docs = False
+            doc_id = None
+            doc_filename = None
+        
         should_skip_action_parsing = is_casual_from_llm or (service_routing_from_llm == "chat")
         
         # Check if this is a tool creation request
@@ -249,7 +409,7 @@ class EnhancedRAGPipeline(RAGPipeline):
             service_routing_from_llm == "tools"
         ])
         
-        if not is_query_pattern and not has_document and not should_skip_action_parsing and not is_tool_creation_request:
+        if not is_query_pattern and not has_document and not has_url and not should_skip_action_parsing and not is_tool_creation_request:
             logger.info(f"🔍 Attempting LLM action parsing: {question[:100]}")
             try:
                 parsed_action = self.item_tracker.parse_item_action(question, user_id or "", channel_id or "")
@@ -260,6 +420,8 @@ class EnhancedRAGPipeline(RAGPipeline):
         else:
             if has_document:
                 logger.info(f"🔍 Skipping action parsing - document query detected: {doc_filename or doc_id}")
+            elif has_url:
+                logger.info(f"🔍 Skipping action parsing - URL detected (website/YouTube query)")
             elif should_skip_action_parsing:
                 logger.info(f"🔍 Skipping action parsing - LLM determined this is casual conversation (is_casual={is_casual_from_llm}, service_routing={service_routing_from_llm})")
             elif is_tool_creation_request:
@@ -329,6 +491,11 @@ class EnhancedRAGPipeline(RAGPipeline):
             # This prevents false positives from casual conversation or ambiguous messages
             confidence_threshold = 0.6  # Require high confidence before executing actions
             
+            # Check if parsed_action is None before accessing it
+            if parsed_action is None:
+                logger.debug("🔍 No action parsed, skipping action handling")
+                parsed_action = {}  # Set to empty dict to prevent errors
+            
             action_type = parsed_action.get("action", "").lower()
             confidence = parsed_action.get("confidence", 0)
             
@@ -365,7 +532,11 @@ class EnhancedRAGPipeline(RAGPipeline):
         }
         
         # If a document is already detected, force document search
-        if doc_id or doc_filename:
+        # BUT skip if URL is detected (URL tool will fetch content)
+        if has_url:
+            should_search_docs = False
+            logger.info(f"🌐 URL detected - skipping document search (URL tool will fetch content)")
+        elif doc_id or doc_filename:
             should_search_docs = True
             logger.info(f"📄 Document already detected ({doc_filename or doc_id}), forcing document search")
         else:
@@ -389,13 +560,24 @@ class EnhancedRAGPipeline(RAGPipeline):
             except Exception as e:
                 logger.debug(f"Could not get recent conversation for context: {e}")
         
-        # Reuse the early LLM analysis if we have it, otherwise run full analysis
+        # 🤖 AGENTIC ORCHESTRATION: Use GopherAgent analysis or fallback to query understanding
         # Check if context changed (e.g., previous conversation added) - if so, re-run analysis
         context_changed = bool(context.get("previous_question") or context.get("previous_answer"))
-        if quick_analysis is not None and not context_changed:
-            # Reuse the early analysis we already ran
-            enhanced_analysis = quick_analysis
-            logger.info(f"♻️ Reusing early LLM analysis result")
+        
+        # Use GopherAgent analysis if available, otherwise use query understanding
+        if gopher_intent is not None and gopher_routing is not None and not context_changed:
+            # Reuse the GopherAgent analysis we already ran
+            enhanced_analysis = {
+                "intent": gopher_intent.get("intent", "question"),
+                "service_routing": gopher_routing.get("handler", "rag"),
+                "needs_rag": gopher_intent.get("needs_rag", False),
+                "needs_tools": gopher_intent.get("needs_tools", False),
+                "needs_memory": gopher_intent.get("needs_memory", False),
+                "is_casual": gopher_intent.get("is_casual", False),
+                "document_references": gopher_intent.get("document_references", []),
+                "confidence": gopher_intent.get("confidence", 0.5)
+            }
+            logger.info(f"♻️ Reusing GopherAgent analysis result")
         else:
             # Need to run full analysis (either first time or context changed)
             import hashlib
@@ -407,7 +589,29 @@ class EnhancedRAGPipeline(RAGPipeline):
             if cached_analysis:
                 enhanced_analysis = cached_analysis
             else:
-                enhanced_analysis = self.query_understanding.analyze_query(question, context)
+                # Try GopherAgent first, fallback to query understanding
+                try:
+                    if context_changed:
+                        # Re-run GopherAgent with updated context
+                        gopher_intent_updated = self.gopher_agent.classify_intent(question, context_for_gopher)
+                        gopher_routing_updated = self.gopher_agent.route_message(question, context_for_gopher, gopher_intent_updated)
+                        enhanced_analysis = {
+                            "intent": gopher_intent_updated.get("intent", "question"),
+                            "service_routing": gopher_routing_updated.get("handler", "rag"),
+                            "needs_rag": gopher_intent_updated.get("needs_rag", False),
+                            "needs_tools": gopher_intent_updated.get("needs_tools", False),
+                            "needs_memory": gopher_intent_updated.get("needs_memory", False),
+                            "is_casual": gopher_intent_updated.get("is_casual", False),
+                            "document_references": gopher_intent_updated.get("document_references", []),
+                            "confidence": gopher_intent_updated.get("confidence", 0.5)
+                        }
+                    else:
+                        # Use query understanding as fallback
+                        enhanced_analysis = self.query_understanding.analyze_query(question, context)
+                except Exception as e:
+                    logger.warning(f"⚠️ GopherAgent analysis failed, using query understanding: {e}")
+                    enhanced_analysis = self.query_understanding.analyze_query(question, context)
+                
                 if use_cache:
                     self.performance_optimizer.analysis_cache[query_hash] = enhanced_analysis
         
@@ -476,21 +680,34 @@ class EnhancedRAGPipeline(RAGPipeline):
                     break
         
         # IMPORTANT: If a document is detected (either from LLM or pattern matching), override routing to use RAG
-        if doc_id or doc_filename:
+        # BUT skip if URL is detected (URL tool will handle content fetching)
+        if (doc_id or doc_filename) and not has_url:
             logger.info(f"📄 Document detected ({doc_filename or doc_id}), overriding service routing to RAG")
             service_routing = "rag"
             needs_rag = True
             should_search_docs = True
+        elif has_url:
+            logger.info(f"🌐 URL detected - skipping document detection (URL tool will fetch content)")
+            should_search_docs = False
         
-        # Override needs_rag if LLM says it's casual conversation (but only if no document detected)
-        if is_casual and not doc_id and not doc_filename:
+        # IMPORTANT: Override casual conversation detection if URL is detected
+        # URLs require tool calling, so they cannot be casual conversation
+        if has_url:
+            is_casual = False
+            service_routing = "rag"  # Force RAG routing to allow tool calling
+            needs_rag = True  # Force needs_rag to prevent early return
+            logger.info(f"🌐 URL detected - overriding is_casual=False, service_routing=rag (URL requires tool calling)")
+        
+        # Override needs_rag if LLM says it's casual conversation (but only if no document detected and no URL)
+        if is_casual and not doc_id and not doc_filename and not has_url:
             needs_rag = False
             should_search_docs = False
         
         logger.info(f"Enhanced query analysis: {enhanced_analysis.get('question_type')}, complexity: {enhanced_analysis.get('complexity')}, service_routing: {service_routing}, needs_rag: {needs_rag}, needs_tools: {needs_tools}, needs_memory: {needs_memory}, is_casual: {is_casual}")
         
         # Early return for casual conversation - generate conversational response without RAG
-        if is_casual or (service_routing == "chat" and not needs_rag):
+        # BUT skip this if URL is detected (URLs require tool calling)
+        if (is_casual or (service_routing == "chat" and not needs_rag)) and not has_url:
             logger.info(f"💬 Generating conversational response (casual conversation detected)")
             # Get user context if needed (but don't block on it)
             user_context_for_conv = None
@@ -504,8 +721,13 @@ class EnhancedRAGPipeline(RAGPipeline):
             )
         
         # Override should_search_docs based on query analysis if available
-        if enhanced_analysis.get("needs_rag") is not None:
+        # BUT respect URL detection - if URL is present, skip document retrieval
+        if enhanced_analysis.get("needs_rag") is not None and not has_url:
             should_search_docs = needs_rag
+        elif has_url:
+            # Force skip document retrieval when URL is detected
+            should_search_docs = False
+            logger.info(f"🌐 URL detected - forcing should_search_docs=False (URL tool will fetch content)")
         
         # Step 3: Rewrite query for better retrieval - OPTIMIZED
         # Skip LLM rewrite for simple queries
@@ -551,8 +773,9 @@ class EnhancedRAGPipeline(RAGPipeline):
         
         # Select which documents to search (if any)
         # IMPORTANT: If a specific document is already detected, skip selection and use that document directly
+        # IMPORTANT: Skip document selection if URL is detected (URL tool will fetch content)
         selected_docs = []
-        if should_search_docs and use_shared_docs:
+        if should_search_docs and use_shared_docs and not has_url:
             if doc_id or doc_filename:
                 # Specific document already detected, don't select others
                 logger.info(f"📄 Using specific document: {doc_filename or doc_id}, skipping document selection")
@@ -572,12 +795,15 @@ class EnhancedRAGPipeline(RAGPipeline):
         retrieved_chunks = []
         retrieved_memories = []
         
-        # Optimize: Use more workers for parallel retrieval (faster)
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        # Optimize: Use adaptive worker count based on workload
+        # More workers for complex queries, fewer for simple ones
+        num_workers = min(5, max(2, len(selected_docs) + 1)) if selected_docs else 3
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = {}
             
             # Enhanced document search (only if documents should be searched)
-            if should_search_docs and use_shared_docs:
+            # IMPORTANT: Skip document search if URL is detected (URL tool will fetch content)
+            if should_search_docs and use_shared_docs and not has_url:
                 # IMPORTANT: If doc_id/doc_filename is set, use it directly (don't use selected_docs)
                 if doc_id or doc_filename:
                     # Search the specific document directly
@@ -898,45 +1124,117 @@ class EnhancedRAGPipeline(RAGPipeline):
                 "content": f"IMPORTANT: You MUST call write_tool NOW to create the tool. Do NOT just describe it. Use this exact format: {{\"tool\": \"write_tool\", \"arguments\": {{\"code\": \"...\", \"function_name\": \"...\", \"description\": \"...\", \"parameters\": {{...}}}}}}"
             })
         
-        if needs_tools or service_routing == "tools":
-            # Force tool calling for tool-related requests (like creating tools)
-            # This ensures meta-tools (write_tool, test_tool, register_tool) are actually called
-            logger.info(f"🔧 Using tool calling (needs_tools={needs_tools}, service_routing={service_routing})")
-            answer, tool_calls_used = self._generate_with_tools(
-                messages=messages,
-                question=question,
-                user_id=user_id,
-                channel_id=channel_id,
-                mentioned_user_id=mentioned_user_id,
-                temperature=strategy.get("temperature", temperature),
-                max_tokens=max_tokens,
-                max_iterations=5,  # Allow up to 5 tool call iterations for tool creation workflow
-                needs_tools=needs_tools,
-                service_routing=service_routing
-            )
-        elif doc_id or doc_filename or retrieved_chunks:
-            # Documents already retrieved - generate response directly without tools
-            # This prevents the LLM from trying to call search_documents when we already have the chunks
-            logger.info(f"📄 Skipping tool calling - documents already retrieved")
-            answer = self.lmstudio_client.generate_response(
-                messages=messages,
-                temperature=strategy.get("temperature", temperature),
-                max_tokens=max_tokens
-            )
-            tool_calls_used = []
+        # Check if query contains URL (for website/YouTube tools)
+        question_lower_for_url = question.lower()
+        has_url_in_query = any([
+            "http://" in question or "https://" in question,
+            "www." in question and ("." in question.split("www.")[1][:50] if "www." in question else False),
+            "youtube.com" in question_lower_for_url or "youtu.be" in question_lower_for_url,
+        ])
+        
+        # 🤖 AGENTIC ORCHESTRATION: Use GopherAgent's routing decision for tool calling
+        # GopherAgent determines if tools are needed based on intent classification
+        needs_tools_final = needs_tools_from_gopher if 'needs_tools_from_gopher' in locals() else needs_tools
+        
+        # Use GopherAgent's routing decision
+        if gopher_routing:
+            handler = gopher_routing.get("handler", service_routing)
+            if handler == "tools" or needs_tools_final:
+                logger.info(f"🤖 GopherAgent orchestrating tool calls (handler={handler}, needs_tools={needs_tools_final})")
+                answer, tool_calls_used = self._generate_with_tools(
+                    messages=messages,
+                    question=question,
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    mentioned_user_id=mentioned_user_id,
+                    temperature=strategy.get("temperature", temperature),
+                    max_tokens=max_tokens,
+                    max_iterations=5 if needs_tools_final else 3,
+                    needs_tools=needs_tools_final,
+                    service_routing=service_routing
+                )
+            elif handler == "rag" and (doc_id or doc_filename or retrieved_chunks):
+                # Documents already retrieved - generate response directly
+                logger.info(f"📄 GopherAgent: Documents already retrieved, generating response")
+                answer = self.lmstudio_client.generate_response(
+                    messages=messages,
+                    temperature=strategy.get("temperature", temperature),
+                    max_tokens=max_tokens
+                )
+                tool_calls_used = []
+            elif handler == "chat" or is_casual_from_llm:
+                # Casual conversation - no tools needed
+                logger.info(f"💬 GopherAgent: Casual conversation, generating chat response")
+                answer = self.lmstudio_client.generate_response(
+                    messages=messages,
+                    temperature=strategy.get("temperature", temperature),
+                    max_tokens=max_tokens
+                )
+                tool_calls_used = []
+            else:
+                # Default: allow tool calling for dynamic search/actions
+                logger.info(f"🤖 GopherAgent: Allowing tool calling for dynamic operations")
+                answer, tool_calls_used = self._generate_with_tools(
+                    messages=messages,
+                    question=question,
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    mentioned_user_id=mentioned_user_id,
+                    temperature=strategy.get("temperature", temperature),
+                    max_tokens=max_tokens,
+                    needs_tools=needs_tools_final,
+                    service_routing=service_routing
+                )
         else:
-            # No documents retrieved - allow tool calling for dynamic search/actions
-            answer, tool_calls_used = self._generate_with_tools(
-                messages=messages,
-                question=question,
-                user_id=user_id,
-                channel_id=channel_id,
-                mentioned_user_id=mentioned_user_id,
-                temperature=strategy.get("temperature", temperature),
-                max_tokens=max_tokens,
-                needs_tools=needs_tools,
-                service_routing=service_routing
-            )
+            # Fallback to original logic if GopherAgent routing unavailable
+            if needs_tools or service_routing == "tools":
+                logger.info(f"🔧 Using tool calling (fallback mode)")
+                answer, tool_calls_used = self._generate_with_tools(
+                    messages=messages,
+                    question=question,
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    mentioned_user_id=mentioned_user_id,
+                    temperature=strategy.get("temperature", temperature),
+                    max_tokens=max_tokens,
+                    max_iterations=5,
+                    needs_tools=needs_tools,
+                    service_routing=service_routing
+                )
+            elif has_url_in_query:
+                logger.info(f"🌐 URL detected in query - allowing tool calling (fallback)")
+                answer, tool_calls_used = self._generate_with_tools(
+                    messages=messages,
+                    question=question,
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    mentioned_user_id=mentioned_user_id,
+                    temperature=strategy.get("temperature", temperature),
+                    max_tokens=max_tokens,
+                    max_iterations=3,
+                    needs_tools=False,
+                    service_routing=service_routing
+                )
+            elif doc_id or doc_filename or retrieved_chunks:
+                logger.info(f"📄 Skipping tool calling - documents already retrieved (fallback)")
+                answer = self.lmstudio_client.generate_response(
+                    messages=messages,
+                    temperature=strategy.get("temperature", temperature),
+                    max_tokens=max_tokens
+                )
+                tool_calls_used = []
+            else:
+                answer, tool_calls_used = self._generate_with_tools(
+                    messages=messages,
+                    question=question,
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    mentioned_user_id=mentioned_user_id,
+                    temperature=strategy.get("temperature", temperature),
+                    max_tokens=max_tokens,
+                    needs_tools=needs_tools,
+                    service_routing=service_routing
+                )
         generation_time = (time.time() - generation_start) * 1000  # ms
         
         # Track generation performance (async to avoid blocking)
@@ -1184,6 +1482,13 @@ Stay true to your bubbly, risky e-girl waifu personality! Be playful, and don't 
             question_lower.startswith("what is") and ("about" in question_lower or "in" in question_lower)
         ]) and (doc_id or doc_filename or context)
         
+        # Check if query contains URL (for website/YouTube tools)
+        has_url_in_question = any([
+            "http://" in question or "https://" in question,
+            "www." in question and ("." in question.split("www.")[1][:50] if "www." in question else False),
+            "youtube.com" in question_lower or "youtu.be" in question_lower,
+        ])
+        
         # Build user prompt
         tool_instruction = ""
         if is_tool_request:
@@ -1191,6 +1496,20 @@ Stay true to your bubbly, risky e-girl waifu personality! Be playful, and don't 
             tool_instruction += "You MUST call write_tool immediately. Do NOT describe what you would do - ACTUALLY CALL IT!\n"
             tool_instruction += "Example format: {\"tool\": \"write_tool\", \"arguments\": {\"code\": \"def get_weather(city): ...\", \"function_name\": \"get_weather\", \"description\": \"Fetches weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n"
             tool_instruction += "After calling write_tool, call test_tool to test it, then register_tool to make it available.\n"
+        
+        # URL instruction - tell LLM to use website/YouTube tools
+        url_instruction = ""
+        if has_url_in_question:
+            if "youtube.com" in question_lower or "youtu.be" in question_lower:
+                url_instruction = "\n\n🌐 YOUTUBE URL DETECTED:\n"
+                url_instruction += "The user provided a YouTube URL. You MUST call summarize_youtube tool with the URL to fetch the transcript.\n"
+                url_instruction += "Example: {\"tool\": \"summarize_youtube\", \"arguments\": {\"url\": \"<URL_FROM_QUESTION>\"}}\n"
+                url_instruction += "After fetching, you can summarize or answer questions about the video content.\n"
+            else:
+                url_instruction = "\n\n🌐 WEBSITE URL DETECTED:\n"
+                url_instruction += "The user provided a website URL. You MUST call summarize_website tool with the URL to fetch and extract the content.\n"
+                url_instruction += "Example: {\"tool\": \"summarize_website\", \"arguments\": {\"url\": \"<URL_FROM_QUESTION>\"}}\n"
+                url_instruction += "After fetching, you can summarize or answer questions about the website content.\n"
         
         summarize_instruction = ""
         if is_summarize_request:
@@ -1204,7 +1523,7 @@ Stay true to your bubbly, risky e-girl waifu personality! Be playful, and don't 
         user_prompt = f"""Context:
 {context}{user_context_str}{conv_context_str}
 
-Question: {question}{tool_instruction}{summarize_instruction}
+Question: {question}{tool_instruction}{url_instruction}{summarize_instruction}
 
 Instructions:
 - Question Type: {question_type}
@@ -1333,17 +1652,41 @@ Examples:
         Returns:
             Tuple of (final_answer, tool_calls_used)
         """
+        # Check if we have URL tool results with key points request
+        question_lower_for_system = question.lower()
+        # Expanded detection to catch variations
+        wants_key_points_for_system = any(phrase in question_lower_for_system for phrase in [
+            "key points", "key point", "main points", "main point", 
+            "important points", "important point", "give me key",
+            "give me the key", "can you give me key", "provide key points",
+            "list key points", "what are the key points"
+        ])
+        url_tool_results_present = any("summarize_youtube" in str(msg.get("content", "")) or "summarize_website" in str(msg.get("content", "")) for msg in messages)
+        
         # Add tool schemas to system message
         tool_schemas = self.tool_registry.get_tools_schema()
         
         if tool_schemas and len(messages) > 0:
             # Enhance system message with tool information
             system_msg = messages[0].get("content", "")
+            
+            # Add critical instruction for key points requests with URL tool results
+            if wants_key_points_for_system and url_tool_results_present:
+                system_msg += "\n\n🚨🚨🚨 CRITICAL INSTRUCTION 🚨🚨🚨\n"
+                system_msg += "The user asked for KEY POINTS and you have the content from a URL tool.\n"
+                system_msg += "YOU MUST START YOUR RESPONSE WITH A BULLETED LIST OF KEY POINTS!\n"
+                system_msg += "DO NOT ask questions. DO NOT say there was an error.\n"
+                system_msg += "Just extract key points from the content and format them as bullets (• or -).\n"
+                system_msg += "Example: • Point 1\n• Point 2\n• Point 3\n"
+                system_msg += "BEGIN IMMEDIATELY WITH THE KEY POINTS!\n"
+            
             tools_description = "\n\nAvailable Tools:\n"
             tools_description += "You can call these tools using JSON format: {\"tool\": \"tool_name\", \"arguments\": {...}}\n"
             tools_description += "EXAMPLE: {\"tool\": \"write_tool\", \"arguments\": {\"code\": \"def my_func(): pass\", \"function_name\": \"my_func\", \"description\": \"...\", \"parameters\": {}}}\n"
+            tools_description += "CRITICAL: Use ONLY the exact tool names listed below. DO NOT invent tool names like 'BMAD', 'youtube', 'data', etc.\n"
             tools_description += "IMPORTANT: Use the exact parameter names shown below (e.g., 'query' not 'q', 'user_id' not 'user').\n"
             tools_description += "CRITICAL: When a user asks you to DO something (like create a tool), you MUST call the appropriate tool. Do NOT just describe what you would do - ACTUALLY CALL THE TOOL!\n"
+            tools_description += "VALID TOOL NAMES: " + ", ".join([tool["function"]["name"] for tool in tool_schemas[:15]]) + "\n"
             
             # Check if meta-tools are available (tool creation capabilities)
             meta_tool_names = ["write_tool", "test_tool", "register_tool", "list_all_tools", "list_stored_tools"]
@@ -1365,10 +1708,50 @@ Examples:
                 tools_description += f"CRITICAL: When tools require 'user_id', use '{user_id}' automatically. DO NOT ask the user for their ID - you already have it from the conversation context.\n"
             tools_description += "\n"
             
+            # Highlight URL tools prominently if URL is detected
+            question_lower_for_tools_check = question.lower()
+            has_url_for_tools = any([
+                "http://" in question or "https://" in question,
+                "www." in question and ("." in question.split("www.")[1][:50] if "www." in question else False),
+                "youtube.com" in question_lower_for_tools_check or "youtu.be" in question_lower_for_tools_check,
+            ])
+            
+            if has_url_for_tools:
+                # Extract URL from question for example
+                import re
+                url_match = re.search(r'(https?://[^\s]+|youtube\.com/watch\?v=[^\s]+|youtu\.be/[^\s]+)', question)
+                example_url = url_match.group(0) if url_match else "<URL_FROM_QUESTION>"
+                
+                tools_description += "\n🌐🌐🌐 URL DETECTED IN QUERY 🌐🌐🌐\n"
+                if "youtube.com" in question_lower_for_tools_check or "youtu.be" in question_lower_for_tools_check:
+                    tools_description += "\n🚨🚨🚨 CRITICAL FOR YOUTUBE URLS - YOU MUST CALL THE TOOL NOW 🚨🚨🚨\n"
+                    tools_description += "STOP READING AND CALL THE TOOL IMMEDIATELY!\n\n"
+                    tools_description += "The user provided a YouTube URL. You MUST call summarize_youtube tool RIGHT NOW!\n"
+                    tools_description += "DO NOT write any text explaining what you will do!\n"
+                    tools_description += "DO NOT say 'I can't' or 'I need to watch' - JUST CALL THE TOOL!\n"
+                    tools_description += "Do NOT call any other tool - ONLY call summarize_youtube!\n\n"
+                    tools_description += f"EXACT FORMAT TO USE (COPY THIS EXACTLY):\n{{\"tool\": \"summarize_youtube\", \"arguments\": {{\"url\": \"{example_url}\"}}}}\n\n"
+                    tools_description += "The tool name is EXACTLY: summarize_youtube\n"
+                    tools_description += "DO NOT USE: 'BMAD', 'youtube', 'data', 'fetch', 'get', or any other name!\n"
+                    tools_description += "ONLY USE: summarize_youtube (exactly as written, case-sensitive)\n\n"
+                    tools_description += "🚨 YOUR RESPONSE SHOULD BE ONLY THE TOOL CALL - NO OTHER TEXT! 🚨\n"
+                    tools_description += "🚨🚨🚨\n"
+                else:
+                    tools_description += "CRITICAL: The user provided a website URL. You MUST call summarize_website tool immediately!\n"
+                    tools_description += "Do NOT call any other tool - ONLY call summarize_website!\n"
+                    tools_description += f"EXACT FORMAT TO USE: {{\"tool\": \"summarize_website\", \"arguments\": {{\"url\": \"{example_url}\"}}}}\n"
+                    tools_description += "Do NOT describe what you would do - ACTUALLY CALL THE TOOL NOW!\n"
+                    tools_description += "The tool name is EXACTLY: summarize_website (not 'data', not 'website', not anything else)\n"
+                tools_description += "\n"
+            
             # Show all tools (not limited to 10) so LLM knows about meta-tools
             for schema in tool_schemas:
                 func = schema["function"]
-                tools_description += f"- {func['name']}: {func['description']}\n"
+                # Highlight URL tools if URL detected
+                if has_url_for_tools and func['name'] in ['summarize_website', 'summarize_youtube']:
+                    tools_description += f"⭐ {func['name']}: {func['description']}\n"
+                else:
+                    tools_description += f"- {func['name']}: {func['description']}\n"
                 # Include parameter names for clarity
                 params = func.get("parameters", {}).get("properties", {})
                 param_list = ", ".join([f"{name}" for name in params.keys()])
@@ -1405,6 +1788,59 @@ Examples:
             
             if not tool_calls:
                 # No tool calls detected
+                # Check if URL is present and we should force tool call
+                question_lower = question.lower()
+                has_url = any([
+                    "http://" in question or "https://" in question,
+                    "www." in question and ("." in question.split("www.")[1][:50] if "www." in question else False),
+                    "youtube.com" in question_lower or "youtu.be" in question_lower,
+                ])
+                
+                # If URL detected but no tool called, force tool call
+                # CRITICAL: Always force tool call when URL is detected, regardless of what LLM says
+                if has_url and iteration == 0:
+                    response_lower = response.lower()
+                    is_youtube_url = "youtube.com" in question_lower or "youtu.be" in question_lower
+                    
+                    # Check if tool was already called in response
+                    tool_already_called = "summarize_youtube" in response_lower or "summarize_website" in response_lower
+                    
+                    # If URL detected but tool not called, ALWAYS force tool call
+                    if not tool_already_called:
+                        if is_youtube_url:
+                            logger.warning(f"⚠️ YouTube URL detected but no tool called - forcing summarize_youtube tool call")
+                            current_messages.append({
+                                "role": "assistant",
+                                "content": response
+                            })
+                            # Extract URL from question
+                            import re
+                            url_match = re.search(r'(https?://[^\s]+|youtube\.com/watch\?v=[^\s]+|youtu\.be/[^\s]+)', question)
+                            url = url_match.group(0) if url_match else question
+                            current_messages.append({
+                                "role": "user",
+                                "content": f"🚨🚨🚨 CRITICAL: You MUST call summarize_youtube NOW with the URL! 🚨🚨🚨\n\nDo NOT describe what you would do - ACTUALLY CALL THE TOOL!\n\nUse this EXACT format:\n{{\"tool\": \"summarize_youtube\", \"arguments\": {{\"url\": \"{url}\"}}}}\n\nDO NOT write any text - ONLY call the tool!"
+                            })
+                            iteration += 1
+                            continue
+                        else:
+                            # Regular website URL
+                            logger.warning(f"⚠️ Website URL detected but no tool called - forcing summarize_website tool call")
+                            current_messages.append({
+                                "role": "assistant",
+                                "content": response
+                            })
+                            # Extract URL from question
+                            import re
+                            url_match = re.search(r'(https?://[^\s]+|www\.[^\s]+)', question)
+                            url = url_match.group(0) if url_match else question
+                            current_messages.append({
+                                "role": "user",
+                                "content": f"🚨🚨🚨 CRITICAL: You MUST call summarize_website NOW with the URL! 🚨🚨🚨\n\nDo NOT describe what you would do - ACTUALLY CALL THE TOOL!\n\nUse this EXACT format:\n{{\"tool\": \"summarize_website\", \"arguments\": {{\"url\": \"{url}\"}}}}\n\nDO NOT write any text - ONLY call the tool!"
+                            })
+                            iteration += 1
+                            continue
+                
                 # If this is a tool creation request and we haven't called write_tool yet, force it
                 if (needs_tools or service_routing == "tools") and iteration == 0:
                     # Check if response mentions creating a tool but didn't call write_tool
@@ -1429,8 +1865,48 @@ Examples:
             
             # Execute tool calls
             tool_results = []
+            url_content_fetched = False  # Track if URL content was successfully fetched
+            
             for tool_call in tool_calls:
                 tool_name = tool_call.get("name", "")
+                
+                # CRITICAL: Skip URL tool calls if we already fetched URL content in this iteration
+                # This prevents duplicate tool calls and unnecessary work
+                if url_content_fetched and tool_name in ["summarize_youtube", "summarize_website"]:
+                    logger.info(f"⏭️ Skipping {tool_name} - URL content already fetched in this iteration")
+                    continue
+                
+                # 🤖 AGENTIC TOOL VALIDATION: Validate tool name before execution
+                # Check if tool exists, if not try to find similar tool or redirect
+                if not self.tool_registry.get_tool(tool_name):
+                    # Tool doesn't exist - try to find correct tool
+                    question_lower_for_redirect = question.lower()
+                    has_url_for_redirect = any([
+                        "http://" in question or "https://" in question,
+                        "www." in question and ("." in question.split("www.")[1][:50] if "www." in question else False),
+                        "youtube.com" in question_lower_for_redirect or "youtu.be" in question_lower_for_redirect,
+                    ])
+                    
+                    # Check if this is a URL-related wrong tool name
+                    if has_url_for_redirect:
+                        import re
+                        url_match = re.search(r'(https?://[^\s]+|youtube\.com/watch\?v=[^\s]+|youtu\.be/[^\s]+)', question)
+                        correct_url = url_match.group(0) if url_match else question
+                        
+                        if "youtube.com" in question_lower_for_redirect or "youtu.be" in question_lower_for_redirect:
+                            correct_tool = "summarize_youtube"
+                        else:
+                            correct_tool = "summarize_website"
+                        
+                        logger.warning(f"⚠️ LLM called invalid tool '{tool_name}' for URL - redirecting to '{correct_tool}'")
+                        tool_call["name"] = correct_tool
+                        tool_call["arguments"] = {"url": correct_url}
+                        tool_name = correct_tool  # Update for logging
+                    else:
+                        # Unknown tool - log error and skip
+                        logger.error(f"❌ LLM called unknown tool '{tool_name}' - skipping. Available tools: {', '.join([t.name for t in self.tool_registry.get_all_tools()])}")
+                        tool_results.append(f"ERROR: Tool '{tool_name}' not found. Available tools: {', '.join([t.name for t in self.tool_registry.get_all_tools()][:10])}")
+                        continue
                 
                 # Prevent calling search_documents when tool creation is detected
                 # Redirect to write_tool instead
@@ -1439,6 +1915,20 @@ Examples:
                     # Replace with write_tool call instruction
                     tool_results.append(f"Tool search_documents blocked: You should use write_tool to create the tool instead. Call write_tool with the actual code for the weather tool.")
                     continue
+                
+                # Fix URL placeholders in tool arguments (for URL tools)
+                if tool_name in ["summarize_youtube", "summarize_website"]:
+                    url_arg = tool_call.get("arguments", {}).get("url", "")
+                    if url_arg and ("<URL_FROM_QUESTION>" in url_arg or url_arg == "<URL_FROM_QUESTION>"):
+                        # Extract actual URL from question
+                        import re
+                        url_match = re.search(r'(https?://[^\s]+|youtube\.com/watch\?v=[^\s]+|youtu\.be/[^\s]+)', question)
+                        if url_match:
+                            actual_url = url_match.group(0)
+                            tool_call["arguments"]["url"] = actual_url
+                            logger.info(f"🔧 Replaced URL placeholder with actual URL: {actual_url}")
+                        else:
+                            logger.warning(f"⚠️ Could not extract URL from question to replace placeholder")
                 
                 # Inject context into tool arguments
                 if user_id and "user_id" not in tool_call.get("arguments", {}):
@@ -1451,29 +1941,571 @@ Examples:
                 if channel_id and "channel_id" not in tool_call.get("arguments", {}):
                     tool_call["arguments"]["channel_id"] = channel_id
                 
+                # CRITICAL: Check if wrong tool is being called for YouTube URLs BEFORE execution
+                if tool_name == "summarize_website":
+                    question_lower_check = question.lower()
+                    url_arg = tool_call.get("arguments", {}).get("url", "")
+                    # Check if this is actually a YouTube URL
+                    is_youtube_url = (
+                        "youtube.com" in question_lower_check or 
+                        "youtu.be" in question_lower_check or
+                        "youtube.com" in url_arg.lower() or
+                        "youtu.be" in url_arg.lower()
+                    )
+                    if is_youtube_url:
+                        logger.warning(f"⚠️ LLM called summarize_website for YouTube URL - redirecting to summarize_youtube BEFORE execution")
+                        # Extract URL from question or use the one in arguments
+                        import re
+                        url_match = re.search(r'(https?://[^\s]+|youtube\.com/watch\?v=[^\s]+|youtu\.be/[^\s]+)', question)
+                        correct_url = url_match.group(0) if url_match else url_arg
+                        # Replace with correct tool
+                        tool_call["name"] = "summarize_youtube"
+                        tool_call["arguments"] = {"url": correct_url}
+                        if user_id:
+                            tool_call["arguments"]["user_id"] = user_id
+                        if channel_id:
+                            tool_call["arguments"]["channel_id"] = channel_id
+                        tool_name = "summarize_youtube"  # Update for logging
+                
+                logger.info(f"🔧 Executing tool: {tool_name} with arguments: {tool_call.get('arguments')}")
                 result = self.tool_executor.execute_tool_call(tool_call)
+                
+                # Check if tool was not found - redirect to correct tool for URLs
+                # BUT: Skip if we already successfully fetched URL content (prevent loops)
+                if result.get("error") and "not found" in result.get("error", "").lower() and not url_content_fetched:
+                    error_msg = result.get("error", "")
+                    logger.error(f"❌ Tool {tool_name} not found: {error_msg}")
+                    
+                    # If URL is in question and wrong tool was called, redirect to correct tool
+                    question_lower_for_redirect = question.lower()
+                    has_url_for_redirect = any([
+                        "http://" in question or "https://" in question,
+                        "www." in question and ("." in question.split("www.")[1][:50] if "www." in question else False),
+                        "youtube.com" in question_lower_for_redirect or "youtu.be" in question_lower_for_redirect,
+                    ])
+                    
+                    if has_url_for_redirect:
+                        import re
+                        url_match = re.search(r'(https?://[^\s]+|youtube\.com/watch\?v=[^\s]+|youtu\.be/[^\s]+)', question)
+                        correct_url = url_match.group(0) if url_match else question
+                        
+                        if "youtube.com" in question_lower_for_redirect or "youtu.be" in question_lower_for_redirect:
+                            correct_tool = "summarize_youtube"
+                        else:
+                            correct_tool = "summarize_website"
+                        
+                        logger.warning(f"⚠️ LLM called wrong tool '{tool_name}' for URL - redirecting to '{correct_tool}'")
+                        # Replace with correct tool call
+                        tool_call["name"] = correct_tool
+                        tool_call["arguments"] = {"url": correct_url}
+                        # Retry with correct tool
+                        result = self.tool_executor.execute_tool_call(tool_call)
+                elif result.get("error") and "not found" in result.get("error", "").lower() and url_content_fetched:
+                    # URL content already fetched - skip this wrong tool call
+                    logger.warning(f"⚠️ LLM called wrong tool '{tool_name}' but URL content already fetched - skipping")
+                    continue
+                
+                # Log tool execution result
+                tool_result = result.get("result", result)
+                has_error = result.get("error") or (isinstance(tool_result, dict) and tool_result.get("error"))
+                
+                # Check if this is a URL tool that succeeded - mark it but continue to add result
+                if not has_error and isinstance(tool_result, dict):
+                    if tool_result.get("success") and tool_name in ["summarize_youtube", "summarize_website"]:
+                        url_content_fetched = True
+                        # Mark that we've successfully fetched URL content
+                        logger.info(f"✅ URL tool {tool_name} succeeded - content fetched, will skip further wrong tool calls")
+                
+                if has_error:
+                    error_msg = result.get("error") or (tool_result.get("error") if isinstance(tool_result, dict) else "Unknown error")
+                    logger.error(f"❌ Tool {tool_name} failed: {error_msg}")
+                    # Skip adding failed tool results - only add successful ones
+                    # This prevents the LLM from seeing errors and getting confused
+                    tool_calls_used.append({
+                        "tool": tool_call.get("name"),
+                        "arguments": tool_call.get("arguments"),
+                        "result": result,
+                        "success": False
+                    })
+                    # Don't add to tool_results - skip failed calls
+                    continue
+                else:
+                    if isinstance(tool_result, dict) and tool_result.get("success"):
+                        logger.info(f"✅ Tool {tool_name} succeeded")
+                        if tool_name == "summarize_youtube" and "transcript" in tool_result:
+                            transcript_len = len(tool_result.get("transcript", ""))
+                            logger.info(f"📄 Transcript length: {transcript_len} characters")
+                        elif tool_name == "summarize_website" and "full_text" in tool_result:
+                            text_len = len(tool_result.get("full_text", ""))
+                            logger.info(f"📄 Content length: {text_len} characters")
+                
                 tool_calls_used.append({
                     "tool": tool_call.get("name"),
                     "arguments": tool_call.get("arguments"),
-                    "result": result
+                    "result": result,
+                    "success": True
                 })
                 
-                # Format result for LLM
+                # Format result for LLM (only successful results)
                 formatted_result = self.tool_parser.format_tool_result(
                     tool_call.get("name"),
-                    result.get("result", result)
+                    tool_result
                 )
+                
+                # Log what we're sending to LLM for debugging
+                if tool_name == "summarize_youtube":
+                    if isinstance(tool_result, dict) and "transcript" in tool_result:
+                        transcript_preview = tool_result.get("transcript", "")[:200]
+                        logger.info(f"📄 Sending transcript to LLM (preview: {transcript_preview}...)")
+                    else:
+                        logger.warning(f"⚠️ Tool result doesn't contain transcript: {list(tool_result.keys()) if isinstance(tool_result, dict) else type(tool_result)}")
+                
                 tool_results.append(f"Tool {tool_call.get('name')} result: {formatted_result}")
+                
+                # If URL content was successfully fetched, stop processing more tool calls
+                # We have what we need, no need to call more tools
+                if url_content_fetched:
+                    logger.info(f"✅ URL content fetched successfully - stopping further tool calls")
+                    break
             
-            # Add tool results to conversation
+            # Check if URL tools were called - if so, prioritize tool results over old context
+            url_tools_called = any("summarize_website" in str(result) or "summarize_youtube" in str(result) for result in tool_results)
+            
+            # Always add assistant response to conversation first
             current_messages.append({
                 "role": "assistant",
                 "content": response
             })
+            
+            # Create strong instruction for tool results
+            if url_tools_called:
+                # For URL tools, make it CRITICAL to use tool results
+                # Check if we have transcript/content in the results (including smart summaries)
+                # More robust detection - check for multiple possible strings
+                has_transcript_content = any(
+                    "TRANSCRIPT CONTENT" in result or 
+                    "ARTICLE CONTENT" in result or 
+                    "SMART SUMMARY" in result or
+                    "VIDEO CONTENT IS BELOW" in result or
+                    "transcript" in result.lower() or
+                    ("SUCCESS" in result and ("transcript" in result.lower() or "summary" in result.lower()))
+                    for result in tool_results
+                )
+                
+                if has_transcript_content:
+                    # Check if user asked for key points or summary
+                    question_lower = question.lower()
+                    # Expanded detection to catch variations like "give me key points", "can you give me key points", etc.
+                    wants_key_points = any(phrase in question_lower for phrase in [
+                        "key points", "key point", "main points", "main point", 
+                        "important points", "important point", "give me key",
+                        "give me the key", "can you give me key", "provide key points",
+                        "list key points", "what are the key points"
+                    ])
+                    wants_summary = any(phrase in question_lower for phrase in ["summarize", "summary", "summarise", "overview", "brief"])
+                    
+                    tool_instruction = f"🎯🎯🎯 CRITICAL SUCCESS MESSAGE 🎯🎯🎯\n\n"
+                    tool_instruction += f"THE TOOL SUCCESSFULLY FETCHED THE CONTENT! There was NO ERROR!\n"
+                    tool_instruction += f"The transcript/article content is shown below and contains the actual video/article content.\n\n"
+                    tool_instruction += f"YOU MUST READ AND USE THE TRANSCRIPT/ARTICLE CONTENT BELOW to answer the user's question.\n"
+                    tool_instruction += f"The content is between the === separators and starts with 'VIDEO CONTENT IS BELOW' or 'SMART SUMMARY' or 'TRANSCRIPT CONTENT'.\n"
+                    tool_instruction += f"LOOK FOR THE CONTENT BETWEEN THE === SEPARATORS - IT'S RIGHT THERE!\n\n"
+                    tool_instruction += f"Tool execution results:\n" + "\n".join(tool_results) + "\n\n"
+                    
+                    if wants_key_points:
+                        tool_instruction += f"🎯🎯🎯 YOUR TASK - PROVIDE KEY POINTS NOW 🎯🎯🎯\n\n"
+                        tool_instruction += f"THE USER ASKED FOR KEY POINTS. YOU MUST PROVIDE A BULLETED LIST IMMEDIATELY!\n\n"
+                        tool_instruction += f"🚨🚨🚨 CRITICAL: DO NOT SAY 'I fetched' OR 'After summarizing' OR 'Let me know when you want to proceed' 🚨🚨🚨\n"
+                        tool_instruction += f"🚨🚨🚨 CRITICAL: DO NOT ASK QUESTIONS OR MAKE CONVERSATIONAL STATEMENTS 🚨🚨🚨\n"
+                        tool_instruction += f"🚨🚨🚨 CRITICAL: START YOUR RESPONSE WITH THE FIRST BULLET POINT - NO INTRODUCTIONS! 🚨🚨🚨\n\n"
+                        tool_instruction += f"CRITICAL INSTRUCTIONS:\n"
+                        tool_instruction += f"1. The transcript/article content is shown above (between the === separators)\n"
+                        tool_instruction += f"2. Read that content carefully - it contains ALL the information you need\n"
+                        tool_instruction += f"3. Extract the main key points from that content\n"
+                        tool_instruction += f"4. START YOUR RESPONSE IMMEDIATELY with bulleted key points\n"
+                        tool_instruction += f"5. Use • or - for bullets (example: • Point 1)\n"
+                        tool_instruction += f"6. Do NOT write any introduction - START WITH THE FIRST BULLET POINT\n"
+                        tool_instruction += f"7. Do NOT ask questions - just provide the key points!\n"
+                        tool_instruction += f"8. Do NOT say there was an error - the tool succeeded and content is shown above!\n"
+                        tool_instruction += f"9. Do NOT say 'I fetched' or 'After summarizing' - just provide the key points!\n"
+                        tool_instruction += f"10. Do NOT say 'Let me know when you want to proceed' - the user wants the key points NOW!\n\n"
+                        tool_instruction += f"EXAMPLE FORMAT (START EXACTLY LIKE THIS - NO INTRO TEXT):\n"
+                        tool_instruction += f"• First key point about the main topic\n"
+                        tool_instruction += f"• Second key point about important details\n"
+                        tool_instruction += f"• Third key point about conclusions\n\n"
+                        tool_instruction += f"WRONG FORMAT (DO NOT DO THIS):\n"
+                        tool_instruction += f"I fetched and summarized the content...\n"
+                        tool_instruction += f"After summarizing, we can discuss...\n"
+                        tool_instruction += f"Let me know when you want to proceed...\n\n"
+                    elif wants_summary:
+                        tool_instruction += f"🎯 YOUR TASK - PROVIDE DETAILED, INFORMATIVE SUMMARY:\n"
+                        tool_instruction += f"The user asked for a SUMMARY. You MUST provide a comprehensive, detailed summary!\n"
+                        tool_instruction += f"1. Read the transcript/article content above thoroughly\n"
+                        tool_instruction += f"2. Provide a DETAILED, INFORMATIVE summary covering:\n"
+                        tool_instruction += f"   - Main topics and themes discussed\n"
+                        tool_instruction += f"   - Specific examples, tools, methods, or concepts mentioned\n"
+                        tool_instruction += f"   - Key points and important information\n"
+                        tool_instruction += f"   - Context and explanations\n"
+                        tool_instruction += f"   - Key takeaways or conclusions\n"
+                        tool_instruction += f"3. Be thorough and comprehensive - include important details from the content\n"
+                        tool_instruction += f"4. Use bullet points or structured format for clarity if helpful\n"
+                        tool_instruction += f"5. Make it informative and useful - the user wants to understand the content!\n"
+                        tool_instruction += f"6. Do NOT ask questions - just provide the detailed summary!\n"
+                        tool_instruction += f"7. Do NOT say there was an error - the tool succeeded and content is shown above!\n\n"
+                    else:
+                        tool_instruction += f"🎯 YOUR TASK - PROVIDE DETAILED, INFORMATIVE ANSWER:\n"
+                        tool_instruction += f"1. Read the transcript/article content above thoroughly (it's between the === separators)\n"
+                        tool_instruction += f"2. The content shows 'Status: SUCCESS' - this means the tool worked!\n"
+                        tool_instruction += f"3. Provide a COMPREHENSIVE, DETAILED answer based on that content:\n"
+                        tool_instruction += f"   - Include main topics and themes\n"
+                        tool_instruction += f"   - Mention specific examples, tools, methods mentioned\n"
+                        tool_instruction += f"   - Include key points and important information\n"
+                        tool_instruction += f"   - Provide context and explanations\n"
+                        tool_instruction += f"   - Be thorough and informative\n"
+                        tool_instruction += f"4. Use bullet points or structured format if helpful for clarity\n"
+                        tool_instruction += f"5. Make it comprehensive enough that the user understands the content\n"
+                        tool_instruction += f"6. Do NOT say there was an error - the tool succeeded!\n"
+                        tool_instruction += f"7. Do NOT ask questions - answer directly using the content above!\n\n"
+                    
+                    tool_instruction += f"\n{'='*80}\n"
+                    tool_instruction += f"🚨🚨🚨 FINAL INSTRUCTION - READ THIS CAREFULLY 🚨🚨🚨\n"
+                    tool_instruction += f"{'='*80}\n\n"
+                    tool_instruction += f"Original question: {question}\n\n"
+                    if wants_key_points:
+                        tool_instruction += f"🚨🚨🚨 YOU MUST PROVIDE KEY POINTS NOW - NO EXCEPTIONS! 🚨🚨🚨\n\n"
+                        tool_instruction += f"🚨 FORBIDDEN PHRASES - DO NOT USE THESE: 🚨\n"
+                        tool_instruction += f"- 'I fetched'\n"
+                        tool_instruction += f"- 'After summarizing'\n"
+                        tool_instruction += f"- 'Let me know when you want to proceed'\n"
+                        tool_instruction += f"- 'Would you like me to'\n"
+                        tool_instruction += f"- 'Here are the key points:'\n"
+                        tool_instruction += f"- Any conversational introduction\n\n"
+                        tool_instruction += f"STEP 1: Read the content above (it's between the === separators)\n"
+                        tool_instruction += f"STEP 2: Extract the main key points from that content\n"
+                        tool_instruction += f"STEP 3: START YOUR RESPONSE IMMEDIATELY with bullet points\n"
+                        tool_instruction += f"STEP 4: Use this exact format (DO NOT add any introduction):\n\n"
+                        tool_instruction += f"• [First key point]\n"
+                        tool_instruction += f"• [Second key point]\n"
+                        tool_instruction += f"• [Third key point]\n\n"
+                        tool_instruction += f"CRITICAL: START IMMEDIATELY WITH THE FIRST BULLET POINT!\n"
+                        tool_instruction += f"CRITICAL: The tool succeeded - the content is RIGHT THERE above!\n"
+                        tool_instruction += f"CRITICAL: Your response should START with '•' (bullet point) - nothing before it!\n\n"
+                    elif wants_summary:
+                        tool_instruction += f"YOU MUST PROVIDE A SUMMARY NOW!\n"
+                        tool_instruction += f"- Read the content above (between === separators)\n"
+                        tool_instruction += f"- Provide a comprehensive summary\n"
+                        tool_instruction += f"- DO NOT ask questions - START WITH THE SUMMARY!\n\n"
+                    else:
+                        tool_instruction += f"YOU MUST ANSWER THE QUESTION NOW!\n"
+                        tool_instruction += f"- Read the content above (between === separators)\n"
+                        tool_instruction += f"- Answer using that content\n"
+                        tool_instruction += f"- DO NOT ask questions - START WITH THE ANSWER!\n\n"
+                    tool_instruction += f"BEGIN YOUR RESPONSE IMMEDIATELY WITH THE ANSWER/KEY POINTS/SUMMARY. DO NOT ASK QUESTIONS!"
+                else:
+                    tool_instruction = f"CRITICAL: Tool execution completed. You MUST use ONLY these tool results to answer the question. IGNORE any previous document context - the tool results contain the correct, up-to-date information.\n\n"
+                    tool_instruction += f"Tool execution results:\n" + "\n".join(tool_results) + "\n\n"
+                    tool_instruction += f"IMPORTANT: Base your answer ENTIRELY on the tool results above. Do NOT reference old documents or previous context. The tool results contain the exact content requested.\n\n"
+                    tool_instruction += f"Original question: {question}\n\n"
+                    tool_instruction += f"Now provide a summary or answer based ONLY on the tool results shown above."
+            else:
+                tool_instruction = f"Tool execution results:\n" + "\n".join(tool_results) + "\n\nPlease use these results to answer the original question: " + question
+            
             current_messages.append({
                 "role": "user",
-                "content": f"Tool execution results:\n" + "\n".join(tool_results) + "\n\nPlease use these results to answer the original question: " + question
+                "content": tool_instruction
             })
+            
+            # Update system message if we have key points request with URL tool results
+            if url_tools_called and has_transcript_content and len(current_messages) > 0:
+                question_lower_check = question.lower()
+                # Expanded detection to catch variations
+                wants_key_points_check = any(phrase in question_lower_check for phrase in [
+                    "key points", "key point", "main points", "main point", 
+                    "important points", "important point", "give me key",
+                    "give me the key", "can you give me key", "provide key points",
+                    "list key points", "what are the key points"
+                ])
+                
+                if wants_key_points_check:
+                    # Find and update the system message
+                    for i, msg in enumerate(current_messages):
+                        if msg.get("role") == "system":
+                            current_messages[i] = {
+                                "role": "system",
+                                "content": msg.get("content", "") + "\n\n🚨🚨🚨 FINAL SYSTEM INSTRUCTION 🚨🚨🚨\n\nTHE USER ASKED FOR KEY POINTS. YOU HAVE THE TRANSCRIPT/CONTENT ABOVE.\n\n🚨 FORBIDDEN PHRASES - NEVER USE THESE: 🚨\n- 'I fetched'\n- 'After summarizing'\n- 'Let me know when you want to proceed'\n- 'Would you like me to'\n- 'Here are the key points:'\n- Any conversational introduction\n\nCRITICAL: START YOUR RESPONSE IMMEDIATELY WITH BULLETED KEY POINTS.\nCRITICAL: Your response MUST start with '•' (bullet point) - nothing before it!\nCRITICAL: DO NOT write any introduction - START WITH THE FIRST BULLET POINT!\nCRITICAL: DO NOT ask questions - just provide the bullets immediately.\nCRITICAL: Format example (START EXACTLY LIKE THIS):\n• First key point\n• Second key point\n• Third key point\n\nSTART WITH THE FIRST BULLET POINT NOW - NO EXCEPTIONS!"
+                            }
+                            break
+            
+            # CRITICAL: If URL content was successfully fetched, generate final response and stop iterating
+            # This prevents the LLM from making more tool calls when we already have the content
+            if url_content_fetched:
+                logger.info(f"✅ URL content fetched - generating final response and stopping iterations")
+                
+                # CRITICAL: Replace system message with clean version for final response
+                # Remove ALL tool instructions since the tool has already been called
+                # We want a clean system message that only instructs to summarize the transcript
+                for i, msg in enumerate(current_messages):
+                    if msg.get("role") == "system":
+                        # Get base system message (before tool descriptions were added)
+                        original_system = msg.get("content", "")
+                        # Extract only the base part (before "Available Tools:")
+                        import re
+                        base_system_match = re.search(r'^(.*?)(?:Available Tools:|🌐🌐🌐)', original_system, re.DOTALL)
+                        if base_system_match:
+                            base_system = base_system_match.group(1).strip()
+                        else:
+                            # If no tool section found, use original but remove tool-related content
+                            base_system = re.sub(r'Available Tools:.*', '', original_system, flags=re.DOTALL)
+                            base_system = re.sub(r'🌐🌐🌐.*', '', base_system, flags=re.DOTALL)
+                            base_system = base_system.strip()
+                        
+                        # Build clean system message focused on summarizing transcript
+                        clean_system_content = base_system
+                        clean_system_content += "\n\n" + "="*80 + "\n"
+                        clean_system_content += "🚨🚨🚨 CRITICAL: URL TOOL SUCCEEDED - SUMMARIZE THE TRANSCRIPT 🚨🚨🚨\n"
+                        clean_system_content += "="*80 + "\n\n"
+                        clean_system_content += "THE YOUTUBE/WEBSITE TOOL ALREADY SUCCEEDED AND FETCHED THE CONTENT!\n"
+                        clean_system_content += "THE TRANSCRIPT/ARTICLE CONTENT IS IN THE MESSAGES ABOVE!\n"
+                        clean_system_content += "YOUR TASK: READ THE TRANSCRIPT AND PROVIDE A DETAILED SUMMARY!\n\n"
+                        clean_system_content += "🚨🚨🚨 CRITICAL RULES: 🚨🚨🚨\n\n"
+                        clean_system_content += "1. READ the transcript/article content from the tool results above\n"
+                        clean_system_content += "2. PROVIDE a comprehensive, detailed summary based on that content\n"
+                        clean_system_content += "3. Write NORMAL TEXT - NOT JSON, NOT tool calls, NOT instructions\n"
+                        clean_system_content += "4. DO NOT include tool call syntax like {\"tool\": ...}\n"
+                        clean_system_content += "5. DO NOT copy tool instructions or examples\n"
+                        clean_system_content += "6. DO NOT say 'I can't access' - the content is RIGHT THERE!\n"
+                        clean_system_content += "7. Just write a regular summary paragraph or bullet points\n\n"
+                        clean_system_content += "🚨 FORBIDDEN IN RESPONSE:\n"
+                        clean_system_content += "- Tool call syntax: {\"tool\": \"summarize_youtube\"}\n"
+                        clean_system_content += "- Tool instructions or examples\n"
+                        clean_system_content += "- 'I can't access YouTube videos'\n"
+                        clean_system_content += "- Placeholder text like '[Summarize here]'\n"
+                        clean_system_content += "- Meta-commentary about fetching or calling tools\n\n"
+                        clean_system_content += "✅ CORRECT: Write a normal text summary of the video/article content!\n"
+                        clean_system_content += "✅ Include main topics, key points, examples, and important information!\n"
+                        clean_system_content += "✅ Be detailed and informative!\n"
+                        clean_system_content += "✅ START DIRECTLY WITH THE SUMMARY - NO GREETINGS, NO 'Hey there', NO 'I've read through'!\n"
+                        clean_system_content += "✅ Your first sentence should be the first key point or topic, NOT a conversational intro!\n\n"
+                        clean_system_content += "The user asked: " + question + "\n"
+                        clean_system_content += "Now provide a detailed summary based on the transcript/article content above. START WITH THE SUMMARY CONTENT, NOT A GREETING!\n"
+                        clean_system_content += "="*80 + "\n"
+                        
+                        current_messages[i] = {
+                            "role": "system",
+                            "content": clean_system_content
+                        }
+                        break
+                
+                # CRITICAL: Clean up ALL messages to remove tool call instructions
+                # The LLM might copy these if they're still in the conversation
+                import re
+                cleaned_messages = []
+                for msg in current_messages:
+                    role = msg.get("role", "")
+                    content = msg.get("content", "")
+                    
+                    # Skip system messages (already cleaned above)
+                    if role == "system":
+                        cleaned_messages.append(msg)
+                        continue
+                    
+                    # For user and assistant messages, check for tool instructions
+                    has_tool_instructions = (
+                        "summarize_youtube tool" in content.lower() or 
+                        "summarize_website tool" in content.lower() or
+                        '{"tool":' in content or
+                        "JUST CALL THE TOOL" in content.upper() or
+                        "YOUR RESPONSE SHOULD BE ONLY THE TOOL CALL" in content.upper() or
+                        "Available Tools:" in content or
+                        "get_user_state:" in content or
+                        "Parameters:" in content
+                    )
+                    
+                    # Check if this message contains actual transcript content
+                    # Look for various patterns that indicate transcript/summary content
+                    has_transcript = (
+                        "TRANSCRIPT CONTENT" in content or 
+                        "VIDEO CONTENT IS BELOW" in content or 
+                        "SMART SUMMARY" in content or 
+                        "Tool summarize_youtube result" in content or
+                        "Tool summarize_website result" in content or
+                        "Section 1:" in content or  # Chunk summaries
+                        "Section 2:" in content or
+                        "Section 3:" in content or
+                        "Section 4:" in content or
+                        "Section 5:" in content or
+                        re.search(r'Section \d+:', content) or  # Any section number
+                        "BMAD" in content or  # Content from video (like in the logs)
+                        "Kilo code" in content or
+                        "transcript discusses" in content.lower() or
+                        "speaker" in content.lower() and len(content) > 200  # Likely summary content
+                    )
+                    
+                    if has_tool_instructions and not has_transcript:
+                        # This message is only tool instructions - skip it completely
+                        logger.info(f"🧹 Skipping {role} message with only tool instructions (length: {len(content)})")
+                        # Log a snippet to help debug
+                        snippet = content[:200].replace('\n', ' ')
+                        logger.debug(f"   Snippet: {snippet}...")
+                        continue
+                    elif has_tool_instructions and has_transcript:
+                        # Remove tool instructions but keep transcript content
+                        # Remove tool call format examples and tool descriptions
+                        content = re.sub(r'summarize_youtube tool.*?NO OTHER TEXT', '', content, flags=re.DOTALL | re.IGNORECASE)
+                        content = re.sub(r'JUST CALL THE TOOL.*?NO OTHER TEXT', '', content, flags=re.DOTALL | re.IGNORECASE)
+                        content = re.sub(r'DO NOT write.*?JUST CALL', '', content, flags=re.DOTALL | re.IGNORECASE)
+                        content = re.sub(r'Example.*?summarize_[^"]+.*?(?=\n|$)', '', content, flags=re.DOTALL | re.IGNORECASE)
+                        content = re.sub(r'\{"tool":\s*"summarize_[^"]+".*?\}', '', content, flags=re.DOTALL)
+                        content = re.sub(r'EXACT FORMAT.*?}}', '', content, flags=re.DOTALL)
+                        content = re.sub(r'YOUR RESPONSE SHOULD BE ONLY.*?TEXT', '', content, flags=re.DOTALL | re.IGNORECASE)
+                        # Remove tool descriptions
+                        content = re.sub(r'Available Tools:.*?(?=TRANSCRIPT|VIDEO|SMART|Section|$)', '', content, flags=re.DOTALL | re.IGNORECASE)
+                        content = re.sub(r'get_user_state:.*?(?=\n\n|\n[A-Z]|$)', '', content, flags=re.DOTALL | re.IGNORECASE | re.MULTILINE)
+                        content = re.sub(r'transfer_state:.*?(?=\n\n|\n[A-Z]|$)', '', content, flags=re.DOTALL | re.IGNORECASE | re.MULTILINE)
+                        content = re.sub(r'summarize_youtube:.*?(?=\n\n|\n[A-Z]|$)', '', content, flags=re.DOTALL | re.IGNORECASE | re.MULTILINE)
+                        content = re.sub(r'summarize_website:.*?(?=\n\n|\n[A-Z]|$)', '', content, flags=re.DOTALL | re.IGNORECASE | re.MULTILINE)
+                        content = re.sub(r'Parameters:.*?(?=\n\n|\n[A-Z]|$)', '', content, flags=re.MULTILINE | re.IGNORECASE)
+                        # Keep the cleaned message
+                        cleaned_messages.append({
+                            "role": role,
+                            "content": content.strip()
+                        })
+                    else:
+                        # Keep message as-is
+                        cleaned_messages.append(msg)
+                
+                current_messages = cleaned_messages
+                logger.info(f"🧹 Cleaned messages: {len(cleaned_messages)} messages after removing tool instructions")
+                # Log message roles for debugging
+                roles = [msg.get("role", "unknown") for msg in cleaned_messages]
+                logger.debug(f"   Message roles: {roles}")
+                
+                # CRITICAL: Verify transcript content is in messages before generating response
+                # Check if tool results contain transcript content
+                has_transcript_in_messages = any(
+                    "TRANSCRIPT CONTENT" in str(msg.get("content", "")) or 
+                    "VIDEO CONTENT IS BELOW" in str(msg.get("content", "")) or
+                    "SMART SUMMARY" in str(msg.get("content", "")) or
+                    "Tool summarize_youtube result" in str(msg.get("content", "")) or
+                    "Tool summarize_website result" in str(msg.get("content", ""))
+                    for msg in current_messages
+                )
+                
+                if not has_transcript_in_messages:
+                    logger.error(f"⚠️⚠️⚠️ WARNING: Transcript content not found in messages before generating final response!")
+                    # Try to add tool results explicitly
+                    if tool_results:
+                        current_messages.append({
+                            "role": "user",
+                            "content": f"Tool execution results:\n" + "\n".join(tool_results)
+                        })
+                
+                # CRITICAL: Add a final explicit instruction right before generating response
+                # This ensures the LLM sees the instruction immediately before responding
+                final_instruction = f"\n\n{'='*80}\n"
+                final_instruction += f"🚨🚨🚨 CRITICAL FINAL INSTRUCTION - READ THE TRANSCRIPT AND SUMMARIZE IT 🚨🚨🚨\n"
+                final_instruction += f"{'='*80}\n\n"
+                final_instruction += f"THE YOUTUBE/WEBSITE TOOL ALREADY SUCCEEDED AND FETCHED THE CONTENT!\n"
+                final_instruction += f"THE TRANSCRIPT/ARTICLE CONTENT IS IN THE MESSAGES ABOVE - SCROLL UP TO READ IT!\n"
+                final_instruction += f"LOOK FOR THE SECTION THAT SAYS 'VIDEO CONTENT IS BELOW' OR 'TRANSCRIPT CONTENT' OR 'SMART SUMMARY'!\n\n"
+                final_instruction += f"🚨🚨🚨 DO NOT INCLUDE TOOL CALL SYNTAX IN YOUR RESPONSE! 🚨🚨🚨\n"
+                final_instruction += f"DO NOT write: {{\"tool\": \"summarize_youtube\"}} or any tool call format!\n"
+                final_instruction += f"DO NOT copy the tool instructions - JUST READ THE TRANSCRIPT AND SUMMARIZE IT!\n"
+                final_instruction += f"YOUR RESPONSE SHOULD BE A NORMAL SUMMARY OF THE VIDEO CONTENT, NOT TOOL CALL SYNTAX!\n\n"
+                final_instruction += f"THE USER ASKED: {question}\n\n"
+                final_instruction += f"🚨🚨🚨 CRITICAL RULES - FOLLOW THESE EXACTLY: 🚨🚨🚨\n\n"
+                final_instruction += f"1. READ THE TRANSCRIPT/ARTICLE CONTENT FROM THE TOOL RESULTS ABOVE\n"
+                final_instruction += f"2. DO NOT make up content - ONLY use what's in the transcript/article\n"
+                final_instruction += f"3. DO NOT say 'I didn't watch' or 'I can't access' - the content is RIGHT THERE above!\n"
+                final_instruction += f"4. DO NOT write placeholder text like '[Summarize the content here]' - ACTUALLY READ AND SUMMARIZE THE CONTENT!\n"
+                final_instruction += f"5. DO NOT write meta-commentary about summarizing - JUST SUMMARIZE THE ACTUAL CONTENT!\n"
+                final_instruction += f"6. PROVIDE A SUMMARY BASED ON THE ACTUAL TRANSCRIPT/ARTICLE CONTENT\n"
+                final_instruction += f"7. If you can't find the transcript, look for 'Tool summarize_youtube result' or 'Tool summarize_website result'\n\n"
+                final_instruction += f"🚨 FORBIDDEN - DO NOT WRITE:\n"
+                final_instruction += f"- '[Summarize the content from the fetched YouTube transcript here]'\n"
+                final_instruction += f"- 'Let me fetch the transcript...'\n"
+                final_instruction += f"- 'After fetching the transcript...'\n"
+                final_instruction += f"- {{\"tool\": \"summarize_youtube\"}} or any tool call syntax\n"
+                final_instruction += f"- Tool call instructions or examples\n"
+                final_instruction += f"- Any placeholder text or meta-commentary\n"
+                final_instruction += f"- Just READ the transcript above and SUMMARIZE IT AS NORMAL TEXT!\n\n"
+                final_instruction += f"🚨 FORBIDDEN PHRASES - NEVER USE THESE: 🚨\n"
+                final_instruction += f"- 'I can't access YouTube videos'\n"
+                final_instruction += f"- 'I cannot access YouTube videos'\n"
+                final_instruction += f"- 'I didn't get a chance to watch'\n"
+                final_instruction += f"- 'I didn't watch the whole thing'\n"
+                final_instruction += f"- 'I'm sorry, but I can't directly access'\n"
+                final_instruction += f"- 'from what I can tell' (if you're guessing)\n"
+                final_instruction += f"- Any variation saying you cannot access or didn't see the content\n\n"
+                final_instruction += f"✅ CORRECT APPROACH - PROVIDE DETAILED, INFORMATIVE SUMMARY:\n"
+                final_instruction += f"1. Find the transcript/article content in the messages above\n"
+                final_instruction += f"2. Read it carefully and thoroughly\n"
+                final_instruction += f"3. Provide a COMPREHENSIVE, DETAILED summary based on that content\n"
+                final_instruction += f"4. Be specific and accurate - use actual details, examples, and key points from the transcript\n"
+                final_instruction += f"5. Include main topics, important concepts, specific examples, and key takeaways\n"
+                final_instruction += f"6. Make it informative and useful - the user wants to understand the content!\n"
+                final_instruction += f"7. Use bullet points or structured format if helpful for clarity\n"
+                final_instruction += f"8. Be thorough - don't skip important details that are in the transcript\n\n"
+                final_instruction += f"🎯 SUMMARY QUALITY REQUIREMENTS:\n"
+                final_instruction += f"- Include main topics and themes discussed\n"
+                final_instruction += f"- Mention specific examples, tools, or methods mentioned\n"
+                final_instruction += f"- Include key points and important information\n"
+                final_instruction += f"- Provide context and explanations where relevant\n"
+                final_instruction += f"- Make it comprehensive enough that the user understands the content\n\n"
+                final_instruction += f"🎯 YOUR RESPONSE FORMAT:\n"
+                final_instruction += f"- Write a NORMAL TEXT SUMMARY (like a paragraph or bullet points)\n"
+                final_instruction += f"- DO NOT use JSON format\n"
+                final_instruction += f"- DO NOT use tool call syntax like {{\"tool\": ...}}\n"
+                final_instruction += f"- DO NOT copy tool instructions\n"
+                final_instruction += f"- Just write a regular summary of the video/article content\n"
+                final_instruction += f"- START DIRECTLY WITH THE SUMMARY - NO INTRODUCTIONS, NO 'Hey there', NO 'I've read through', NO CONVERSATIONAL INTRO!\n"
+                final_instruction += f"- DO NOT say 'Hey there!' or 'I've read through' or any greeting - START WITH THE ACTUAL SUMMARY CONTENT!\n"
+                final_instruction += f"- Your first sentence should be the first key point or topic from the content, NOT a greeting!\n\n"
+                final_instruction += f"NOW READ THE TRANSCRIPT/ARTICLE ABOVE AND PROVIDE A DETAILED, INFORMATIVE ANSWER TO: {question}\n"
+                final_instruction += f"{'='*80}\n"
+                
+                current_messages.append({
+                    "role": "user",
+                    "content": final_instruction
+                })
+                
+                # Generate final response with tool results
+                # For YouTube/URL summaries, use higher max_tokens for more detailed responses
+                # The good response used 240 tokens, so we want at least that much
+                summary_max_tokens = max(max_tokens, 500) if url_content_fetched else max_tokens
+                
+                final_response = self.lmstudio_client.generate_response(
+                    messages=current_messages,
+                    temperature=temperature,
+                    max_tokens=summary_max_tokens
+                )
+                logger.info(f"✅ Generated final response after URL content fetch (length: {len(final_response)})")
+                
+                # Log a warning if the response contains forbidden phrases or placeholder text
+                response_lower = final_response.lower()
+                forbidden_phrases = [
+                    "can't access", "cannot access", "don't have access", 
+                    "i'm sorry, but i can't", "i cannot directly access",
+                    "i can't just summarize", "without actually watching"
+                ]
+                placeholder_indicators = [
+                    "[summarize", "[start summarizing", "[introduce", "[key point",
+                    "let me fetch", "after fetching", "wait a moment", "got it! the transcript",
+                    '{"tool":', '"tool":', "summarize_youtube tool", "summarize_website tool"
+                ]
+                
+                has_forbidden = any(phrase in response_lower for phrase in forbidden_phrases)
+                has_placeholder = any(indicator in response_lower for indicator in placeholder_indicators)
+                
+                if has_forbidden:
+                    logger.error(f"⚠️⚠️⚠️ WARNING: Final response contains forbidden phrases! Response: {final_response[:200]}")
+                if has_placeholder:
+                    logger.error(f"⚠️⚠️⚠️ WARNING: Final response contains placeholder text! Response: {final_response[:300]}")
+                    # If response is mostly placeholder text, it's not useful - log full response for debugging
+                    if len(final_response) > 200 and any(x in response_lower for x in ["[", "placeholder", "template"]):
+                        logger.error(f"⚠️⚠️⚠️ Response appears to be placeholder text. Full response length: {len(final_response)}")
+                
+                return final_response, tool_calls_used
             
             iteration += 1
         
