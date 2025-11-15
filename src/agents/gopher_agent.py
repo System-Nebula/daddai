@@ -164,27 +164,24 @@ class GopherAgent:
             if context.get("is_mentioned"):
                 context_str += "\nBot was mentioned in message."
         
-        # Fast LLM classification prompt (optimized for speed - shorter prompt)
+        # OPTIMIZED: Fast LLM classification prompt (shorter for speed)
         # Truncate message if too long to reduce token usage
-        message_truncated = message[:500] if len(message) > 500 else message
-        prompt = f"""Classify Discord message intent. JSON only.
+        message_truncated = message[:300] if len(message) > 300 else message  # Reduced from 500
+        
+        # Shorter context
+        short_context_str = ""
+        if context:
+            if context.get("has_attachments"):
+                short_context_str += "\nHas attachments."
+            if context.get("is_mentioned"):
+                short_context_str += "\nMentioned."
+        
+        # More concise prompt
+        prompt = f"""Classify intent. JSON only.
 
-Message: "{message_truncated}"{context_str}
+"{message_truncated}"{short_context_str}
 
-JSON:
-{{
-    "intent": "question|command|casual|action|upload|ignore",
-    "should_respond": true|false,
-    "confidence": 0.0-1.0,
-    "routing": "rag|chat|tools|memory|action",
-    "needs_rag": true|false,
-    "needs_tools": true|false,
-    "needs_memory": true|false,
-    "is_casual": true|false,
-    "document_references": []
-}}
-
-Rules: question=needs answer, casual=greetings/small talk, action=give/transfer, upload=file, ignore=don't respond. Set needs_rag=true for document queries, needs_tools=true for tool calls, is_casual=true for greetings."""
+{{"intent":"question|command|casual|action|upload|ignore","should_respond":true|false,"confidence":0.0-1.0,"routing":"rag|chat|tools|memory|action","needs_rag":true|false,"needs_tools":true|false,"needs_memory":true|false,"is_casual":true|false}}"""
         
         # Create future for deduplication if cache enabled
         from concurrent.futures import Future
@@ -194,16 +191,16 @@ Rules: question=needs answer, casual=greetings/small talk, action=give/transfer,
             self.pending_requests[cache_key] = future
         
         try:
-            # Fast LLM call (low temperature for consistency, reduced tokens for speed)
+            # OPTIMIZED: Fast LLM call (low temperature for consistency, reduced tokens for speed)
             # Use shorter timeout for faster responses
             try:
                 response = self.llm_client.generate_response(
                     messages=[
-                        {"role": "system", "content": "You are a fast message intent classifier. Respond with ONLY valid JSON."},
+                        {"role": "system", "content": "Fast intent classifier. JSON only."},
                         {"role": "user", "content": prompt}
                     ],
                     temperature=0.1,  # Low temperature for consistent classification
-                    max_tokens=150  # Reduced from 200 for faster generation
+                    max_tokens=120  # OPTIMIZED: Reduced from 150 for faster generation
                 )
             except Exception as e:
                 logger.warning(f"LLM call failed in GopherAgent: {e}, using fallback")
@@ -289,6 +286,21 @@ Rules: question=needs answer, casual=greetings/small talk, action=give/transfer,
             re.search(r'\b[a-zA-Z0-9-]+\.[a-zA-Z]{2,}\b', message) is not None  # Domain pattern
         ])
         
+        # Check for image generation requests (always need tools)
+        image_generation_keywords = [
+            "generate an image", "generate image", "generate a image",
+            "create an image", "create image", "create a image",
+            "make an image", "make image", "make a image",
+            "draw an image", "draw image", "draw a image",
+            "generate a picture", "generate picture", "generate an picture",
+            "create a picture", "create picture", "create an picture",
+            "make a picture", "make picture", "make an picture",
+            "draw a picture", "draw picture", "draw an picture",
+            "generate artwork", "create artwork", "make artwork",
+            "generate art", "create art", "make art"
+        ]
+        has_image_generation = any(keyword in message_lower for keyword in image_generation_keywords)
+        
         # Enhanced context analysis
         has_recent_context = context and context.get("recent_messages") and len(context.get("recent_messages", [])) > 0
         is_follow_up = has_recent_context and any(
@@ -306,6 +318,14 @@ Rules: question=needs answer, casual=greetings/small talk, action=give/transfer,
         elif intent == "action" or routing == "action":
             handler = "action"
             reasoning_parts.append("action intent detected")
+        # CRITICAL: Image generation requests always need tools (override casual/chat routing)
+        elif has_image_generation:
+            handler = "tools"
+            intent_result["needs_tools"] = True
+            intent_result["needs_rag"] = False  # Image generation doesn't need RAG
+            intent_result["is_casual"] = False  # Image generation is not casual
+            reasoning_parts.append("image generation detected - requires tool execution")
+            logger.info(f"🎨 Image generation detected in message - forcing tools handler")
         # CRITICAL: URLs always need tools (override casual/chat routing)
         elif has_url:
             handler = "tools"
@@ -547,6 +567,32 @@ Rules: question=needs answer, casual=greetings/small talk, action=give/transfer,
                 "document_references": []
             }
         
+        # Check for image generation requests (always need tools)
+        image_generation_keywords = [
+            "generate an image", "generate image", "generate a image",
+            "create an image", "create image", "create a image",
+            "make an image", "make image", "make a image",
+            "draw an image", "draw image", "draw a image",
+            "generate a picture", "generate picture", "generate an picture",
+            "create a picture", "create picture", "create an picture",
+            "make a picture", "make picture", "make an picture",
+            "draw a picture", "draw picture", "draw an picture",
+            "generate artwork", "create artwork", "make artwork",
+            "generate art", "create art", "make art"
+        ]
+        if any(keyword in message_lower for keyword in image_generation_keywords):
+            return {
+                "intent": "command",
+                "should_respond": True,
+                "confidence": 0.95,
+                "routing": "tools",
+                "needs_rag": False,
+                "needs_tools": True,
+                "needs_memory": False,
+                "is_casual": False,
+                "document_references": []
+            }
+        
         # Check for file uploads
         if context and context.get("has_attachments"):
             return {
@@ -622,10 +668,10 @@ Rules: question=needs answer, casual=greetings/small talk, action=give/transfer,
 _gopher_agent_instance: Optional[GopherAgent] = None
 
 
-def get_gopher_agent() -> GopherAgent:
+def get_gopher_agent(llm_client: Optional[LMStudioClient] = None, embedding_generator: Optional[EmbeddingGenerator] = None) -> GopherAgent:
     """Get or create GopherAgent singleton instance."""
     global _gopher_agent_instance
     if _gopher_agent_instance is None:
-        _gopher_agent_instance = GopherAgent()
+        _gopher_agent_instance = GopherAgent(llm_client=llm_client, embedding_generator=embedding_generator)
     return _gopher_agent_instance
 

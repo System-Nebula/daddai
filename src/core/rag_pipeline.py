@@ -590,15 +590,17 @@ Document Content:
 
 User's Question: {safe_question}{entity_context}
 
-Instructions:
+CRITICAL INSTRUCTIONS:
+- READ THROUGH ALL THE DOCUMENT CONTENT CAREFULLY - don't skip any sections!
 - Question Type: {question_type} (expecting {answer_type} answer)
 - Extract relevant information that directly answers the question
+- If asking for specific mentions (books, names, quotes, concepts), search through ALL content for those mentions
 - If asking for specific data (numbers, names, dates), provide exact values from the document
 - If asking for analysis, provide insights based on patterns in the document
 - If asking for comparisons, identify and present relevant comparisons
 - Be specific and cite document sections when possible
-- If the document doesn't contain enough information, clearly state what IS available
-- START WITH THE ANSWER, NOT A GREETING - Your first sentence should be the answer or first fact!
+- If you find the information in the document, provide it directly - don't say "I'm not sure" if it's there!
+- START WITH THE ANSWER, NOT A GREETING - Your first sentence should be the answer or first fact found!
 
 Answer based on the document (START WITH THE ANSWER, NOT A GREETING):"""
         
@@ -625,6 +627,13 @@ Your first sentence should be the answer or first fact, NOT a greeting!"""
 
 Question: {safe_question}{entity_context}
 
+CRITICAL INSTRUCTIONS:
+- READ THROUGH ALL THE CONTEXT CHUNKS CAREFULLY - don't skip any!
+- If the question asks about specific mentions (books, names, concepts), search through ALL chunks for those mentions
+- Extract specific information like book titles, author names, quotes, or other entities mentioned
+- If you find the information, provide it directly - don't say "I'm not sure" if the information is in the context
+- START WITH THE ANSWER, NOT A GREETING - Your first sentence should be the answer or first fact found!
+
 Provide a factual, direct answer based on the context. START WITH THE ANSWER, NOT A GREETING:"""
             
             elif question_type == 'analytical':
@@ -637,6 +646,13 @@ Your first sentence should be the answer or first insight, NOT a greeting!"""
 {context}{doc_list_text}{anti_hallucination_note}
 
 Question: {safe_question}{entity_context}
+
+CRITICAL INSTRUCTIONS:
+- READ THROUGH ALL THE CONTEXT CHUNKS CAREFULLY - don't skip any!
+- If the question asks about specific mentions (books, names, concepts), search through ALL chunks for those mentions
+- Extract specific information like book titles, author names, quotes, or other entities mentioned
+- If you find the information, provide it directly - don't say "I'm not sure" if the information is in the context
+- START WITH THE ANSWER, NOT A GREETING - Your first sentence should be the answer or first insight found!
 
 Analyze the context and provide a thoughtful answer with reasoning. START WITH THE ANSWER, NOT A GREETING:"""
             

@@ -70,21 +70,21 @@ class EnhancedRAGPipeline(RAGPipeline):
         # Initialize base pipeline
         super().__init__()
         
-        # Initialize enhanced components
-        self.intelligent_memory = IntelligentMemory()
+        # Initialize enhanced components (share clients and stores to avoid duplicate initialization)
+        self.intelligent_memory = IntelligentMemory(memory_store=self.memory_store)
         self.user_relations = UserRelations()
-        self.query_understanding = EnhancedQueryUnderstanding()
-        self.enhanced_search = EnhancedDocumentSearch()
+        self.query_understanding = EnhancedQueryUnderstanding(lmstudio_client=self.lmstudio_client)
+        self.enhanced_search = EnhancedDocumentSearch(document_store=self.document_store, neo4j_store=self.neo4j_store)
         self.knowledge_graph = KnowledgeGraph()
         self.state_manager = UserStateManager()
         self.action_parser = ActionParser()
-        self.document_selector = SmartDocumentSelector()
-        self.item_tracker = LLMItemTracker()  # LLM-based item tracking
+        self.document_selector = SmartDocumentSelector(document_store=self.document_store, embedding_generator=self.embedding_generator)
+        self.item_tracker = LLMItemTracker(llm_client=self.lmstudio_client)  # LLM-based item tracking
         
         # State-of-the-art retrieval components (lazy load for faster startup)
         self.cross_encoder_reranker = CrossEncoderReranker(lazy_load=True)  # Cross-encoder reranking (lazy load)
         self.fallback_reranker = FallbackReranker()  # Fallback if cross-encoder unavailable
-        self.multi_query = MultiQueryRetrieval()  # Multi-query retrieval
+        self.multi_query = MultiQueryRetrieval(llm_client=self.lmstudio_client)  # Multi-query retrieval
         
         # Evaluation and monitoring (lazy load for faster startup)
         self.evaluator = RAGEvaluator(lazy_load=True)  # Evaluation framework (lazy load)
@@ -92,8 +92,8 @@ class EnhancedRAGPipeline(RAGPipeline):
         self.ab_testing = ABTesting()  # A/B testing framework
         self.performance_optimizer = PerformanceOptimizer()  # Performance optimizations
         
-        # Initialize GopherAgent as central orchestrator (lazy singleton)
-        self.gopher_agent = get_gopher_agent()
+        # Initialize GopherAgent as central orchestrator (lazy singleton, share clients to avoid duplicate initialization)
+        self.gopher_agent = get_gopher_agent(llm_client=self.lmstudio_client, embedding_generator=self.embedding_generator)
         logger.info("🤖 GopherAgent initialized as central orchestrator")
         
         # Initialize LLM tools (lazy - only when needed)
@@ -116,9 +116,15 @@ class EnhancedRAGPipeline(RAGPipeline):
             self._enhanced_embedding_cache = TTLCache(maxsize=CACHE_MAX_SIZE * 2, ttl=CACHE_TTL_SECONDS)
             # Cache for query analysis results
             self._query_analysis_cache = TTLCache(maxsize=CACHE_MAX_SIZE, ttl=CACHE_TTL_SECONDS // 2)
+            # OPTIMIZED: Cache full query results (for identical queries)
+            self._query_result_cache = TTLCache(maxsize=CACHE_MAX_SIZE // 4, ttl=CACHE_TTL_SECONDS // 3)
+            # OPTIMIZED: Cache document selection results
+            self._document_selection_cache = TTLCache(maxsize=CACHE_MAX_SIZE // 2, ttl=CACHE_TTL_SECONDS // 2)
         else:
             self._enhanced_embedding_cache = {}
             self._query_analysis_cache = {}
+            self._query_result_cache = {}
+            self._document_selection_cache = {}
         
         logger.info("Enhanced RAG Pipeline initialized with optimized lazy loading")
     
@@ -183,6 +189,19 @@ class EnhancedRAGPipeline(RAGPipeline):
             self._enhanced_embedding_cache[query_normalized] = embedding
         
         return embedding
+    
+    def _get_query_cache_key(self, question: str, channel_id: Optional[str], 
+                            doc_id: Optional[str], doc_filename: Optional[str]) -> str:
+        """Generate cache key for query results."""
+        import hashlib
+        cache_data = {
+            "question": question.strip().lower()[:300],  # Normalize and truncate
+            "channel_id": channel_id or "global",
+            "doc_id": doc_id or "",
+            "doc_filename": doc_filename or ""
+        }
+        cache_str = str(sorted(cache_data.items()))
+        return hashlib.md5(cache_str.encode()).hexdigest()
     
     def query(self,
               question: str,
@@ -409,7 +428,22 @@ class EnhancedRAGPipeline(RAGPipeline):
             service_routing_from_llm == "tools"
         ])
         
-        if not is_query_pattern and not has_document and not has_url and not should_skip_action_parsing and not is_tool_creation_request:
+        # CRITICAL: Check for image generation requests - skip action parsing for these
+        image_generation_keywords = [
+            "generate an image", "generate image", "generate a image",
+            "create an image", "create image", "create a image",
+            "make an image", "make image", "make a image",
+            "draw an image", "draw image", "draw a image",
+            "generate a picture", "generate picture", "generate an picture",
+            "create a picture", "create picture", "create an picture",
+            "make a picture", "make picture", "make an picture",
+            "draw a picture", "draw picture", "draw an picture",
+            "generate artwork", "create artwork", "make artwork",
+            "generate art", "create art", "make art"
+        ]
+        has_image_generation_request = any(keyword in question_lower_for_tools for keyword in image_generation_keywords)
+        
+        if not is_query_pattern and not has_document and not has_url and not should_skip_action_parsing and not is_tool_creation_request and not has_image_generation_request:
             logger.info(f"🔍 Attempting LLM action parsing: {question[:100]}")
             try:
                 parsed_action = self.item_tracker.parse_item_action(question, user_id or "", channel_id or "")
@@ -426,6 +460,8 @@ class EnhancedRAGPipeline(RAGPipeline):
                 logger.info(f"🔍 Skipping action parsing - LLM determined this is casual conversation (is_casual={is_casual_from_llm}, service_routing={service_routing_from_llm})")
             elif is_tool_creation_request:
                 logger.info(f"🔍 Skipping action parsing - tool creation request detected")
+            elif has_image_generation_request:
+                logger.info(f"🔍 Skipping action parsing - image generation request detected")
             else:
                 logger.info(f"🔍 Skipping action parsing - detected as query pattern: {question[:100]}")
             parsed_action = None
@@ -640,13 +676,35 @@ class EnhancedRAGPipeline(RAGPipeline):
                 is_casual = False
                 service_routing = "rag"
         
+        # Check for image generation early - if detected, skip RAG entirely
+        question_lower_for_image_check_early = question.lower()
+        image_generation_keywords_early = [
+            "generate an image", "generate image", "generate a image",
+            "create an image", "create image", "create a image",
+            "make an image", "make image", "make a image",
+            "draw an image", "draw image", "draw a image",
+            "generate a picture", "generate picture", "generate an picture",
+            "create a picture", "create picture", "create an picture",
+            "make a picture", "make picture", "make an picture",
+            "draw a picture", "draw picture", "draw an picture",
+            "generate artwork", "create artwork", "make artwork",
+            "generate art", "create art", "make art"
+        ]
+        has_image_generation_early = any(keyword in question_lower_for_image_check_early for keyword in image_generation_keywords_early)
+        
         # Override: If query explicitly mentions "document", it's NOT casual conversation
+        # BUT skip this if image generation is detected (image generation doesn't need RAG)
         question_lower = question.lower()
-        if any(word in question_lower for word in ["document", "doc", "file", "the document", "about the document"]):
+        if any(word in question_lower for word in ["document", "doc", "file", "the document", "about the document"]) and not has_image_generation_early:
             is_casual = False
             needs_rag = True
             service_routing = "rag"
             logger.info(f"📄 Query mentions document - overriding is_casual to false, needs_rag to true")
+        elif has_image_generation_early:
+            # Image generation detected - skip RAG
+            needs_rag = False
+            should_search_docs = False
+            logger.info(f"🎨 Image generation detected - skipping RAG retrieval")
         
         # Update is_casual_conversation from LLM analysis (LLM is the source of truth, not patterns)
         is_casual_conversation = is_casual
@@ -667,15 +725,53 @@ class EnhancedRAGPipeline(RAGPipeline):
                 from src.stores.document_store import DocumentStore
                 doc_store = DocumentStore()
             all_docs = doc_store.get_all_shared_documents()
+            # Sort documents by recency (most recent first) to prioritize recent documents
+            all_docs.sort(key=lambda d: d.get("uploaded_at", ""), reverse=True)
+            
             for ref in document_references:
                 ref_lower = ref.lower()
+                best_match = None
+                best_score = 0.0
+                
                 for doc in all_docs:
                     filename_lower = doc.get("file_name", "").lower()
-                    if ref_lower in filename_lower or filename_lower in ref_lower:
-                        doc_id = doc.get("id")
-                        doc_filename = doc.get("file_name")
-                        logger.info(f"🔍 LLM detected document reference '{ref}' -> matched to '{doc_filename}' (ID: {doc_id})")
-                        break
+                    score = 0.0
+                    
+                    # Exact match gets highest score
+                    if ref_lower in filename_lower:
+                        score = 1.0
+                    # Partial match (word boundary)
+                    elif ref_lower in filename_lower.split() or any(ref_lower in word for word in filename_lower.split()):
+                        score = 0.8
+                    # Check if reference word appears in filename
+                    elif any(word in filename_lower for word in ref_lower.split() if len(word) > 2):
+                        score = 0.6
+                    
+                    # Boost for recent documents (uploaded in last 24 hours)
+                    uploaded_at = doc.get("uploaded_at")
+                    if uploaded_at:
+                        try:
+                            from datetime import datetime
+                            if isinstance(uploaded_at, str):
+                                upload_time = datetime.fromisoformat(uploaded_at.replace('Z', '+00:00'))
+                            else:
+                                upload_time = uploaded_at
+                            time_diff = (datetime.now(upload_time.tzinfo) - upload_time).total_seconds()
+                            if time_diff < 86400:  # 24 hours
+                                score += 0.3  # Boost for recent documents
+                        except:
+                            pass
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_match = doc
+                
+                if best_match and best_score > 0.5:  # Only match if score is reasonable
+                    doc_id = best_match.get("id")
+                    doc_filename = best_match.get("file_name")
+                    logger.info(f"🔍 LLM detected document reference '{ref}' -> matched to '{doc_filename}' (ID: {doc_id}, score: {best_score:.2f})")
+                    break
+                
                 if doc_id:
                     break
         
@@ -705,9 +801,34 @@ class EnhancedRAGPipeline(RAGPipeline):
         
         logger.info(f"Enhanced query analysis: {enhanced_analysis.get('question_type')}, complexity: {enhanced_analysis.get('complexity')}, service_routing: {service_routing}, needs_rag: {needs_rag}, needs_tools: {needs_tools}, needs_memory: {needs_memory}, is_casual: {is_casual}")
         
+        # CRITICAL: Check for image generation BEFORE casual conversation path
+        question_lower_for_early_image_check_conv = question.lower()
+        image_generation_keywords_early_conv = [
+            "generate an image", "generate image", "generate a image",
+            "create an image", "create image", "create a image",
+            "make an image", "make image", "make a image",
+            "draw an image", "draw image", "draw a image",
+            "generate a picture", "generate picture", "generate an picture",
+            "create a picture", "create picture", "create an picture",
+            "make a picture", "make picture", "make an picture",
+            "draw a picture", "draw picture", "draw an picture",
+            "generate artwork", "create artwork", "make artwork",
+            "generate art", "create art", "make art",
+            # Also detect image generation requests with descriptive keywords
+            "character portrait", "side profile", "dramatic light", "dungeon background",
+            "generate character", "create character", "draw character",
+            "portrait", "artwork", "illustration", "render", "concept art"
+        ]
+        # Check for image generation keywords OR combination of image-related terms
+        has_image_gen_early_conv = (
+            any(keyword in question_lower_for_early_image_check_conv for keyword in image_generation_keywords_early_conv) or
+            (("character" in question_lower_for_early_image_check_conv or "portrait" in question_lower_for_early_image_check_conv) and 
+             ("generate" in question_lower_for_early_image_check_conv or "create" in question_lower_for_early_image_check_conv or "draw" in question_lower_for_early_image_check_conv or "make" in question_lower_for_early_image_check_conv))
+        )
+        
         # Early return for casual conversation - generate conversational response without RAG
-        # BUT skip this if URL is detected (URLs require tool calling)
-        if (is_casual or (service_routing == "chat" and not needs_rag)) and not has_url:
+        # BUT skip this if URL is detected (URLs require tool calling) OR image generation is detected
+        if (is_casual or (service_routing == "chat" and not needs_rag)) and not has_url and not has_image_gen_early_conv:
             logger.info(f"💬 Generating conversational response (casual conversation detected)")
             # Get user context if needed (but don't block on it)
             user_context_for_conv = None
@@ -721,8 +842,13 @@ class EnhancedRAGPipeline(RAGPipeline):
             )
         
         # Override should_search_docs based on query analysis if available
-        # BUT respect URL detection - if URL is present, skip document retrieval
-        if enhanced_analysis.get("needs_rag") is not None and not has_url:
+        # BUT respect URL detection and image generation - skip document retrieval for both
+        if has_image_generation_early:
+            # Force skip document retrieval when image generation is detected
+            should_search_docs = False
+            needs_rag = False
+            logger.info(f"🎨 Image generation detected - forcing should_search_docs=False and needs_rag=False (no RAG needed for image generation)")
+        elif enhanced_analysis.get("needs_rag") is not None and not has_url:
             should_search_docs = needs_rag
         elif has_url:
             # Force skip document retrieval when URL is detected
@@ -768,12 +894,19 @@ class EnhancedRAGPipeline(RAGPipeline):
             except Exception as e:
                 logger.debug(f"Error tracking document interaction: {e}")
         
+        # OPTIMIZED: Check query result cache first (for identical queries)
+        query_cache_key = self._get_query_cache_key(question, channel_id, doc_id, doc_filename)
+        if CACHE_ENABLED and query_cache_key in self._query_result_cache:
+            logger.info(f"✅ Query result cache hit for: {question[:50]}...")
+            cached_result = self._query_result_cache[query_cache_key].copy()
+            # Update timing to reflect cache hit
+            cached_result["timing"]["cache_hit"] = True
+            return cached_result
+        
         # Step 6: Smart document selection
         query_embedding = self._get_cached_embedding(rewritten_query)
         
-        # Select which documents to search (if any)
-        # IMPORTANT: If a specific document is already detected, skip selection and use that document directly
-        # IMPORTANT: Skip document selection if URL is detected (URL tool will fetch content)
+        # OPTIMIZED: Cache document selection results
         selected_docs = []
         if should_search_docs and use_shared_docs and not has_url:
             if doc_id or doc_filename:
@@ -781,13 +914,21 @@ class EnhancedRAGPipeline(RAGPipeline):
                 logger.info(f"📄 Using specific document: {doc_filename or doc_id}, skipping document selection")
                 selected_docs = []  # Empty to trigger direct search with doc_id/doc_filename filter
             else:
-                selected_docs = self.document_selector.select_relevant_documents(
-                    question,
-                    query_embedding,
-                    context,
-                    max_docs=5
-                )
-                logger.info(f"Selected {len(selected_docs)} relevant documents")
+                # Check cache for document selection
+                doc_selection_key = f"{rewritten_query[:200]}_{channel_id or 'global'}"
+                if CACHE_ENABLED and doc_selection_key in self._document_selection_cache:
+                    selected_docs = self._document_selection_cache[doc_selection_key]
+                    logger.info(f"✅ Document selection cache hit: {len(selected_docs)} documents")
+                else:
+                    selected_docs = self.document_selector.select_relevant_documents(
+                        question,
+                        query_embedding,
+                        context,
+                        max_docs=5
+                    )
+                    if CACHE_ENABLED:
+                        self._document_selection_cache[doc_selection_key] = selected_docs
+                    logger.info(f"Selected {len(selected_docs)} relevant documents")
         
         # Step 5: Multi-stage document retrieval
         retrieval_start = time.time()
@@ -863,7 +1004,7 @@ class EnhancedRAGPipeline(RAGPipeline):
                     min_importance=0.3
                 )
             
-            # Collect results (optimized timeout)
+            # OPTIMIZED: Collect results with early termination for high-confidence results
             for key, future in futures.items():
                 try:
                     # Longer timeout for complex operations, shorter for simple ones
@@ -890,6 +1031,17 @@ class EnhancedRAGPipeline(RAGPipeline):
                         retrieved_chunks = result
                         if isinstance(result, list):
                             logger.info(f"📊 [Chunks] First chunk sample: {result[0] if result else 'empty'}")
+                            
+                            # OPTIMIZED: Early termination if we have high-confidence results
+                            if len(result) >= top_k:
+                                top_scores = sorted([chunk.get('score', 0) for chunk in result], reverse=True)[:top_k]
+                                if top_scores and top_scores[0] >= 0.9 and top_scores[-1] >= 0.7:
+                                    logger.info(f"✅ Early termination: High-confidence results found (top score: {top_scores[0]:.2f})")
+                                    # Cancel remaining futures if we have high-confidence results
+                                    for other_key, other_future in futures.items():
+                                        if other_key != key and not other_future.done():
+                                            other_future.cancel()
+                                    break
                 except Exception as e:
                     logger.warning(f"Could not retrieve {key}: {e}")
         
@@ -1136,9 +1288,42 @@ class EnhancedRAGPipeline(RAGPipeline):
         # GopherAgent determines if tools are needed based on intent classification
         needs_tools_final = needs_tools_from_gopher if 'needs_tools_from_gopher' in locals() else needs_tools
         
+        # CRITICAL: Check for image generation BEFORE any response generation
+        # This must happen early to prevent conversational responses for image generation requests
+        question_lower_for_early_image_check = question.lower()
+        image_generation_keywords_early = [
+            "generate an image", "generate image", "generate a image",
+            "create an image", "create image", "create a image",
+            "make an image", "make image", "make a image",
+            "draw an image", "draw image", "draw a image",
+            "generate a picture", "generate picture", "generate an picture",
+            "create a picture", "create picture", "create an picture",
+            "make a picture", "make picture", "make an picture",
+            "draw a picture", "draw picture", "draw an picture",
+            "generate artwork", "create artwork", "make artwork",
+            "generate art", "create art", "make art",
+            # Also detect image generation requests with descriptive keywords
+            "character portrait", "side profile", "dramatic light", "dungeon background",
+            "generate character", "create character", "draw character",
+            "portrait", "artwork", "illustration", "render", "concept art"
+        ]
+        # Check for image generation keywords OR combination of image-related terms
+        has_image_gen_early = (
+            any(keyword in question_lower_for_early_image_check for keyword in image_generation_keywords_early) or
+            (("character" in question_lower_for_early_image_check or "portrait" in question_lower_for_early_image_check) and 
+             ("generate" in question_lower_for_early_image_check or "create" in question_lower_for_early_image_check or "draw" in question_lower_for_early_image_check or "make" in question_lower_for_early_image_check))
+        )
+        
+        # If image generation detected, FORCE tools handler and skip all other paths
+        if has_image_gen_early:
+            logger.info(f"🎨 Image generation detected early - forcing tools handler and skipping conversational response")
+            handler = "tools"
+            needs_tools_final = True
+            is_casual_from_llm = False  # Override casual flag for image generation
+        
         # Use GopherAgent's routing decision
         if gopher_routing:
-            handler = gopher_routing.get("handler", service_routing)
+            handler = gopher_routing.get("handler", service_routing) if not has_image_gen_early else "tools"
             if handler == "tools" or needs_tools_final:
                 logger.info(f"🤖 GopherAgent orchestrating tool calls (handler={handler}, needs_tools={needs_tools_final})")
                 answer, tool_calls_used = self._generate_with_tools(
@@ -1164,13 +1349,31 @@ class EnhancedRAGPipeline(RAGPipeline):
                 tool_calls_used = []
             elif handler == "chat" or is_casual_from_llm:
                 # Casual conversation - no tools needed
-                logger.info(f"💬 GopherAgent: Casual conversation, generating chat response")
-                answer = self.lmstudio_client.generate_response(
-                    messages=messages,
-                    temperature=strategy.get("temperature", temperature),
-                    max_tokens=max_tokens
-                )
-                tool_calls_used = []
+                # BUT skip if image generation was detected
+                if has_image_gen_early:
+                    logger.info(f"🎨 Image generation detected - skipping conversational response, forcing tools")
+                    handler = "tools"
+                    needs_tools_final = True
+                    answer, tool_calls_used = self._generate_with_tools(
+                        messages=messages,
+                        question=question,
+                        user_id=user_id,
+                        channel_id=channel_id,
+                        mentioned_user_id=mentioned_user_id,
+                        temperature=strategy.get("temperature", temperature),
+                        max_tokens=max_tokens,
+                        max_iterations=5 if needs_tools_final else 3,
+                        needs_tools=needs_tools_final,
+                        service_routing=service_routing
+                    )
+                else:
+                    logger.info(f"💬 GopherAgent: Casual conversation, generating chat response")
+                    answer = self.lmstudio_client.generate_response(
+                        messages=messages,
+                        temperature=strategy.get("temperature", temperature),
+                        max_tokens=max_tokens
+                    )
+                    tool_calls_used = []
             else:
                 # Default: allow tool calling for dynamic search/actions
                 logger.info(f"🤖 GopherAgent: Allowing tool calling for dynamic operations")
@@ -1372,9 +1575,14 @@ class EnhancedRAGPipeline(RAGPipeline):
             "timing": {
                 "retrieval_ms": retrieval_time * 1000,
                 "generation_ms": generation_time * 1000,
-                "total_ms": total_time * 1000
+                "total_ms": total_time * 1000,
+                "cache_hit": False
             }
         }
+        
+        # OPTIMIZED: Cache query result for future identical queries
+        if CACHE_ENABLED:
+            self._query_result_cache[query_cache_key] = result.copy()
         
         return result
     
@@ -1634,6 +1842,191 @@ Examples:
         logger.info(f"💬 Generated conversational response in {total_time*1000:.0f}ms")
         return result
     
+    def _execute_single_tool_with_context(self, tool_call: Dict[str, Any], question: str, 
+                                          user_id: Optional[str], channel_id: Optional[str],
+                                          mentioned_user_id: Optional[str], needs_tools: bool,
+                                          service_routing: Optional[str], tool_calls_used: List[Dict]) -> Dict[str, Any]:
+        """
+        Execute a single tool call with full context validation and error handling.
+        OPTIMIZED: Extracted for parallel execution support.
+        """
+        tool_name = tool_call.get("name", "")
+        
+        # CRITICAL: Map image generation tool variations to generate_image
+        image_gen_variations_map = {
+            'imggen': 'generate_image',
+            'img_gen': 'generate_image',
+            'imagegen': 'generate_image',
+            'image_gen': 'generate_image',
+            'gen_image': 'generate_image',
+            'genimage': 'generate_image',
+            'create_image': 'generate_image',
+            'make_image': 'generate_image',
+            'draw_image': 'generate_image'
+        }
+        if tool_name.lower() in image_gen_variations_map:
+            logger.warning(f"⚠️ Tool name variation detected ({tool_name}) - mapping to generate_image")
+            tool_name = image_gen_variations_map[tool_name.lower()]
+            tool_call["name"] = tool_name
+        
+        # 🤖 AGENTIC TOOL VALIDATION: Validate tool name before execution
+        if not self.tool_registry.get_tool(tool_name):
+            question_lower_for_redirect = question.lower()
+            has_url_for_redirect = any([
+                "http://" in question or "https://" in question,
+                "www." in question and ("." in question.split("www.")[1][:50] if "www." in question else False),
+                "youtube.com" in question_lower_for_redirect or "youtu.be" in question_lower_for_redirect,
+            ])
+            
+            if has_url_for_redirect:
+                import re
+                url_match = re.search(r'(https?://[^\s]+|youtube\.com/watch\?v=[^\s]+|youtu\.be/[^\s]+)', question)
+                correct_url = url_match.group(0) if url_match else question
+                
+                if "youtube.com" in question_lower_for_redirect or "youtu.be" in question_lower_for_redirect:
+                    correct_tool = "summarize_youtube"
+                else:
+                    correct_tool = "summarize_website"
+                
+                logger.warning(f"⚠️ LLM called invalid tool '{tool_name}' for URL - redirecting to '{correct_tool}'")
+                tool_call["name"] = correct_tool
+                tool_call["arguments"] = {"url": correct_url}
+                tool_name = correct_tool
+        
+        # Prevent calling search_documents when tool creation is detected
+        if tool_name == "search_documents" and (needs_tools or service_routing == "tools"):
+            logger.warning(f"⚠️ LLM tried to call search_documents during tool creation - redirecting to write_tool")
+            return {"error": "Tool search_documents blocked: You should use write_tool to create the tool instead."}
+        
+        # Fix URL placeholders in tool arguments
+        if tool_name in ["summarize_youtube", "summarize_website"]:
+            url_arg = tool_call.get("arguments", {}).get("url", "")
+            if url_arg and ("<URL_FROM_QUESTION>" in url_arg or url_arg == "<URL_FROM_QUESTION>"):
+                import re
+                url_match = re.search(r'(https?://[^\s]+|youtube\.com/watch\?v=[^\s]+|youtu\.be/[^\s]+)', question)
+                if url_match:
+                    tool_call["arguments"]["url"] = url_match.group(0)
+                    logger.info(f"🔧 Replaced URL placeholder with actual URL")
+        
+        # CRITICAL: For generate_image, extract prompt from question if missing or invalid
+        if tool_name == "generate_image":
+            args = tool_call.get("arguments", {})
+            current_prompt = args.get("prompt", "").strip() if args.get("prompt") else ""
+            # Check if prompt is missing, empty, or just a placeholder like "prompt"
+            placeholder_prompts = {"prompt", "image", "picture", "art", "artwork", "generate", "create", "draw"}
+            needs_extraction = (
+                not current_prompt or 
+                len(current_prompt) < 3 or 
+                current_prompt.lower() in placeholder_prompts
+            )
+            
+            if needs_extraction:
+                logger.warning(f"⚠️ generate_image called with invalid prompt '{current_prompt}' - extracting from question")
+                import re
+                # Try to match prompt after image generation keywords (handles multi-line with DOTALL)
+                prompt_match = re.search(r'(?:generate|create|make|draw)\s+(?:an?\s+)?(?:image|picture|artwork|art)\s*(?:of|with|:)?\s*(.+?)(?:\s*$|\s*\?|\s*!)', question, re.IGNORECASE | re.DOTALL)
+                if prompt_match:
+                    extracted_prompt = prompt_match.group(1).strip()
+                else:
+                    # If no match, try to extract everything after the first line (for multi-line prompts)
+                    lines = question.split('\n')
+                    if len(lines) > 1:
+                        # Take everything after the first line as the prompt
+                        extracted_prompt = '\n'.join(lines[1:]).strip()
+                    else:
+                        extracted_prompt = question
+                
+                # Clean up the prompt
+                extracted_prompt = re.sub(r'^(?:of|with|:)\s*', '', extracted_prompt, flags=re.IGNORECASE).strip()
+                if not extracted_prompt or len(extracted_prompt) < 3:
+                    # Fallback: remove image generation keywords
+                    extracted_prompt = question.replace("generate", "").replace("create", "").replace("make", "").replace("draw", "").replace("an image", "").replace("a image", "").replace("image", "").replace("picture", "").replace("artwork", "").replace("art", "").strip()
+                if not extracted_prompt or len(extracted_prompt) < 3:
+                    extracted_prompt = "a beautiful image"
+                args["prompt"] = extracted_prompt
+                tool_call["arguments"] = args
+                logger.info(f"🔄 Added prompt to generate_image: {extracted_prompt}")
+        
+        # Inject context into tool arguments (but skip generate_image which doesn't need them)
+        if tool_name != "generate_image":  # Don't inject context for generate_image
+            if user_id and "user_id" not in tool_call.get("arguments", {}):
+                tool_call["arguments"]["user_id"] = user_id
+            if channel_id and "channel_id" not in tool_call.get("arguments", {}):
+                tool_call["arguments"]["channel_id"] = channel_id
+        
+        # Check if wrong tool is being called for YouTube URLs
+        if tool_name == "summarize_website":
+            question_lower_check = question.lower()
+            url_arg = tool_call.get("arguments", {}).get("url", "")
+            is_youtube_url = (
+                "youtube.com" in question_lower_check or 
+                "youtu.be" in question_lower_check or
+                "youtube.com" in url_arg.lower() or
+                "youtu.be" in url_arg.lower()
+            )
+            if is_youtube_url:
+                import re
+                url_match = re.search(r'(https?://[^\s]+|youtube\.com/watch\?v=[^\s]+|youtu\.be/[^\s]+)', question)
+                correct_url = url_match.group(0) if url_match else url_arg
+                tool_call["name"] = "summarize_youtube"
+                tool_call["arguments"] = {"url": correct_url}
+                if user_id:
+                    tool_call["arguments"]["user_id"] = user_id
+                if channel_id:
+                    tool_call["arguments"]["channel_id"] = channel_id
+                tool_name = "summarize_youtube"
+        
+        logger.info(f"🔧 Executing tool: {tool_name} with arguments: {tool_call.get('arguments')}")
+        result = self.tool_executor.execute_tool_call(tool_call)
+        
+        # Handle tool not found errors
+        if result.get("error") and "not found" in result.get("error", "").lower():
+            question_lower_for_redirect = question.lower()
+            has_url_for_redirect = any([
+                "http://" in question or "https://" in question,
+                "www." in question and ("." in question.split("www.")[1][:50] if "www." in question else False),
+                "youtube.com" in question_lower_for_redirect or "youtu.be" in question_lower_for_redirect,
+            ])
+            
+            if has_url_for_redirect:
+                import re
+                url_match = re.search(r'(https?://[^\s]+|youtube\.com/watch\?v=[^\s]+|youtu\.be/[^\s]+)', question)
+                correct_url = url_match.group(0) if url_match else question
+                
+                if "youtube.com" in question_lower_for_redirect or "youtu.be" in question_lower_for_redirect:
+                    correct_tool = "summarize_youtube"
+                else:
+                    correct_tool = "summarize_website"
+                
+                logger.warning(f"⚠️ LLM called wrong tool '{tool_name}' for URL - redirecting to '{correct_tool}'")
+                tool_call["name"] = correct_tool
+                tool_call["arguments"] = {"url": correct_url}
+                result = self.tool_executor.execute_tool_call(tool_call)
+        
+        # Log execution result
+        tool_result = result.get("result", result)
+        has_error = result.get("error") or (isinstance(tool_result, dict) and tool_result.get("error"))
+        
+        if has_error:
+            logger.error(f"❌ Tool {tool_name} failed: {result.get('error', 'Unknown error')}")
+            tool_calls_used.append({
+                "tool": tool_call.get("name"),
+                "arguments": tool_call.get("arguments"),
+                "result": result,
+                "success": False
+            })
+        else:
+            if isinstance(tool_result, dict) and tool_result.get("success"):
+                logger.info(f"✅ Tool {tool_name} succeeded")
+            tool_calls_used.append({
+                "tool": tool_call.get("name"),
+                "arguments": tool_call.get("arguments"),
+                "result": result,
+                "success": True
+            })
+        
+        return result
+    
     def _generate_with_tools(self,
                             messages: List[Dict[str, str]],
                             question: str,
@@ -1683,7 +2076,10 @@ Examples:
             tools_description = "\n\nAvailable Tools:\n"
             tools_description += "You can call these tools using JSON format: {\"tool\": \"tool_name\", \"arguments\": {...}}\n"
             tools_description += "EXAMPLE: {\"tool\": \"write_tool\", \"arguments\": {\"code\": \"def my_func(): pass\", \"function_name\": \"my_func\", \"description\": \"...\", \"parameters\": {}}}\n"
-            tools_description += "CRITICAL: Use ONLY the exact tool names listed below. DO NOT invent tool names like 'BMAD', 'youtube', 'data', etc.\n"
+            tools_description += "CRITICAL: Use ONLY the exact tool names listed below. DO NOT invent tool names like 'BMAD', 'youtube', 'data', 'generate_dnd_character', 'create_dnd_character', 'fetch_artwork', 'BeautifulSoup', 'find', 'get_text', 'pipe', 'from_pretrained', 'to', 'pixels', 'CFG', 'save', 'write', 'paste', 'strings', 'string', 'items', 'artists', 'fetch_artists', 'summarize_artists', 'something', 'new', 'n', 'get', 'open', 'Draw', 'cat_in_hat', 'cat_broom', etc.\n"
+            tools_description += "CRITICAL: DO NOT use Python library functions or methods as tool names (like BeautifulSoup, get, open, write, save, find, etc.)!\n"
+            tools_description += "CRITICAL: DO NOT create compound tool names (like 'generate_dnd_character', 'create_dnd_character', 'fetch_artwork') - use ONLY the tools listed below!\n"
+            tools_description += "CRITICAL: DO NOT create dynamic tool names based on user input! For example, if user asks for 'dwarf image', DO NOT create 'create_dwarf_image' - use 'generate_image' with the description in the prompt parameter!\n"
             tools_description += "IMPORTANT: Use the exact parameter names shown below (e.g., 'query' not 'q', 'user_id' not 'user').\n"
             tools_description += "CRITICAL: When a user asks you to DO something (like create a tool), you MUST call the appropriate tool. Do NOT just describe what you would do - ACTUALLY CALL THE TOOL!\n"
             tools_description += "VALID TOOL NAMES: " + ", ".join([tool["function"]["name"] for tool in tool_schemas[:15]]) + "\n"
@@ -1744,12 +2140,67 @@ Examples:
                     tools_description += "The tool name is EXACTLY: summarize_website (not 'data', not 'website', not anything else)\n"
                 tools_description += "\n"
             
+            # Check for image generation requests
+            question_lower_for_image_check = question.lower()
+            image_generation_keywords = [
+                "generate an image", "generate image", "generate a image",
+                "create an image", "create image", "create a image",
+                "make an image", "make image", "make a image",
+                "draw an image", "draw image", "draw a image",
+                "generate a picture", "generate picture", "generate an picture",
+                "create a picture", "create picture", "create an picture",
+                "make a picture", "make picture", "make an picture",
+                "draw a picture", "draw picture", "draw an picture",
+                "generate artwork", "create artwork", "make artwork",
+                "generate art", "create art", "make art"
+            ]
+            has_image_generation = any(keyword in question_lower_for_image_check for keyword in image_generation_keywords)
+            
+            if has_image_generation:
+                # Extract prompt from question (everything after "generate/create/make/draw")
+                import re
+                prompt_match = re.search(r'(?:generate|create|make|draw)\s+(?:an?\s+)?(?:image|picture|artwork|art)\s+(?:of|with|:)?\s*(.+?)(?:\s*$|\s*\?|\s*!)', question_lower_for_image_check, re.IGNORECASE)
+                example_prompt = prompt_match.group(1).strip() if prompt_match else "a cat wearing a hat"
+                if not example_prompt or len(example_prompt) < 3:
+                    example_prompt = "a cat wearing a hat"
+                
+                tools_description += "\n🎨🎨🎨 IMAGE GENERATION REQUEST DETECTED 🎨🎨🎨\n"
+                tools_description += "\n🚨🚨🚨 CRITICAL FOR IMAGE GENERATION - YOU MUST CALL THE TOOL NOW 🚨🚨🚨\n"
+                tools_description += "STOP READING AND CALL THE TOOL IMMEDIATELY!\n\n"
+                tools_description += "The user wants to generate an image. You MUST call generate_image tool RIGHT NOW!\n"
+                tools_description += "DO NOT write any text explaining what you will do!\n"
+                tools_description += "DO NOT invent tool names like 'cat_in_hat', 'get', 'json', 'open', 'Draw', 'truetype', 'textlength', 'text', 'show', 'hat', 'generate_dnd_character', 'create_dnd_character', 'fetch_artwork', 'BeautifulSoup', 'find', 'get_text', 'pipe', 'from_pretrained', 'to', 'pixels', 'CFG', 'save', 'write', 'paste', 'strings', 'string', 'items', 'artists', 'fetch_artists', 'summarize_artists', 'something', 'new', 'n'!\n"
+                tools_description += "🚨 CRITICAL: DO NOT CREATE DYNAMIC TOOL NAMES BASED ON THE PROMPT! 🚨\n"
+                tools_description += "DO NOT use names like 'create_dwarf_image', 'generate_cat_image', 'make_*_image', 'draw_*_image'!\n"
+                tools_description += "DO NOT combine words from the user's prompt with 'create_' or 'generate_' to make tool names!\n"
+                tools_description += "The tool name is ALWAYS 'generate_image' regardless of what image the user wants!\n"
+                tools_description += "DO NOT try to describe how to draw or create images manually!\n"
+                tools_description += "DO NOT try to use Python libraries or functions as tools!\n"
+                tools_description += "Do NOT call any other tool - ONLY call generate_image!\n\n"
+                tools_description += f"EXACT FORMAT TO USE (COPY THIS EXACTLY):\n{{\"tool\": \"generate_image\", \"arguments\": {{\"prompt\": \"{example_prompt}\"}}}}\n\n"
+                tools_description += "The tool name is EXACTLY: generate_image (NOT 'create_dwarf_image', NOT 'generate_cat_image', NOT anything else!)\n"
+                tools_description += "DO NOT USE: 'cat_in_hat', 'get', 'json', 'open', 'Draw', 'truetype', 'textlength', 'text', 'show', 'hat', 'draw', 'create', 'make', 'generate_dnd_character', 'create_dnd_character', 'fetch_artwork', 'BeautifulSoup', 'find', 'get_text', 'pipe', 'from_pretrained', 'to', 'pixels', 'CFG', 'save', 'write', 'paste', 'strings', 'string', 'items', 'artists', 'fetch_artists', 'summarize_artists', 'something', 'new', 'n', or ANY other name!\n"
+                tools_description += "DO NOT USE DYNAMIC NAMES LIKE: 'create_*_image', 'generate_*_image', 'make_*_image', 'draw_*_image' where * is any word!\n"
+                tools_description += "ONLY USE: generate_image (exactly as written, case-sensitive, no variations, no dynamic names)\n\n"
+                tools_description += "The generate_image tool accepts a 'prompt' parameter with a detailed description of what to generate.\n"
+                tools_description += "Extract the image description from the user's message and use it as the prompt parameter.\n"
+                tools_description += "The prompt goes INSIDE the arguments, NOT in the tool name!\n"
+                tools_description += "🚨 YOUR RESPONSE SHOULD BE ONLY THE TOOL CALL - NO OTHER TEXT! 🚨\n"
+                tools_description += "🚨🚨🚨\n\n"
+            
             # Show all tools (not limited to 10) so LLM knows about meta-tools
             for schema in tool_schemas:
                 func = schema["function"]
                 # Highlight URL tools if URL detected
                 if has_url_for_tools and func['name'] in ['summarize_website', 'summarize_youtube']:
                     tools_description += f"⭐ {func['name']}: {func['description']}\n"
+                # Highlight image generation tool if image generation detected - make it VERY prominent
+                elif has_image_generation and func['name'] == 'generate_image':
+                    tools_description += f"\n🎨🎨🎨 USE THIS TOOL FOR IMAGE GENERATION 🎨🎨🎨\n"
+                    tools_description += f"🎨 Tool name: {func['name']}\n"
+                    tools_description += f"🎨 Description: {func['description']}\n"
+                    tools_description += f"🎨 REMEMBER: Tool name is '{func['name']}' - NOT 'create_*_image', NOT 'generate_*_image', NOT any dynamic name!\n"
+                    tools_description += f"🎨🎨🎨\n"
                 else:
                     tools_description += f"- {func['name']}: {func['description']}\n"
                 # Include parameter names for clarity
@@ -1841,6 +2292,50 @@ Examples:
                             iteration += 1
                             continue
                 
+                # Check if image generation is requested but no tool called
+                image_generation_keywords_check = [
+                    "generate an image", "generate image", "generate a image",
+                    "create an image", "create image", "create a image",
+                    "make an image", "make image", "make a image",
+                    "draw an image", "draw image", "draw a image",
+                    "generate a picture", "generate picture", "generate an picture",
+                    "create a picture", "create picture", "create an picture",
+                    "make a picture", "make picture", "make an picture",
+                    "draw a picture", "draw picture", "draw an picture",
+                    "generate artwork", "create artwork", "make artwork",
+                    "generate art", "create art", "make art"
+                ]
+                has_image_gen_request = any(keyword in question_lower for keyword in image_generation_keywords_check)
+                
+                if has_image_gen_request and iteration == 0:
+                    response_lower = response.lower()
+                    tool_already_called = "generate_image" in response_lower
+                    
+                    # If image generation detected but tool not called, ALWAYS force tool call
+                    if not tool_already_called:
+                        logger.warning(f"⚠️ Image generation detected but no tool called - forcing generate_image tool call")
+                        current_messages.append({
+                            "role": "assistant",
+                            "content": response
+                        })
+                        # Extract prompt from question
+                        import re
+                        prompt_match = re.search(r'(?:generate|create|make|draw)\s+(?:an?\s+)?(?:image|picture|artwork|art)\s+(?:of|with|:)?\s*(.+?)(?:\s*$|\s*\?|\s*!)', question, re.IGNORECASE)
+                        extracted_prompt = prompt_match.group(1).strip() if prompt_match else question
+                        # Clean up the prompt - remove common prefixes
+                        extracted_prompt = re.sub(r'^(?:of|with|:)\s*', '', extracted_prompt, flags=re.IGNORECASE).strip()
+                        if not extracted_prompt or len(extracted_prompt) < 3:
+                            extracted_prompt = question.replace("generate", "").replace("create", "").replace("make", "").replace("draw", "").replace("an image", "").replace("a image", "").replace("image", "").replace("picture", "").replace("artwork", "").replace("art", "").strip()
+                        if not extracted_prompt or len(extracted_prompt) < 3:
+                            extracted_prompt = "a beautiful image"
+                        
+                        current_messages.append({
+                            "role": "user",
+                            "content": f"🚨🚨🚨 CRITICAL: You MUST call generate_image NOW! 🚨🚨🚨\n\nDo NOT invent tool names like 'cat_in_hat', 'get', 'json', 'open', 'Draw', 'truetype', 'textlength', 'text', 'show', 'hat', 'generate_dnd_character', 'create_dnd_character', 'fetch_artwork', 'BeautifulSoup', 'find', 'get_text', 'pipe', 'from_pretrained', 'to', 'pixels', 'CFG', 'save', 'write', 'paste', 'strings', 'string', 'items', 'artists', 'fetch_artists', 'summarize_artists', 'something', 'new', 'n'!\nDo NOT use Python library functions as tools!\nDo NOT describe what you would do - ACTUALLY CALL THE TOOL!\n\nUse this EXACT format:\n{{\"tool\": \"generate_image\", \"arguments\": {{\"prompt\": \"{extracted_prompt}\"}}}}\n\nThe tool name is EXACTLY: generate_image (case-sensitive)\nDO NOT write any text - ONLY call the tool!"
+                        })
+                        iteration += 1
+                        continue
+                
                 # If this is a tool creation request and we haven't called write_tool yet, force it
                 if (needs_tools or service_routing == "tools") and iteration == 0:
                     # Check if response mentions creating a tool but didn't call write_tool
@@ -1863,213 +2358,272 @@ Examples:
                 logger.info(f"🔧 No tool calls detected, returning response")
                 return response, tool_calls_used
             
-            # Execute tool calls
+            # OPTIMIZED: Execute tool calls with parallel execution for independent tools
             tool_results = []
             url_content_fetched = False  # Track if URL content was successfully fetched
+            
+            # CRITICAL: Check for image generation request and invalid tool calls
+            # If LLM is hallucinating tool names instead of using generate_image, force it
+            question_lower_for_image_check = question.lower()
+            image_generation_keywords_check = [
+                "generate an image", "generate image", "generate a image",
+                "create an image", "create image", "create a image",
+                "make an image", "make image", "make a image",
+                "draw an image", "draw image", "draw a image",
+                "generate a picture", "generate picture", "generate an picture",
+                "create a picture", "create picture", "create an picture",
+                "make a picture", "make picture", "make an picture",
+                "draw a picture", "draw picture", "draw an picture",
+                "generate artwork", "create artwork", "make artwork",
+                "generate art", "create art", "make art"
+            ]
+            has_image_gen_request = any(keyword in question_lower_for_image_check for keyword in image_generation_keywords_check)
+            
+            # Check if invalid tool names were called for image generation
+            invalid_image_tool_names = [
+                'cat_in_hat', 'cat_broom', 'cat_flying_broom', 'get', 'json', 'open', 'Draw', 'truetype', 'textlength', 'text', 'show', 'hat', 
+                'is_available', 'from_pretrained', 'to', 'pipe', 'generate_cat_in_hat', 'ngenerate_image',
+                'generate_dnd_character', 'create_dnd_character', 'fetch_artwork', 'BeautifulSoup', 'find', 'get_text', 
+                'pixels', 'CFG', 'save', 'write', 'paste', 'strings', 'string', 'items', 'artists', 'fetch_artists', 
+                'summarize_artists', 'something', 'new', 'n'
+            ]
+            # Also check for common variations/misspellings of image generation tools
+            image_gen_variations = ['imggen', 'img_gen', 'imagegen', 'image_gen', 'gen_image', 'genimage', 'create_image', 'make_image', 'draw_image']
+            
+            # Get list of valid tool names from registry
+            if hasattr(self.tool_registry, 'tools'):
+                valid_tool_names = set(self.tool_registry.tools.keys())
+            else:
+                # Fallback: get tool names from registered tools
+                valid_tool_names = {tool.name for tool in self.tool_registry.get_all_tools()}
+            
+            # Import re for pattern matching
+            import re
+            
+            # Detect dynamically generated tool names (e.g., create_dwarf_image, generate_cat_image, etc.)
+            def is_dynamically_generated_tool(tool_name: str) -> bool:
+                """Check if a tool name looks like it was dynamically generated."""
+                tool_lower = tool_name.lower()
+                # Pattern: create_*_image, generate_*_image, make_*_image, draw_*_image
+                dynamic_patterns = [
+                    r'^create_[^_]+_image$',  # create_dwarf_image, create_cat_image, etc.
+                    r'^generate_[^_]+_image$',  # generate_dwarf_image, etc.
+                    r'^make_[^_]+_image$',  # make_dwarf_image, etc.
+                    r'^draw_[^_]+_image$',  # draw_dwarf_image, etc.
+                ]
+                for pattern in dynamic_patterns:
+                    if re.match(pattern, tool_lower):
+                        return True
+                return False
+            
+            # Check for invalid tools (both explicit list and dynamically generated ones)
+            invalid_tool_calls = []
+            for tool_call in tool_calls:
+                tool_name = tool_call.get("name", "")
+                # Check if tool is in invalid list, dynamically generated, or not in registry
+                if (tool_name in invalid_image_tool_names or 
+                    is_dynamically_generated_tool(tool_name) or
+                    (tool_name not in valid_tool_names and tool_name != "generate_image")):
+                    invalid_tool_calls.append(tool_name)
+            
+            called_invalid_tools = len(invalid_tool_calls) > 0
+            
+            # Early filtering: Remove invalid tools immediately if image generation is requested
+            if has_image_gen_request and called_invalid_tools:
+                logger.warning(f"⚠️ Detected {len(invalid_tool_calls)} invalid tool call(s) for image generation: {invalid_tool_calls}")
+                # Filter out invalid tools early
+                original_count = len(tool_calls)
+                tool_calls = [
+                    tc for tc in tool_calls 
+                    if (tc.get("name", "") not in invalid_image_tool_names and
+                        tc.get("name", "").lower() not in image_gen_variations and
+                        not is_dynamically_generated_tool(tc.get("name", "")) and
+                        (tc.get("name", "") in valid_tool_names or tc.get("name", "") == "generate_image"))
+                ]
+                logger.info(f"🔄 Early filtering: Removed {original_count - len(tool_calls)} invalid tool(s), {len(tool_calls)} remaining")
+                
+                # If all tools were filtered out and image generation is requested, force-add generate_image
+                if len(tool_calls) == 0:
+                    logger.warning(f"⚠️ All tools filtered out for image generation - forcing generate_image with extracted prompt")
+                    # Extract prompt early (we'll refine it later)
+                    import re
+                    prompt_match = re.search(r'(?:generate|create|make|draw)\s+(?:an?\s+)?(?:image|picture|artwork|art)\s+(?:of|with|:)?\s*(.+?)(?:\s*$|\s*\?|\s*!)', question, re.IGNORECASE | re.DOTALL)
+                    if prompt_match:
+                        temp_prompt = prompt_match.group(1).strip()
+                    else:
+                        lines = question.split('\n')
+                        temp_prompt = '\n'.join(lines[1:]).strip() if len(lines) > 1 else question
+                    temp_prompt = re.sub(r'^(?:of|with|:)\s*', '', temp_prompt, flags=re.IGNORECASE).strip()
+                    if not temp_prompt or len(temp_prompt) < 3:
+                        temp_prompt = question.replace("generate", "").replace("create", "").replace("make", "").replace("draw", "").replace("an image", "").replace("a image", "").replace("image", "").replace("picture", "").replace("artwork", "").replace("art", "").strip()
+                    if not temp_prompt or len(temp_prompt) < 3:
+                        temp_prompt = "a beautiful image"
+                    tool_calls = [{
+                        "name": "generate_image",
+                        "arguments": {"prompt": temp_prompt}
+                    }]
+                    logger.info(f"🔄 Force-added generate_image with prompt: {temp_prompt[:100]}...")
+            
+            # Check for image generation tool variations that should map to generate_image
+            image_gen_variation_call = next((tc for tc in tool_calls if tc.get("name", "").lower() in image_gen_variations), None)
+            generate_image_call = next((tc for tc in tool_calls if tc.get("name", "") == "generate_image"), None)
+            called_generate_image = generate_image_call is not None
+            called_image_gen_variation = image_gen_variation_call is not None
+            
+            # Re-check invalid tools after early filtering
+            invalid_tool_calls = [
+                tc.get("name", "") for tc in tool_calls
+                if (tc.get("name", "") in invalid_image_tool_names or
+                    is_dynamically_generated_tool(tc.get("name", "")) or
+                    (tc.get("name", "") not in valid_tool_names and tc.get("name", "") != "generate_image"))
+            ]
+            called_invalid_tools = len(invalid_tool_calls) > 0
+            
+            # Extract prompt from question (for use in fixing generate_image calls)
+            prompt_match = re.search(r'(?:generate|create|make|draw)\s+(?:an?\s+)?(?:image|picture|artwork|art)\s+(?:of|with|:)?\s*(.+?)(?:\s*$|\s*\?|\s*!)', question, re.IGNORECASE)
+            extracted_prompt = prompt_match.group(1).strip() if prompt_match else question
+            # Clean up the prompt
+            extracted_prompt = re.sub(r'^(?:of|with|:)\s*', '', extracted_prompt, flags=re.IGNORECASE).strip()
+            if not extracted_prompt or len(extracted_prompt) < 3:
+                extracted_prompt = question.replace("generate", "").replace("create", "").replace("make", "").replace("draw", "").replace("an image", "").replace("a image", "").replace("image", "").replace("picture", "").replace("artwork", "").replace("art", "").strip()
+            if not extracted_prompt or len(extracted_prompt) < 3:
+                extracted_prompt = "a beautiful image"
+            
+            # If image generation requested:
+            if has_image_gen_request:
+                # Safety check: If no valid tools remain after filtering, force-add generate_image
+                if len(tool_calls) == 0:
+                    logger.warning(f"⚠️ No valid tools found for image generation - forcing generate_image")
+                    tool_calls = [{
+                        "name": "generate_image",
+                        "arguments": {"prompt": extracted_prompt}
+                    }]
+                    generate_image_call = tool_calls[0]
+                    called_generate_image = True
+                    logger.info(f"🔄 Force-added generate_image with prompt: {extracted_prompt[:100]}...")
+                # Case 1: Image generation variation called (imggen, img_gen, etc.) - map to generate_image
+                elif called_image_gen_variation and not called_generate_image:
+                    logger.warning(f"⚠️ Image generation variation detected ({image_gen_variation_call.get('name')}) - mapping to generate_image")
+                    # Extract prompt from variation call if present, otherwise use extracted prompt
+                    variation_args = image_gen_variation_call.get("arguments", {})
+                    prompt_from_variation = variation_args.get("prompt") or variation_args.get("description") or variation_args.get("text") or extracted_prompt
+                    # Replace the variation call with generate_image
+                    tool_calls = [tc for tc in tool_calls if tc.get("name", "").lower() not in image_gen_variations]
+                    tool_calls.append({
+                        "name": "generate_image",
+                        "arguments": {"prompt": prompt_from_variation}
+                    })
+                    logger.info(f"🔄 Mapped {image_gen_variation_call.get('name')} to generate_image: {prompt_from_variation}")
+                # Case 2: Invalid tools called but generate_image not called - replace all with generate_image
+                elif called_invalid_tools and not called_generate_image:
+                    logger.warning(f"⚠️ Image generation detected but LLM called invalid tools - forcing generate_image tool call")
+                    tool_calls = [{
+                        "name": "generate_image",
+                        "arguments": {"prompt": extracted_prompt}
+                    }]
+                    logger.info(f"🔄 Replaced invalid tool calls with generate_image: {extracted_prompt}")
+                # Case 3: generate_image called but missing prompt - add prompt
+                elif called_generate_image:
+                    generate_image_args = generate_image_call.get("arguments", {})
+                    if "prompt" not in generate_image_args or not generate_image_args.get("prompt"):
+                        logger.warning(f"⚠️ generate_image called but missing prompt parameter - adding extracted prompt")
+                        generate_image_args["prompt"] = extracted_prompt
+                        generate_image_call["arguments"] = generate_image_args
+                        logger.info(f"🔄 Added prompt to generate_image call: {extracted_prompt}")
+                    # Case 4: generate_image called correctly but invalid tools also present - remove invalid tools
+                    if called_invalid_tools or called_image_gen_variation:
+                        logger.warning(f"⚠️ generate_image called correctly but invalid/variation tools also present - removing them")
+                        # Filter out invalid tools (explicit list, variations, and dynamically generated ones)
+                        filtered_tool_calls = []
+                        for tc in tool_calls:
+                            tool_name = tc.get("name", "")
+                            # Keep only valid tools (generate_image and tools in registry)
+                            if (tool_name == "generate_image" or 
+                                (tool_name in valid_tool_names and 
+                                 tool_name not in invalid_image_tool_names and 
+                                 tool_name.lower() not in image_gen_variations and
+                                 not is_dynamically_generated_tool(tool_name))):
+                                filtered_tool_calls.append(tc)
+                            else:
+                                logger.debug(f"🗑️ Filtering out invalid tool: {tool_name}")
+                        tool_calls = filtered_tool_calls
+                        logger.info(f"🔄 Filtered out invalid/variation tools, keeping {len(tool_calls)} valid tool call(s)")
+            
+            # Group tools by dependencies
+            independent_tools = []
+            dependent_tools = []
+            url_tools = ["summarize_youtube", "summarize_website"]
             
             for tool_call in tool_calls:
                 tool_name = tool_call.get("name", "")
                 
-                # CRITICAL: Skip URL tool calls if we already fetched URL content in this iteration
-                # This prevents duplicate tool calls and unnecessary work
-                if url_content_fetched and tool_name in ["summarize_youtube", "summarize_website"]:
-                    logger.info(f"⏭️ Skipping {tool_name} - URL content already fetched in this iteration")
+                # Skip duplicate URL tools
+                if url_content_fetched and tool_name in url_tools:
+                    logger.info(f"⏭️ Skipping {tool_name} - URL content already fetched")
                     continue
                 
-                # 🤖 AGENTIC TOOL VALIDATION: Validate tool name before execution
-                # Check if tool exists, if not try to find similar tool or redirect
-                if not self.tool_registry.get_tool(tool_name):
-                    # Tool doesn't exist - try to find correct tool
-                    question_lower_for_redirect = question.lower()
-                    has_url_for_redirect = any([
-                        "http://" in question or "https://" in question,
-                        "www." in question and ("." in question.split("www.")[1][:50] if "www." in question else False),
-                        "youtube.com" in question_lower_for_redirect or "youtu.be" in question_lower_for_redirect,
-                    ])
-                    
-                    # Check if this is a URL-related wrong tool name
-                    if has_url_for_redirect:
-                        import re
-                        url_match = re.search(r'(https?://[^\s]+|youtube\.com/watch\?v=[^\s]+|youtu\.be/[^\s]+)', question)
-                        correct_url = url_match.group(0) if url_match else question
-                        
-                        if "youtube.com" in question_lower_for_redirect or "youtu.be" in question_lower_for_redirect:
-                            correct_tool = "summarize_youtube"
-                        else:
-                            correct_tool = "summarize_website"
-                        
-                        logger.warning(f"⚠️ LLM called invalid tool '{tool_name}' for URL - redirecting to '{correct_tool}'")
-                        tool_call["name"] = correct_tool
-                        tool_call["arguments"] = {"url": correct_url}
-                        tool_name = correct_tool  # Update for logging
-                    else:
-                        # Unknown tool - log error and skip
-                        logger.error(f"❌ LLM called unknown tool '{tool_name}' - skipping. Available tools: {', '.join([t.name for t in self.tool_registry.get_all_tools()])}")
-                        tool_results.append(f"ERROR: Tool '{tool_name}' not found. Available tools: {', '.join([t.name for t in self.tool_registry.get_all_tools()][:10])}")
-                        continue
-                
-                # Prevent calling search_documents when tool creation is detected
-                # Redirect to write_tool instead
-                if tool_name == "search_documents" and (needs_tools or service_routing == "tools"):
-                    logger.warning(f"⚠️ LLM tried to call search_documents during tool creation - redirecting to write_tool")
-                    # Replace with write_tool call instruction
-                    tool_results.append(f"Tool search_documents blocked: You should use write_tool to create the tool instead. Call write_tool with the actual code for the weather tool.")
-                    continue
-                
-                # Fix URL placeholders in tool arguments (for URL tools)
-                if tool_name in ["summarize_youtube", "summarize_website"]:
-                    url_arg = tool_call.get("arguments", {}).get("url", "")
-                    if url_arg and ("<URL_FROM_QUESTION>" in url_arg or url_arg == "<URL_FROM_QUESTION>"):
-                        # Extract actual URL from question
-                        import re
-                        url_match = re.search(r'(https?://[^\s]+|youtube\.com/watch\?v=[^\s]+|youtu\.be/[^\s]+)', question)
-                        if url_match:
-                            actual_url = url_match.group(0)
-                            tool_call["arguments"]["url"] = actual_url
-                            logger.info(f"🔧 Replaced URL placeholder with actual URL: {actual_url}")
-                        else:
-                            logger.warning(f"⚠️ Could not extract URL from question to replace placeholder")
-                
-                # Inject context into tool arguments
-                if user_id and "user_id" not in tool_call.get("arguments", {}):
-                    # Try to infer user_id from context
-                    if mentioned_user_id and "user_id" in tool_call.get("arguments", {}):
-                        pass  # Already has user_id
-                    elif user_id:
-                        tool_call["arguments"]["user_id"] = user_id
-                
-                if channel_id and "channel_id" not in tool_call.get("arguments", {}):
-                    tool_call["arguments"]["channel_id"] = channel_id
-                
-                # CRITICAL: Check if wrong tool is being called for YouTube URLs BEFORE execution
-                if tool_name == "summarize_website":
-                    question_lower_check = question.lower()
-                    url_arg = tool_call.get("arguments", {}).get("url", "")
-                    # Check if this is actually a YouTube URL
-                    is_youtube_url = (
-                        "youtube.com" in question_lower_check or 
-                        "youtu.be" in question_lower_check or
-                        "youtube.com" in url_arg.lower() or
-                        "youtu.be" in url_arg.lower()
-                    )
-                    if is_youtube_url:
-                        logger.warning(f"⚠️ LLM called summarize_website for YouTube URL - redirecting to summarize_youtube BEFORE execution")
-                        # Extract URL from question or use the one in arguments
-                        import re
-                        url_match = re.search(r'(https?://[^\s]+|youtube\.com/watch\?v=[^\s]+|youtu\.be/[^\s]+)', question)
-                        correct_url = url_match.group(0) if url_match else url_arg
-                        # Replace with correct tool
-                        tool_call["name"] = "summarize_youtube"
-                        tool_call["arguments"] = {"url": correct_url}
-                        if user_id:
-                            tool_call["arguments"]["user_id"] = user_id
-                        if channel_id:
-                            tool_call["arguments"]["channel_id"] = channel_id
-                        tool_name = "summarize_youtube"  # Update for logging
-                
-                logger.info(f"🔧 Executing tool: {tool_name} with arguments: {tool_call.get('arguments')}")
-                result = self.tool_executor.execute_tool_call(tool_call)
-                
-                # Check if tool was not found - redirect to correct tool for URLs
-                # BUT: Skip if we already successfully fetched URL content (prevent loops)
-                if result.get("error") and "not found" in result.get("error", "").lower() and not url_content_fetched:
-                    error_msg = result.get("error", "")
-                    logger.error(f"❌ Tool {tool_name} not found: {error_msg}")
-                    
-                    # If URL is in question and wrong tool was called, redirect to correct tool
-                    question_lower_for_redirect = question.lower()
-                    has_url_for_redirect = any([
-                        "http://" in question or "https://" in question,
-                        "www." in question and ("." in question.split("www.")[1][:50] if "www." in question else False),
-                        "youtube.com" in question_lower_for_redirect or "youtu.be" in question_lower_for_redirect,
-                    ])
-                    
-                    if has_url_for_redirect:
-                        import re
-                        url_match = re.search(r'(https?://[^\s]+|youtube\.com/watch\?v=[^\s]+|youtu\.be/[^\s]+)', question)
-                        correct_url = url_match.group(0) if url_match else question
-                        
-                        if "youtube.com" in question_lower_for_redirect or "youtu.be" in question_lower_for_redirect:
-                            correct_tool = "summarize_youtube"
-                        else:
-                            correct_tool = "summarize_website"
-                        
-                        logger.warning(f"⚠️ LLM called wrong tool '{tool_name}' for URL - redirecting to '{correct_tool}'")
-                        # Replace with correct tool call
-                        tool_call["name"] = correct_tool
-                        tool_call["arguments"] = {"url": correct_url}
-                        # Retry with correct tool
-                        result = self.tool_executor.execute_tool_call(tool_call)
-                elif result.get("error") and "not found" in result.get("error", "").lower() and url_content_fetched:
-                    # URL content already fetched - skip this wrong tool call
-                    logger.warning(f"⚠️ LLM called wrong tool '{tool_name}' but URL content already fetched - skipping")
-                    continue
-                
-                # Log tool execution result
-                tool_result = result.get("result", result)
-                has_error = result.get("error") or (isinstance(tool_result, dict) and tool_result.get("error"))
-                
-                # Check if this is a URL tool that succeeded - mark it but continue to add result
-                if not has_error and isinstance(tool_result, dict):
-                    if tool_result.get("success") and tool_name in ["summarize_youtube", "summarize_website"]:
-                        url_content_fetched = True
-                        # Mark that we've successfully fetched URL content
-                        logger.info(f"✅ URL tool {tool_name} succeeded - content fetched, will skip further wrong tool calls")
-                
-                if has_error:
-                    error_msg = result.get("error") or (tool_result.get("error") if isinstance(tool_result, dict) else "Unknown error")
-                    logger.error(f"❌ Tool {tool_name} failed: {error_msg}")
-                    # Skip adding failed tool results - only add successful ones
-                    # This prevents the LLM from seeing errors and getting confused
-                    tool_calls_used.append({
-                        "tool": tool_call.get("name"),
-                        "arguments": tool_call.get("arguments"),
-                        "result": result,
-                        "success": False
-                    })
-                    # Don't add to tool_results - skip failed calls
-                    continue
+                # URL tools should run sequentially (to track url_content_fetched)
+                if tool_name in url_tools:
+                    dependent_tools.append(tool_call)
                 else:
-                    if isinstance(tool_result, dict) and tool_result.get("success"):
-                        logger.info(f"✅ Tool {tool_name} succeeded")
-                        if tool_name == "summarize_youtube" and "transcript" in tool_result:
-                            transcript_len = len(tool_result.get("transcript", ""))
-                            logger.info(f"📄 Transcript length: {transcript_len} characters")
-                        elif tool_name == "summarize_website" and "full_text" in tool_result:
-                            text_len = len(tool_result.get("full_text", ""))
-                            logger.info(f"📄 Content length: {text_len} characters")
-                
-                tool_calls_used.append({
-                    "tool": tool_call.get("name"),
-                    "arguments": tool_call.get("arguments"),
-                    "result": result,
-                    "success": True
-                })
-                
-                # Format result for LLM (only successful results)
-                formatted_result = self.tool_parser.format_tool_result(
-                    tool_call.get("name"),
-                    tool_result
-                )
-                
-                # Log what we're sending to LLM for debugging
-                if tool_name == "summarize_youtube":
-                    if isinstance(tool_result, dict) and "transcript" in tool_result:
-                        transcript_preview = tool_result.get("transcript", "")[:200]
-                        logger.info(f"📄 Sending transcript to LLM (preview: {transcript_preview}...)")
-                    else:
-                        logger.warning(f"⚠️ Tool result doesn't contain transcript: {list(tool_result.keys()) if isinstance(tool_result, dict) else type(tool_result)}")
-                
-                tool_results.append(f"Tool {tool_call.get('name')} result: {formatted_result}")
-                
-                # If URL content was successfully fetched, stop processing more tool calls
-                # We have what we need, no need to call more tools
-                if url_content_fetched:
-                    logger.info(f"✅ URL content fetched successfully - stopping further tool calls")
-                    break
+                    independent_tools.append(tool_call)
+            
+            # Execute independent tools in parallel
+            if independent_tools:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                with ThreadPoolExecutor(max_workers=min(5, len(independent_tools))) as executor:
+                    futures = {
+                        executor.submit(self._execute_single_tool_with_context, tool_call, question, user_id, channel_id, mentioned_user_id, needs_tools, service_routing, tool_calls_used): idx
+                        for idx, tool_call in enumerate(independent_tools)
+                    }
+                    
+                    independent_results = [None] * len(independent_tools)
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        try:
+                            result = future.result(timeout=30)
+                            if isinstance(result, dict):
+                                formatted_result = self.tool_parser.format_tool_result(
+                                    independent_tools[idx].get("name"),
+                                    result.get("result", result)
+                                )
+                                tool_results.append(f"Tool {independent_tools[idx].get('name')} result: {formatted_result}")
+                        except Exception as e:
+                            logger.error(f"Error executing independent tool: {e}")
+                            tool_results.append(f"ERROR: Tool execution failed: {e}")
+            
+            # Execute dependent tools sequentially (URL tools, etc.)
+            for tool_call in dependent_tools:
+                result = self._execute_single_tool_with_context(tool_call, question, user_id, channel_id, mentioned_user_id, needs_tools, service_routing, tool_calls_used)
+                if isinstance(result, dict):
+                    formatted_result = self.tool_parser.format_tool_result(
+                        tool_call.get("name"),
+                        result.get("result", result)
+                    )
+                    tool_results.append(f"Tool {tool_call.get('name')} result: {formatted_result}")
+                    
+                    tool_name = tool_call.get("name", "")
+                    if tool_name in url_tools:
+                        # Check if URL content was successfully fetched
+                        tool_result = result.get("result", result) if isinstance(result, dict) else {}
+                        if isinstance(tool_result, dict) and not tool_result.get("error"):
+                            url_content_fetched = True
             
             # Check if URL tools were called - if so, prioritize tool results over old context
             url_tools_called = any("summarize_website" in str(result) or "summarize_youtube" in str(result) for result in tool_results)
+            
+            # CRITICAL: Check if generate_image succeeded - if so, skip LLM response and return tool result directly
+            image_generation_succeeded = False
+            for tool_call_entry in tool_calls_used:
+                if tool_call_entry.get("tool") == "generate_image" and tool_call_entry.get("success"):
+                    tool_result = tool_call_entry.get("result", {})
+                    if isinstance(tool_result, dict):
+                        actual_result = tool_result.get("result", tool_result)
+                        if isinstance(actual_result, dict) and actual_result.get("success"):
+                            image_generation_succeeded = True
+                            logger.info(f"🎨 Image generation succeeded - skipping LLM response generation")
+                            # Return a simple success message - the Discord bot will extract image from tool_calls
+                            return "I've generated the image for you!", tool_calls_used
             
             # Always add assistant response to conversation first
             current_messages.append({
@@ -2386,19 +2940,33 @@ Examples:
                     "TRANSCRIPT CONTENT" in str(msg.get("content", "")) or 
                     "VIDEO CONTENT IS BELOW" in str(msg.get("content", "")) or
                     "SMART SUMMARY" in str(msg.get("content", "")) or
+                    "ARTICLE CONTENT" in str(msg.get("content", "")) or
                     "Tool summarize_youtube result" in str(msg.get("content", "")) or
                     "Tool summarize_website result" in str(msg.get("content", ""))
                     for msg in current_messages
                 )
                 
+                # Don't add tool results again if they're already in messages - this causes duplication
+                # The tool_instruction message already contains the tool results
                 if not has_transcript_in_messages:
-                    logger.error(f"⚠️⚠️⚠️ WARNING: Transcript content not found in messages before generating final response!")
-                    # Try to add tool results explicitly
-                    if tool_results:
+                    logger.warning(f"⚠️⚠️⚠️ WARNING: Transcript content not found in messages before generating final response!")
+                    logger.warning(f"   This might cause issues. Tool results should already be in the tool_instruction message.")
+                    # Only add if absolutely necessary and not already present
+                    # Check if tool_instruction message exists with tool results
+                    has_tool_instruction = any(
+                        "Tool execution results" in str(msg.get("content", "")) or
+                        "Tool summarize_youtube result" in str(msg.get("content", "")) or
+                        "Tool summarize_website result" in str(msg.get("content", ""))
+                        for msg in current_messages
+                    )
+                    if tool_results and not has_tool_instruction:
+                        logger.info(f"   Adding tool results explicitly as fallback")
                         current_messages.append({
                             "role": "user",
                             "content": f"Tool execution results:\n" + "\n".join(tool_results)
                         })
+                    else:
+                        logger.info(f"   Tool results already present in messages, skipping duplicate addition")
                 
                 # CRITICAL: Add a final explicit instruction right before generating response
                 # This ensures the LLM sees the instruction immediately before responding

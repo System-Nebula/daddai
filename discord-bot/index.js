@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, Collection, Events, REST, Routes, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { Client, GatewayIntentBits, Collection, Events, REST, Routes, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, AttachmentBuilder } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
@@ -423,6 +423,19 @@ client.on(Events.GuildCreate, async (guild) => {
     }
 });
 
+// Track processed messages to prevent duplicate responses
+const processedMessages = new Set();
+const PROCESSED_MESSAGE_TTL = 60000; // 60 seconds - messages older than this are removed from tracking
+
+// Clean up old processed message IDs periodically
+setInterval(() => {
+    // Keep the set size manageable by clearing old entries
+    // Since we're using message IDs (which are unique), we don't need to track them forever
+    if (processedMessages.size > 1000) {
+        processedMessages.clear();
+    }
+}, 300000); // Every 5 minutes
+
 client.on(Events.MessageCreate, async (message) => {
     // Ignore bot messages
     if (message.author.bot) return;
@@ -434,6 +447,14 @@ client.on(Events.MessageCreate, async (message) => {
     const userId = message.author.id;
     const channelId = message.channel.id;
     
+    // CRITICAL: Prevent duplicate processing of the same message
+    const messageKey = `${message.id}_${channelId}`;
+    if (processedMessages.has(messageKey)) {
+        logger.debug(`⏭️ Skipping duplicate message processing: ${message.id}`);
+        return;
+    }
+    processedMessages.add(messageKey);
+    
     // Rate limiting
     if (!rateLimiter.checkUserLimit(userId, 'messages')) {
         logger.warn('Rate limit exceeded for user', { userId, channelId });
@@ -444,6 +465,14 @@ client.on(Events.MessageCreate, async (message) => {
         // 🤖 AGENTIC ROUTING: Use GopherAgent to intelligently route messages
         const isMentioned = message.mentions.has(client.user);
         const hasAttachments = message.attachments.size > 0;
+        
+        // CRITICAL: Only respond if bot is mentioned (unless it's a direct message)
+        // The bot can be mentioned along with other users, but it must be mentioned for the bot to respond
+        // This prevents the bot from responding to messages that only mention other users
+        if (!isMentioned && message.guild) {
+            // Not mentioned and not a DM - ignore (even if other users are mentioned)
+            return;
+        }
         
         // Get recent messages for context (last 3 messages)
         let recentMessages = [];
@@ -816,6 +845,25 @@ async function handleQuestion(message, routingResult = null) {
             intent.needs_rag = false;
             intent.is_casual = false;
             logger.debug('🌐 URL detected - forcing tools handler (overriding GopherAgent routing)');
+        }
+        
+        // CRITICAL: Check for image generation requests - ALWAYS need tools, even if GopherAgent says casual
+        const imageGenerationPatterns = [
+            /generate\s+(?:an?\s+)?(?:image|picture|artwork|art)/i,
+            /create\s+(?:an?\s+)?(?:image|picture|artwork|art)/i,
+            /make\s+(?:an?\s+)?(?:image|picture|artwork|art)/i,
+            /draw\s+(?:an?\s+)?(?:image|picture|artwork|art)/i,
+            /(?:generate|create|make|draw)\s+(?:character|portrait|artwork|illustration|render|concept\s+art)/i,
+            /(?:character|portrait).*(?:generate|create|make|draw)/i,
+            /(?:side\s+profile|dramatic\s+light|dungeon\s+background).*(?:generate|create|make|draw)/i
+        ];
+        const hasImageGeneration = imageGenerationPatterns.some(pattern => pattern.test(question));
+        if (hasImageGeneration) {
+            handler = 'tools';
+            intent.needs_tools = true;
+            intent.needs_rag = false;
+            intent.is_casual = false;
+            logger.debug('🎨 Image generation detected - forcing tools handler (overriding GopherAgent routing)');
         }
         
         // Remove all Discord user/role/channel mentions for filename detection
@@ -1241,11 +1289,15 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
             // The response will be regenerated with tool calling
         }
         
-        // CRITICAL: If RAG already returned a conversational response, skip all memory retrieval
-        if (isRAGConversationalResponse && !hasUrl) {
-            logger.info(`⏭️ Skipping memory retrieval - RAG already returned conversational response`);
-            // Skip to the end - don't do memory retrieval or simple chat
-        } else if (!response && !needsRAG(question) && !targetDocId && !targetDocFilename && !isCasualConversation && !isStatementOrRequest && !isStateQueryAboutOtherUser && !hasUrl) {
+        // CRITICAL: If RAG already returned ANY response (conversational, tool calls, etc.), skip all memory retrieval and simple chat
+        // The response is already set, so we should proceed directly to sending it
+        // Check if response exists and has an answer OR tool calls
+        const hasRAGResponse = response && (response.answer || (response.tool_calls && response.tool_calls.length > 0));
+        
+        if (hasRAGResponse) {
+            logger.info(`⏭️ Skipping memory retrieval and simple chat - RAG already returned response (answer: ${!!response.answer}, tool_calls: ${response.tool_calls?.length || 0})`);
+            // Response is already set, continue to sending
+        } else if (!response && !needsRAG(question) && !targetDocId && !targetDocFilename && !isCasualConversation && !isStatementOrRequest && !isStateQueryAboutOtherUser && !hasUrl && !isRAGConversationalResponse) {
             // Use original question (with mentions) for needsRAG to detect state queries about other users
             // Only do memory retrieval if we don't have a response yet
             try {
@@ -1309,8 +1361,9 @@ IMPORTANT:
 
 Answer:`;
                     
-                    // Don't overwrite if RAG already returned a conversational response
-                    if (!response || (!response.is_casual_conversation && response.service_routing !== 'chat')) {
+                    // Don't overwrite if RAG already returned ANY response (conversational, tool calls, etc.)
+                    // CRITICAL: Check hasRAGResponse to prevent overwriting RAG responses
+                    if (!hasRAGResponse && (!response || (!response.is_casual_conversation && response.service_routing !== 'chat'))) {
                         const memoryResponse = await Promise.race([
                             chatService.chat(memoryPrompt, []),
                             new Promise((_, reject) => 
@@ -1348,8 +1401,9 @@ Answer:`;
         }
         
         // Use simple chat if RAG not needed or failed, and memory retrieval didn't work
-        // IMPORTANT: Don't overwrite response if it's already set (e.g., from comparison)
-        if (!response) {
+        // IMPORTANT: Don't overwrite response if it's already set (e.g., from comparison, RAG, or memory retrieval)
+        // CRITICAL: Also check if RAG already returned a response to prevent duplicate responses
+        if (!response && !hasRAGResponse) {
             try {
                 // Use cleaned question for chat (mentions removed)
                 const chatResponse = await Promise.race([
@@ -1489,6 +1543,72 @@ Answer:`;
         
         // Send response using embeds with pagination
         let answer = response.answer || '';
+        
+        // CRITICAL: Track if we've already sent a response to prevent duplicates
+        let responseSent = false;
+        
+        // Check for image generation results in tool_calls
+        let imageBuffer = null;
+        let imageFilename = null;
+        if (response.tool_calls && Array.isArray(response.tool_calls)) {
+            logger.debug(`🔍 Checking ${response.tool_calls.length} tool calls for image generation`);
+            for (const toolCall of response.tool_calls) {
+                logger.debug(`🔍 Tool call: tool=${toolCall.tool}, has result=${!!toolCall.result}, has result.result=${!!(toolCall.result && toolCall.result.result)}`);
+                
+                if (toolCall.tool === 'generate_image') {
+                    // Try multiple nested structures to find the result
+                    let toolResult = null;
+                    if (toolCall.result && toolCall.result.result) {
+                        toolResult = toolCall.result.result;
+                    } else if (toolCall.result) {
+                        toolResult = toolCall.result;
+                    }
+                    
+                    if (toolResult && toolResult.success) {
+                        logger.info(`🎨 Found generate_image tool result with success=true`);
+                        // Prefer base64 data (no disk I/O)
+                        if (toolResult.image_base64) {
+                            try {
+                                imageBuffer = Buffer.from(toolResult.image_base64, 'base64');
+                                imageFilename = toolResult.filename || 'generated_image.png';
+                                logger.info(`✅ Successfully decoded base64 image: ${imageFilename} (${imageBuffer.length} bytes)`);
+                                break;
+                            } catch (error) {
+                                logger.error(`❌ Error decoding base64 image: ${error.message}`);
+                            }
+                        }
+                        // Fallback to file path if base64 not available
+                        else if (toolResult.image_path) {
+                            try {
+                                const fs = require('fs');
+                                if (fs.existsSync(toolResult.image_path)) {
+                                    imageBuffer = fs.readFileSync(toolResult.image_path);
+                                    imageFilename = toolResult.filename || 'generated_image.png';
+                                    logger.info(`🎨 Found generated image (file): ${toolResult.image_path}`);
+                                    // Delete the temp file after reading
+                                    try {
+                                        fs.unlinkSync(toolResult.image_path);
+                                        logger.debug(`🗑️ Deleted temp image file: ${toolResult.image_path}`);
+                                    } catch (deleteError) {
+                                        logger.warn(`⚠️ Could not delete temp file: ${deleteError.message}`);
+                                    }
+                                    break;
+                                }
+                            } catch (error) {
+                                logger.error(`❌ Error reading image file: ${error.message}`);
+                            }
+                        } else {
+                            logger.warn(`⚠️ generate_image succeeded but no image_base64 or image_path found in result`);
+                            logger.debug(`   Tool result keys: ${Object.keys(toolResult).join(', ')}`);
+                        }
+                    } else {
+                        logger.debug(`   Tool result success=${toolResult?.success}, error=${toolResult?.error}`);
+                    }
+                }
+            }
+        } else {
+            logger.debug(`🔍 No tool_calls found in response (tool_calls=${response.tool_calls})`);
+        }
         const MAX_EMBED_DESCRIPTION = 4096; // Discord embed description limit
         const PAGINATION_THRESHOLD = 2000; // Use pagination for responses longer than this (better UX)
         
@@ -1619,58 +1739,72 @@ Answer:`;
                 replyOptions.components = [buttons];
             }
             
-            const sentMessage = await message.reply(replyOptions);
-            
-            // Store pagination state (in memory - could be improved with a Map)
-            if (!client.paginationState) {
-                client.paginationState = new Map();
+            // Attach image if available (from buffer, no disk I/O)
+            if (imageBuffer) {
+                try {
+                    const attachment = new AttachmentBuilder(imageBuffer, { name: imageFilename || 'generated_image.png' });
+                    replyOptions.files = [attachment];
+                    logger.info(`📎 Attaching image from memory: ${imageFilename}`);
+                } catch (error) {
+                    logger.error(`❌ Error attaching image: ${error.message}`);
+                }
             }
-            client.paginationState.set(`page_${message.id}`, {
-                pages: pages,
-                currentPage: 0,
-                messageId: sentMessage.id,
-                userId: userId,
-                sourceInfo: {
-                    documents: response.source_documents || [],
-                    memories: response.source_memories || [],
-                    memoryCount: response.memories_used || 0,
-                    chunkCount: response.context_chunks || 0
-                }
-            });
             
-            // Set up button collector
-            const collector = sentMessage.createMessageComponentCollector({
-                filter: (interaction) => {
+            if (!responseSent) {
+                const sentMessage = await message.reply(replyOptions);
+                responseSent = true;
+                
+                // Store pagination state (in memory - could be improved with a Map)
+                if (!client.paginationState) {
+                    client.paginationState = new Map();
+                }
+                client.paginationState.set(`page_${message.id}`, {
+                    pages: pages,
+                    currentPage: 0,
+                    messageId: sentMessage.id,
+                    userId: userId,
+                    sourceInfo: {
+                        documents: response.source_documents || [],
+                        memories: response.source_memories || [],
+                        memoryCount: response.memories_used || 0,
+                        chunkCount: response.context_chunks || 0
+                    }
+                });
+                
+                // Set up button collector
+                const collector = sentMessage.createMessageComponentCollector({
+                    filter: (interaction) => {
+                        const state = client.paginationState.get(`page_${message.id}`);
+                        return state && interaction.user.id === state.userId;
+                    },
+                    time: 300000 // 5 minutes
+                });
+                
+                collector.on('collect', async (interaction) => {
                     const state = client.paginationState.get(`page_${message.id}`);
-                    return state && interaction.user.id === state.userId;
-                },
-                time: 300000 // 5 minutes
-            });
-            
-            collector.on('collect', async (interaction) => {
-                const state = client.paginationState.get(`page_${message.id}`);
-                if (!state) {
-                    await interaction.reply({ content: 'This pagination has expired.', ephemeral: true });
-                    return;
-                }
+                    if (!state) {
+                        await interaction.reply({ content: 'This pagination has expired.', ephemeral: true });
+                        return;
+                    }
+                    
+                    if (interaction.customId === `page_prev_${message.id}`) {
+                        state.currentPage = Math.max(0, state.currentPage - 1);
+                    } else if (interaction.customId === `page_next_${message.id}`) {
+                        state.currentPage = Math.min(state.pages.length - 1, state.currentPage + 1);
+                    }
+                    
+                    const updateOptions = {
+                        embeds: [createEmbed(state.currentPage)],
+                        components: createButtons(state.currentPage) ? [createButtons(state.currentPage)] : []
+                    };
+                    
+                    await interaction.update(updateOptions);
+                });
                 
-                if (interaction.customId === `page_prev_${message.id}`) {
-                    state.currentPage = Math.max(0, state.currentPage - 1);
-                } else if (interaction.customId === `page_next_${message.id}`) {
-                    state.currentPage = Math.min(state.pages.length - 1, state.currentPage + 1);
-                }
-                
-                const updateOptions = {
-                    embeds: [createEmbed(state.currentPage)],
-                    components: createButtons(state.currentPage) ? [createButtons(state.currentPage)] : []
-                };
-                
-                await interaction.update(updateOptions);
-            });
-            
-            collector.on('end', () => {
-                client.paginationState.delete(`page_${message.id}`);
-            });
+                collector.on('end', () => {
+                    client.paginationState.delete(`page_${message.id}`);
+                });
+            }
             
         } else {
             // Single page embed
@@ -1716,10 +1850,26 @@ Answer:`;
                 inline: true
             });
             
-            await message.reply({
+            const replyOptions = {
                 embeds: [embed],
                 allowedMentions: { repliedUser: false }
-            });
+            };
+            
+            // Attach image if available (from buffer, no disk I/O)
+            if (imageBuffer) {
+                try {
+                    const attachment = new AttachmentBuilder(imageBuffer, { name: imageFilename || 'generated_image.png' });
+                    replyOptions.files = [attachment];
+                    logger.info(`📎 Attaching image from memory: ${imageFilename}`);
+                } catch (error) {
+                    logger.error(`❌ Error attaching image: ${error.message}`);
+                }
+            }
+            
+            if (!responseSent) {
+                await message.reply(replyOptions);
+                responseSent = true;
+            }
         }
         
     } catch (error) {
@@ -1902,9 +2052,8 @@ client.on(Events.Disconnect, () => {
     console.log('🔄 Discord.js will attempt to reconnect automatically...');
 });
 
-client.on(Events.Ready, () => {
-    console.log('✅ Bot reconnected and ready!');
-});
+// REMOVED: Events.Ready is an alias for Events.ClientReady in Discord.js v14+
+// Having both causes duplicate initialization. The ClientReady handler already handles this.
 
 // Login
 const token = process.env.DISCORD_TOKEN;

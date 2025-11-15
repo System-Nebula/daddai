@@ -13,11 +13,37 @@ class GopherAgent {
         this.cache = new Map();
         this.cacheTTL = 5 * 60 * 1000; // 5 minutes
         this.pendingRequests = new Map();
-        this.timeout = 15000; // 15 second timeout (increased for LLM inference overhead)
+        this.timeout = 60000; // 60 second timeout (increased for LLM inference overhead)
         
         // Try HTTP server first (faster), fallback to subprocess
         this.useHttpServer = process.env.GOPHER_AGENT_HTTP === 'true';
         this.httpBaseUrl = process.env.GOPHER_AGENT_URL || 'http://localhost:8765';
+        
+        // OPTIMIZED: Create HTTP client with connection pooling
+        if (this.useHttpServer) {
+            const axios = require('axios');
+            const http = require('http');
+            const https = require('https');
+            
+            this.httpClient = axios.create({
+                baseURL: this.httpBaseUrl,
+                timeout: this.timeout,
+                headers: { 'Content-Type': 'application/json' },
+                // OPTIMIZED: Connection pooling
+                httpAgent: new http.Agent({
+                    keepAlive: true,
+                    keepAliveMsecs: 1000,
+                    maxSockets: 10,
+                    maxFreeSockets: 5
+                }),
+                httpsAgent: new https.Agent({
+                    keepAlive: true,
+                    keepAliveMsecs: 1000,
+                    maxSockets: 10,
+                    maxFreeSockets: 5
+                })
+            });
+        }
         
         logger.info(`🤖 GopherAgent initialized (mode: ${this.useHttpServer ? 'HTTP' : 'subprocess'})`);
     }
@@ -68,8 +94,8 @@ class GopherAgent {
             this.pendingRequests.delete(cacheKey);
             // If timeout, return fallback result instead of throwing
             if (error.code === 'TIMEOUT' || error.message.includes('timeout')) {
-                logger.warn(`GopherAgent ${method} timeout, using fallback`);
-                return this._getFallbackResult(message, context, method);
+                logger.warn(`GopherAgent timeout, using fallback`);
+                return this._getFallbackResult(message, context, 'classify_intent');
             }
             throw error;
         }
@@ -83,41 +109,77 @@ class GopherAgent {
      * @returns {Promise<Object>} Routing result
      */
     async routeMessage(message, context = {}, intentResult = null) {
-        // Get intent if not provided
-        if (!intentResult) {
-            intentResult = await this.classifyIntent(message, context);
+        // CRITICAL: Add deduplication for routeMessage as well
+        const cacheKey = this._getCacheKey(message, context) + '_route';
+        const cached = this.cache.get(cacheKey);
+        if (cached && Date.now() - cached.timestamp < this.cacheTTL) {
+            logger.debug('GopherAgent routeMessage cache hit');
+            return { ...cached.data, cached: true };
         }
         
-        // Route based on intent
-        const intent = intentResult.intent || 'ignore';
-        const routing = intentResult.routing || 'chat';
-        const shouldRespond = intentResult.should_respond !== false;
-        
-        // Determine handler
-        let handler = 'ignore';
-        if (!shouldRespond) {
-            handler = 'ignore';
-        } else if (intent === 'upload' || context.hasAttachments) {
-            handler = 'upload';
-        } else if (intent === 'action' || routing === 'action') {
-            handler = 'action';
-        } else if (routing === 'rag' || intentResult.needs_rag) {
-            handler = 'rag';
-        } else if (routing === 'tools' || intentResult.needs_tools) {
-            handler = 'tools';
-        } else if (routing === 'memory' || intentResult.needs_memory) {
-            handler = 'memory';
-        } else if (routing === 'chat' || intent === 'casual') {
-            handler = 'chat';
-        } else {
-            handler = 'chat'; // Default fallback
+        // Check if request is already pending (deduplication)
+        if (this.pendingRequests.has(cacheKey)) {
+            logger.debug('GopherAgent routeMessage request deduplication');
+            return await this.pendingRequests.get(cacheKey);
         }
         
-        return {
-            handler,
-            intent: intentResult,
-            routing_confidence: intentResult.confidence || 0.5
-        };
+        // Create routing promise
+        const routePromise = (async () => {
+            // Get intent if not provided
+            if (!intentResult) {
+                intentResult = await this.classifyIntent(message, context);
+            }
+            
+            // Route based on intent
+            const intent = intentResult.intent || 'ignore';
+            const routing = intentResult.routing || 'chat';
+            const shouldRespond = intentResult.should_respond !== false;
+            
+            // Determine handler
+            let handler = 'ignore';
+            if (!shouldRespond) {
+                handler = 'ignore';
+            } else if (intent === 'upload' || context.hasAttachments) {
+                handler = 'upload';
+            } else if (intent === 'action' || routing === 'action') {
+                handler = 'action';
+            } else if (routing === 'rag' || intentResult.needs_rag) {
+                handler = 'rag';
+            } else if (routing === 'tools' || intentResult.needs_tools) {
+                handler = 'tools';
+            } else if (routing === 'memory' || intentResult.needs_memory) {
+                handler = 'memory';
+            } else if (routing === 'chat' || intent === 'casual') {
+                handler = 'chat';
+            } else {
+                handler = 'chat'; // Default fallback
+            }
+            
+            const result = {
+                handler,
+                intent: intentResult,
+                routing_confidence: intentResult.confidence || 0.5
+            };
+            
+            // Cache result
+            this.cache.set(cacheKey, {
+                data: result,
+                timestamp: Date.now()
+            });
+            
+            return result;
+        })();
+        
+        this.pendingRequests.set(cacheKey, routePromise);
+        
+        try {
+            const result = await routePromise;
+            this.pendingRequests.delete(cacheKey);
+            return { ...result, cached: false };
+        } catch (error) {
+            this.pendingRequests.delete(cacheKey);
+            throw error;
+        }
     }
     
     /**
@@ -161,10 +223,10 @@ class GopherAgent {
     
     /**
      * Call GopherAgent via HTTP (faster)
+     * OPTIMIZED: Uses connection pooling
      * @private
      */
     async _callHttpAgent(method, params) {
-        const axios = require('axios');
         const endpoint = method === 'classify_intent' ? '/classify_intent' :
                         method === 'route_message' ? '/route_message' :
                         method === 'get_metrics' ? '/get_metrics' : null;
@@ -174,15 +236,24 @@ class GopherAgent {
         }
         
         try {
-            const response = await axios.post(`${this.httpBaseUrl}${endpoint}`, params, {
-                timeout: this.timeout,
-                headers: { 'Content-Type': 'application/json' }
+            // OPTIMIZED: Use pooled HTTP client with timeout
+            // CRITICAL: Use Promise.race to prevent both HTTP and subprocess from completing
+            const httpPromise = this.httpClient.post(endpoint, params);
+            const timeoutPromise = new Promise((_, reject) => {
+                setTimeout(() => reject(new Error('HTTP timeout')), this.timeout);
             });
+            
+            const response = await Promise.race([httpPromise, timeoutPromise]);
             return response.data;
         } catch (error) {
-            logger.warn(`GopherAgent HTTP call failed, falling back to subprocess: ${error.message}`);
-            // Fallback to subprocess
-            return this._callSubprocessAgent(method, params);
+            // Only fallback if it's a real error (not just timeout from race)
+            if (error.message === 'HTTP timeout' || error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
+                logger.warn(`GopherAgent HTTP call failed (${error.message}), falling back to subprocess`);
+                // Fallback to subprocess
+                return this._callSubprocessAgent(method, params);
+            }
+            // Re-throw other errors
+            throw error;
         }
     }
     

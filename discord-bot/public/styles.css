@@ -1741,4 +1741,39 @@ select:focus-visible {
 .document-card {
     will-change: transform;
     contain: layout style paint;
+    content-visibility: auto;
+}
+
+/* Smooth scrolling */
+.content-area {
+    scroll-behavior: smooth;
+    -webkit-overflow-scrolling: touch;
+}
+
+/* ============================================
+   Skeleton Loading States
+   ============================================ */
+
+.skeleton {
+    background: linear-gradient(
+        90deg,
+        var(--bg-tertiary) 0%,
+        var(--surface1) 50%,
+        var(--bg-tertiary) 100%
+    );
+    background-size: 200% 100%;
+    animation: skeleton-loading 1.5s ease-in-out infinite;
+    border-radius: var(--radius-md);
+}
+
+@keyframes skeleton-loading {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+
+.memory-card.skeleton,
+.document-card.skeleton {
+    height: 120px;
+    margin-bottom: var(--spacing-sm);
+    border-bottom: 1px solid var(--border-color);
 }

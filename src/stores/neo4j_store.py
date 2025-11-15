@@ -6,7 +6,8 @@ from neo4j import GraphDatabase
 import numpy as np
 from config import (
     NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, EMBEDDING_DIMENSION,
-    NEO4J_MAX_CONNECTION_LIFETIME, NEO4J_MAX_CONNECTION_POOL_SIZE
+    NEO4J_MAX_CONNECTION_LIFETIME, NEO4J_MAX_CONNECTION_POOL_SIZE,
+    NEO4J_CONNECTION_ACQUISITION_TIMEOUT
 )
 from logger_config import logger
 
@@ -29,7 +30,7 @@ class Neo4jStore:
                 auth=(user, password),
                 max_connection_lifetime=NEO4J_MAX_CONNECTION_LIFETIME,
                 max_connection_pool_size=NEO4J_MAX_CONNECTION_POOL_SIZE,
-                connection_acquisition_timeout=30.0
+                connection_acquisition_timeout=NEO4J_CONNECTION_ACQUISITION_TIMEOUT
             )
             # Verify connectivity
             self.driver.verify_connectivity()
@@ -52,6 +53,15 @@ class Neo4jStore:
             except Exception as e:
                 # Constraints might already exist
                 logger.debug(f"Constraint creation (may already exist): {e}")
+            
+            # Create performance indexes for common queries
+            try:
+                session.run("CREATE INDEX document_file_name IF NOT EXISTS FOR (d:Document) ON (d.file_name)")
+                session.run("CREATE INDEX document_file_type IF NOT EXISTS FOR (d:Document) ON (d.file_type)")
+                session.run("CREATE INDEX chunk_doc_relationship IF NOT EXISTS FOR ()-[r:CONTAINS]-() ON type(r)")
+                logger.info("Performance indexes created successfully")
+            except Exception as e:
+                logger.debug(f"Index creation (may already exist): {e}")
             
             # Try to create vector index (Neo4j 5.x+ with vector plugin)
             try:
@@ -116,25 +126,24 @@ class Neo4jStore:
                         'embedding': embedding
                     })
                 
-                # Batch create chunks for better performance
-                for chunk_data in chunks_data:
+                # OPTIMIZED: Batch create all chunks at once using UNWIND
+                if chunks_data:
+                    # Add doc_id to each chunk data for UNWIND
+                    for chunk_data in chunks_data:
+                        chunk_data['doc_id'] = doc_id
+                    
                     session.run("""
+                        UNWIND $chunks_data AS chunk_data
                         CREATE (c:Chunk {
-                            id: $chunk_id,
-                            text: $text,
-                            chunk_index: $chunk_index,
-                            embedding: $embedding
+                            id: chunk_data.chunk_id,
+                            text: chunk_data.text,
+                            chunk_index: chunk_data.chunk_index,
+                            embedding: chunk_data.embedding
                         })
-                        WITH c
-                        MATCH (d:Document {id: $doc_id})
+                        WITH c, chunk_data.doc_id AS doc_id
+                        MATCH (d:Document {id: doc_id})
                         CREATE (d)-[:CONTAINS]->(c)
-                    """,
-                        chunk_id=chunk_data['chunk_id'],
-                        text=chunk_data['text'],
-                        chunk_index=chunk_data['chunk_index'],
-                        embedding=chunk_data['embedding'],
-                        doc_id=doc_id
-                    )
+                    """, chunks_data=chunks_data)
             
             logger.info(f"Stored document {doc_id} with {len(chunks_data)} chunks")
             return doc_id
@@ -193,9 +202,12 @@ class Neo4jStore:
                         self.use_vector_index = False
                 
                 # Fallback: Calculate cosine similarity manually (optimized with vectorized operations)
+                # OPTIMIZED: Use LIMIT early to reduce data transfer
                 result = session.run("""
                     MATCH (c:Chunk)<-[:CONTAINS]-(d:Document)
                     WHERE c.embedding IS NOT NULL
+                    WITH c, d
+                    LIMIT 10000
                     RETURN c.text AS text,
                            c.chunk_index AS chunk_index,
                            c.id AS chunk_id,
@@ -251,7 +263,7 @@ class Neo4jStore:
             raise
     
     def get_all_documents(self) -> List[Dict[str, Any]]:
-        """Get all stored documents."""
+        """Get all stored documents. OPTIMIZED: Uses index on file_name."""
         try:
             with self.driver.session() as session:
                 result = session.run("""
@@ -260,6 +272,7 @@ class Neo4jStore:
                            d.file_name AS file_name,
                            d.file_path AS file_path,
                            d.file_type AS file_type
+                    ORDER BY d.file_name
                 """)
                 
                 return [dict(record) for record in result]

@@ -47,10 +47,12 @@ class LLMToolRegistry:
     def __init__(self):
         """Initialize tool registry."""
         self.tools: Dict[str, LLMTool] = {}
+        self._schema_cache = None  # OPTIMIZED: Cache schema
     
     def register_tool(self, tool: LLMTool):
-        """Register a tool."""
+        """Register a tool. OPTIMIZED: Invalidate cache."""
         self.tools[tool.name] = tool
+        self._schema_cache = None  # Invalidate cache
     
     def get_tool(self, name: str) -> Optional[LLMTool]:
         """Get a tool by name."""
@@ -61,7 +63,11 @@ class LLMToolRegistry:
         return list(self.tools.values())
     
     def get_tools_schema(self) -> List[Dict[str, Any]]:
-        """Get JSON schema for all tools (for LLM)."""
+        """Get JSON schema for all tools (for LLM). OPTIMIZED: Cached."""
+        # Return cached schema if tools haven't changed
+        if self._schema_cache is not None:
+            return self._schema_cache
+        
         schemas = []
         for tool in self.tools.values():
             schemas.append({
@@ -72,6 +78,8 @@ class LLMToolRegistry:
                     "parameters": tool.parameters
                 }
             })
+        
+        self._schema_cache = schemas
         return schemas
 
 
@@ -82,6 +90,17 @@ class LLMToolExecutor:
         """Initialize tool executor."""
         self.registry = tool_registry
         self.execution_history: List[Dict[str, Any]] = []
+        
+        # OPTIMIZED: Add result caching
+        from cachetools import TTLCache
+        from config import CACHE_ENABLED, CACHE_TTL_SECONDS
+        if CACHE_ENABLED:
+            self.result_cache = TTLCache(maxsize=100, ttl=CACHE_TTL_SECONDS // 2)  # 30 min cache
+        else:
+            self.result_cache = {}
+        
+        # OPTIMIZED: Cache function signatures
+        self._signature_cache = {}
     
     def execute_tool_call(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -115,26 +134,46 @@ class LLMToolExecutor:
         # Log arguments after mapping for debugging
         logger.debug(f"Tool {tool_name} arguments after alias mapping: {list(arguments.keys())}")
         
-        # Filter out unexpected parameters by checking function signature
+        # OPTIMIZED: Check cache for cacheable tools
+        cacheable_tools = ["summarize_youtube", "summarize_website", "search_documents", "get_memories"]
+        if tool_name in cacheable_tools and self.result_cache:
+            cache_key = self._get_tool_cache_key(tool_name, arguments)
+            if cache_key in self.result_cache:
+                logger.debug(f"Tool {tool_name} cache hit")
+                cached_result = self.result_cache[cache_key].copy()
+                cached_result["cached"] = True
+                return cached_result
+        
+        # OPTIMIZED: Use cached signature
         import inspect
-        try:
-            sig = inspect.signature(tool.function)
-            valid_params = set(sig.parameters.keys())
+        valid_params = None
+        if tool_name not in self._signature_cache:
+            try:
+                sig = inspect.signature(tool.function)
+                valid_params = set(sig.parameters.keys())
+                self._signature_cache[tool_name] = valid_params
+            except Exception as e:
+                logger.debug(f"Could not inspect function signature for {tool_name}: {e}")
+                self._signature_cache[tool_name] = None
+        else:
+            valid_params = self._signature_cache[tool_name]
+        
+        # Filter arguments using cached signature
+        if valid_params:
             logger.debug(f"Tool {tool_name} valid parameters from signature: {valid_params}")
-            
-            # Filter arguments to only include valid parameters
             filtered_arguments = {k: v for k, v in arguments.items() if k in valid_params}
             
             # Log if we filtered anything (for debugging)
             filtered_out = set(arguments.keys()) - valid_params
             if filtered_out:
-                logger.warning(f"⚠️ Filtered out unexpected parameters for {tool_name}: {filtered_out}. Valid params: {valid_params}")
+                # Don't warn for generate_image - we intentionally filter out user_id/channel_id
+                if tool_name != "generate_image":
+                    logger.warning(f"⚠️ Filtered out unexpected parameters for {tool_name}: {filtered_out}. Valid params: {valid_params}")
+                else:
+                    logger.debug(f"Filtered out context parameters for {tool_name}: {filtered_out}")
             
             arguments = filtered_arguments
             logger.debug(f"Tool {tool_name} arguments after filtering: {list(arguments.keys())}")
-        except Exception as e:
-            logger.debug(f"Could not inspect function signature for {tool_name}: {e}")
-            # Continue with original arguments if inspection fails
         
         # Validate required parameters
         required_params = tool.parameters.get("required", [])
@@ -164,10 +203,17 @@ class LLMToolExecutor:
             }
             self.execution_history.append(execution_record)
             
-            return {
+            tool_result = {
                 "tool_name": tool_name,
                 "result": result
             }
+            
+            # OPTIMIZED: Cache result for cacheable tools
+            if tool_name in cacheable_tools and self.result_cache and "error" not in result:
+                cache_key = self._get_tool_cache_key(tool_name, arguments)
+                self.result_cache[cache_key] = tool_result.copy()
+            
+            return tool_result
         except TypeError as e:
             # Enhanced error recovery: try to infer missing parameters from context
             error_msg = str(e)
@@ -205,12 +251,80 @@ class LLMToolExecutor:
             }
     
     def execute_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Execute multiple tool calls."""
-        results = []
+        """
+        Execute multiple tool calls.
+        OPTIMIZED: Execute independent tools in parallel.
+        """
+        if len(tool_calls) == 1:
+            return [self.execute_tool_call(tool_calls[0])]
+        
+        # Group tools by dependencies
+        # Tools that can run in parallel vs those that depend on others
+        independent_tools = []
+        dependent_tools = []
+        
+        # URL tools should run sequentially (to avoid duplicate fetches)
+        # Other tools can run in parallel
+        url_tools = ["summarize_youtube", "summarize_website"]
+        
         for tool_call in tool_calls:
-            result = self.execute_tool_call(tool_call)
-            results.append(result)
+            tool_name = tool_call.get("name", "")
+            if tool_name in url_tools:
+                dependent_tools.append(tool_call)
+            else:
+                independent_tools.append(tool_call)
+        
+        results = []
+        
+        # Execute independent tools in parallel
+        if independent_tools:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=min(5, len(independent_tools))) as executor:
+                futures = {
+                    executor.submit(self.execute_tool_call, tool_call): idx
+                    for idx, tool_call in enumerate(independent_tools)
+                }
+                
+                independent_results = [None] * len(independent_tools)
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        independent_results[idx] = future.result(timeout=30)
+                    except Exception as e:
+                        logger.error(f"Error executing independent tool {idx}: {e}")
+                        independent_results[idx] = {
+                            "error": str(e),
+                            "tool_name": independent_tools[idx].get("name", "unknown")
+                        }
+                
+                results.extend(independent_results)
+        
+        # Execute dependent tools sequentially (URL tools, etc.)
+        for tool_call in dependent_tools:
+            try:
+                result = self.execute_tool_call(tool_call)
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Error executing dependent tool: {e}")
+                results.append({
+                    "error": str(e),
+                    "tool_name": tool_call.get("name", "unknown")
+                })
+        
         return results
+    
+    def _get_tool_cache_key(self, tool_name: str, arguments: Dict[str, Any]) -> str:
+        """Generate cache key for tool call."""
+        import hashlib
+        import json
+        
+        # Normalize arguments for cache key
+        cache_data = {
+            "tool": tool_name,
+            "args": sorted(arguments.items())
+        }
+        cache_str = json.dumps(cache_data, sort_keys=True)
+        return hashlib.md5(cache_str.encode()).hexdigest()
     
     def _map_parameter_aliases(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -528,6 +642,33 @@ class LLMToolParser:
                     formatted += f"\nNote: Content saved to document store (doc_id: {result.get('doc_id')}).\n"
                 
                 return formatted
+            
+            # Special formatting for image generation
+            if tool_name == "generate_image":
+                if result.get("success"):
+                    image_path = result.get("image_path", "")
+                    filename = result.get("filename", "generated_image.png")
+                    prompt = result.get("prompt", "")
+                    
+                    formatted = f"✅✅✅ SUCCESS: Image Generated Successfully! ✅✅✅\n\n"
+                    formatted += f"**Prompt:** {prompt}\n"
+                    formatted += f"**Image Path:** {image_path}\n"
+                    formatted += f"**Filename:** {filename}\n"
+                    formatted += f"\n🎨 The image has been generated and saved. The image file path is: {image_path}\n"
+                    formatted += f"📎 IMPORTANT: The bot should attach this image file to the Discord message.\n"
+                    
+                    # Include metadata
+                    if result.get("width"):
+                        formatted += f"**Dimensions:** {result.get('width')}x{result.get('height')}\n"
+                    if result.get("steps"):
+                        formatted += f"**Steps:** {result.get('steps')}\n"
+                    if result.get("seed"):
+                        formatted += f"**Seed:** {result.get('seed')}\n"
+                    
+                    return formatted
+                else:
+                    error_msg = result.get("error", "Unknown error")
+                    return f"❌ Image generation failed: {error_msg}\n\nPlease inform the user that the image could not be generated."
             
             # Default: return JSON for other tools
             return json.dumps(result, indent=2)
@@ -905,45 +1046,39 @@ def create_rag_tools(pipeline) -> LLMToolRegistry:
                         # Also handle YouTube transcripts which might be continuous text
                         chunks = []
                         
+                        # Remove markdown headers to get to the actual content
+                        # Extract transcript/content section if it exists
+                        content_section = text
+                        if "## Transcript" in text:
+                            content_section = text.split("## Transcript")[-1].strip()
+                        elif "# YouTube Video Transcript" in text or "# " in text:
+                            # Skip header lines
+                            lines = text.split('\n')
+                            content_start = 0
+                            for i, line in enumerate(lines):
+                                if line.strip() and not line.strip().startswith('#') and not line.strip().startswith('**') and not line.strip().startswith('---'):
+                                    content_start = i
+                                    break
+                            content_section = '\n'.join(lines[content_start:]).strip()
+                        
                         # First try splitting by double newlines (paragraphs)
-                        paragraphs = re.split(r'\n\s*\n', text)
+                        paragraphs = re.split(r'\n\s*\n', content_section)
                         
-                        # If that doesn't create enough chunks, also split by single newlines
-                        if len(paragraphs) < 3 and len(text) > self.chunk_size * 2:
-                            # Split by single newlines or periods followed by space
-                            paragraphs = re.split(r'(?<=[.!?])\s+|\n+', text)
-                        
-                        current_chunk = ""
-                        chunk_index = 0
-                        
-                        for para in paragraphs:
-                            para = para.strip()
-                            if not para or len(para) < 10:  # Skip very short paragraphs
-                                continue
+                        # If that doesn't create enough chunks, split by sentences instead
+                        if len(paragraphs) < 3 or (len(content_section) > self.chunk_size * 3 and len(paragraphs) < len(content_section) / self.chunk_size):
+                            # Split by sentences (periods, exclamation, question marks followed by space)
+                            sentences = re.split(r'(?<=[.!?])\s+', content_section)
+                            # Group sentences into chunks
+                            current_chunk = ""
+                            chunk_index = 0
                             
-                            # If paragraph itself is larger than chunk_size, split it further
-                            if len(para) > self.chunk_size:
-                                # Split large paragraph by sentences
-                                sentences = re.split(r'(?<=[.!?])\s+', para)
-                                for sentence in sentences:
-                                    sentence = sentence.strip()
-                                    if not sentence:
-                                        continue
-                                    
-                                    if len(current_chunk) + len(sentence) + 2 > self.chunk_size and current_chunk:
-                                        chunks.append({
-                                            'text': current_chunk.strip(),
-                                            'chunk_index': chunk_index
-                                        })
-                                        chunk_index += 1
-                                        # Start new chunk with overlap
-                                        overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
-                                        current_chunk = overlap_text + ' ' + sentence
-                                    else:
-                                        current_chunk += ' ' + sentence if current_chunk else sentence
-                            else:
-                                # Normal paragraph processing
-                                if len(current_chunk) + len(para) + 2 > self.chunk_size and current_chunk:
+                            for sentence in sentences:
+                                sentence = sentence.strip()
+                                if not sentence or len(sentence) < 5:
+                                    continue
+                                
+                                # If adding this sentence would exceed chunk_size, save current chunk
+                                if len(current_chunk) + len(sentence) + 2 > self.chunk_size and current_chunk:
                                     chunks.append({
                                         'text': current_chunk.strip(),
                                         'chunk_index': chunk_index
@@ -951,17 +1086,66 @@ def create_rag_tools(pipeline) -> LLMToolRegistry:
                                     chunk_index += 1
                                     # Start new chunk with overlap
                                     overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
-                                    current_chunk = overlap_text + '\n\n' + para
+                                    current_chunk = overlap_text + ' ' + sentence
                                 else:
-                                    current_chunk += '\n\n' + para if current_chunk else para
+                                    current_chunk += ' ' + sentence if current_chunk else sentence
+                            
+                            if current_chunk:
+                                chunks.append({
+                                    'text': current_chunk.strip(),
+                                    'chunk_index': chunk_index
+                                })
+                        else:
+                            # Use paragraph-based chunking
+                            current_chunk = ""
+                            chunk_index = 0
+                            
+                            for para in paragraphs:
+                                para = para.strip()
+                                if not para or len(para) < 10:  # Skip very short paragraphs
+                                    continue
+                                
+                                # If paragraph itself is larger than chunk_size, split it further
+                                if len(para) > self.chunk_size:
+                                    # Split large paragraph by sentences
+                                    sentences = re.split(r'(?<=[.!?])\s+', para)
+                                    for sentence in sentences:
+                                        sentence = sentence.strip()
+                                        if not sentence:
+                                            continue
+                                        
+                                        if len(current_chunk) + len(sentence) + 2 > self.chunk_size and current_chunk:
+                                            chunks.append({
+                                                'text': current_chunk.strip(),
+                                                'chunk_index': chunk_index
+                                            })
+                                            chunk_index += 1
+                                            # Start new chunk with overlap
+                                            overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
+                                            current_chunk = overlap_text + ' ' + sentence
+                                        else:
+                                            current_chunk += ' ' + sentence if current_chunk else sentence
+                                else:
+                                    # Normal paragraph processing
+                                    if len(current_chunk) + len(para) + 2 > self.chunk_size and current_chunk:
+                                        chunks.append({
+                                            'text': current_chunk.strip(),
+                                            'chunk_index': chunk_index
+                                        })
+                                        chunk_index += 1
+                                        # Start new chunk with overlap
+                                        overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
+                                        current_chunk = overlap_text + '\n\n' + para
+                                    else:
+                                        current_chunk += '\n\n' + para if current_chunk else para
+                            
+                            if current_chunk:
+                                chunks.append({
+                                    'text': current_chunk.strip(),
+                                    'chunk_index': chunk_index
+                                })
                         
-                        if current_chunk:
-                            chunks.append({
-                                'text': current_chunk.strip(),
-                                'chunk_index': chunk_index
-                            })
-                        
-                        logger.info(f"📝 Created {len(chunks)} chunks from document ({len(text)} chars)")
+                        logger.info(f"📝 Created {len(chunks)} chunks from document ({len(text)} chars, content section: {len(content_section)} chars)")
                         
                         return {
                             'text': text,
@@ -1103,45 +1287,39 @@ def create_rag_tools(pipeline) -> LLMToolRegistry:
                         # Also handle YouTube transcripts which might be continuous text
                         chunks = []
                         
+                        # Remove markdown headers to get to the actual content
+                        # Extract transcript/content section if it exists
+                        content_section = text
+                        if "## Transcript" in text:
+                            content_section = text.split("## Transcript")[-1].strip()
+                        elif "# YouTube Video Transcript" in text or "# " in text:
+                            # Skip header lines
+                            lines = text.split('\n')
+                            content_start = 0
+                            for i, line in enumerate(lines):
+                                if line.strip() and not line.strip().startswith('#') and not line.strip().startswith('**') and not line.strip().startswith('---'):
+                                    content_start = i
+                                    break
+                            content_section = '\n'.join(lines[content_start:]).strip()
+                        
                         # First try splitting by double newlines (paragraphs)
-                        paragraphs = re.split(r'\n\s*\n', text)
+                        paragraphs = re.split(r'\n\s*\n', content_section)
                         
-                        # If that doesn't create enough chunks, also split by single newlines
-                        if len(paragraphs) < 3 and len(text) > self.chunk_size * 2:
-                            # Split by single newlines or periods followed by space
-                            paragraphs = re.split(r'(?<=[.!?])\s+|\n+', text)
-                        
-                        current_chunk = ""
-                        chunk_index = 0
-                        
-                        for para in paragraphs:
-                            para = para.strip()
-                            if not para or len(para) < 10:  # Skip very short paragraphs
-                                continue
+                        # If that doesn't create enough chunks, split by sentences instead
+                        if len(paragraphs) < 3 or (len(content_section) > self.chunk_size * 3 and len(paragraphs) < len(content_section) / self.chunk_size):
+                            # Split by sentences (periods, exclamation, question marks followed by space)
+                            sentences = re.split(r'(?<=[.!?])\s+', content_section)
+                            # Group sentences into chunks
+                            current_chunk = ""
+                            chunk_index = 0
                             
-                            # If paragraph itself is larger than chunk_size, split it further
-                            if len(para) > self.chunk_size:
-                                # Split large paragraph by sentences
-                                sentences = re.split(r'(?<=[.!?])\s+', para)
-                                for sentence in sentences:
-                                    sentence = sentence.strip()
-                                    if not sentence:
-                                        continue
-                                    
-                                    if len(current_chunk) + len(sentence) + 2 > self.chunk_size and current_chunk:
-                                        chunks.append({
-                                            'text': current_chunk.strip(),
-                                            'chunk_index': chunk_index
-                                        })
-                                        chunk_index += 1
-                                        # Start new chunk with overlap
-                                        overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
-                                        current_chunk = overlap_text + ' ' + sentence
-                                    else:
-                                        current_chunk += ' ' + sentence if current_chunk else sentence
-                            else:
-                                # Normal paragraph processing
-                                if len(current_chunk) + len(para) + 2 > self.chunk_size and current_chunk:
+                            for sentence in sentences:
+                                sentence = sentence.strip()
+                                if not sentence or len(sentence) < 5:
+                                    continue
+                                
+                                # If adding this sentence would exceed chunk_size, save current chunk
+                                if len(current_chunk) + len(sentence) + 2 > self.chunk_size and current_chunk:
                                     chunks.append({
                                         'text': current_chunk.strip(),
                                         'chunk_index': chunk_index
@@ -1149,17 +1327,66 @@ def create_rag_tools(pipeline) -> LLMToolRegistry:
                                     chunk_index += 1
                                     # Start new chunk with overlap
                                     overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
-                                    current_chunk = overlap_text + '\n\n' + para
+                                    current_chunk = overlap_text + ' ' + sentence
                                 else:
-                                    current_chunk += '\n\n' + para if current_chunk else para
+                                    current_chunk += ' ' + sentence if current_chunk else sentence
+                            
+                            if current_chunk:
+                                chunks.append({
+                                    'text': current_chunk.strip(),
+                                    'chunk_index': chunk_index
+                                })
+                        else:
+                            # Use paragraph-based chunking
+                            current_chunk = ""
+                            chunk_index = 0
+                            
+                            for para in paragraphs:
+                                para = para.strip()
+                                if not para or len(para) < 10:  # Skip very short paragraphs
+                                    continue
+                                
+                                # If paragraph itself is larger than chunk_size, split it further
+                                if len(para) > self.chunk_size:
+                                    # Split large paragraph by sentences
+                                    sentences = re.split(r'(?<=[.!?])\s+', para)
+                                    for sentence in sentences:
+                                        sentence = sentence.strip()
+                                        if not sentence:
+                                            continue
+                                        
+                                        if len(current_chunk) + len(sentence) + 2 > self.chunk_size and current_chunk:
+                                            chunks.append({
+                                                'text': current_chunk.strip(),
+                                                'chunk_index': chunk_index
+                                            })
+                                            chunk_index += 1
+                                            # Start new chunk with overlap
+                                            overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
+                                            current_chunk = overlap_text + ' ' + sentence
+                                        else:
+                                            current_chunk += ' ' + sentence if current_chunk else sentence
+                                else:
+                                    # Normal paragraph processing
+                                    if len(current_chunk) + len(para) + 2 > self.chunk_size and current_chunk:
+                                        chunks.append({
+                                            'text': current_chunk.strip(),
+                                            'chunk_index': chunk_index
+                                        })
+                                        chunk_index += 1
+                                        # Start new chunk with overlap
+                                        overlap_text = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
+                                        current_chunk = overlap_text + '\n\n' + para
+                                    else:
+                                        current_chunk += '\n\n' + para if current_chunk else para
+                            
+                            if current_chunk:
+                                chunks.append({
+                                    'text': current_chunk.strip(),
+                                    'chunk_index': chunk_index
+                                })
                         
-                        if current_chunk:
-                            chunks.append({
-                                'text': current_chunk.strip(),
-                                'chunk_index': chunk_index
-                            })
-                        
-                        logger.info(f"📝 Created {len(chunks)} chunks from document ({len(text)} chars)")
+                        logger.info(f"📝 Created {len(chunks)} chunks from document ({len(text)} chars, content section: {len(content_section)} chars)")
                         
                         return {
                             'text': text,
@@ -1223,6 +1450,79 @@ def create_rag_tools(pipeline) -> LLMToolRegistry:
             "required": ["url"]
         },
         function=summarize_youtube_wrapper
+    ))
+    
+    # Tool: Generate image
+    def generate_image_wrapper(
+        prompt: str,
+        negative_prompt: str = "bad hands, blurry, low quality, distorted",
+        width: int = 512,
+        height: int = 512,
+        steps: int = 20,
+        cfg: float = 8.0,
+        seed: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Wrapper for image generation tool.
+        Generates images using RunPod API with Stable Diffusion 1.5 + LoRA.
+        """
+        from src.tools.image_generation_tool import generate_image
+        
+        result = generate_image(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=width,
+            height=height,
+            steps=steps,
+            cfg=cfg,
+            seed=seed
+        )
+        
+        return result
+    
+    registry.register_tool(LLMTool(
+        name="generate_image",
+        description="Generate an image using AI image generation (Stable Diffusion 1.5 + LoRA). Use this tool when users ask to generate, create, make, or draw an image, picture, artwork, or visual content. IMPORTANT: This is the ONLY tool for image generation. DO NOT create dynamic tool names like 'create_dwarf_image' or 'generate_cat_image' - always use 'generate_image' and put the description in the 'prompt' parameter. Returns the path to the generated image file that can be sent to Discord.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Detailed description of what to generate. Be specific about style, composition, colors, mood, and details."
+                },
+                "negative_prompt": {
+                    "type": "string",
+                    "description": "Things to avoid in the image (e.g., 'bad hands, blurry, low quality'). Default: 'bad hands, blurry, low quality, distorted'",
+                    "default": "bad hands, blurry, low quality, distorted"
+                },
+                "width": {
+                    "type": "integer",
+                    "description": "Image width in pixels (default: 512)",
+                    "default": 512
+                },
+                "height": {
+                    "type": "integer",
+                    "description": "Image height in pixels (default: 512)",
+                    "default": 512
+                },
+                "steps": {
+                    "type": "integer",
+                    "description": "Number of sampling steps (default: 20, higher = better quality but slower)",
+                    "default": 20
+                },
+                "cfg": {
+                    "type": "number",
+                    "description": "Classifier-free guidance scale (default: 8.0, higher = more adherence to prompt)",
+                    "default": 8.0
+                },
+                "seed": {
+                    "type": "integer",
+                    "description": "Random seed for reproducibility (optional, leave null for random)"
+                }
+            },
+            "required": ["prompt"]
+        },
+        function=generate_image_wrapper
     ))
     
     return registry

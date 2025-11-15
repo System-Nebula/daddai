@@ -37,12 +37,14 @@ class IntelligentMemory:
     - Uses Elasticsearch for faster search if enabled
     """
     
-    def __init__(self, uri: str = NEO4J_URI, user: str = NEO4J_USER, password: str = NEO4J_PASSWORD):
+    def __init__(self, uri: str = NEO4J_URI, user: str = NEO4J_USER, password: str = NEO4J_PASSWORD, memory_store=None):
         """Initialize intelligent memory system."""
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
         
-        # Use hybrid memory store if Elasticsearch is enabled
-        if ELASTICSEARCH_ENABLED and HYBRID_MEMORY_AVAILABLE:
+        # Use provided memory store if available, otherwise create new one
+        if memory_store is not None:
+            self.memory_store = memory_store
+        elif ELASTICSEARCH_ENABLED and HYBRID_MEMORY_AVAILABLE:
             try:
                 self.memory_store = HybridMemoryStore()
                 logger.info("✅ Using HybridMemoryStore (Neo4j + Elasticsearch)")

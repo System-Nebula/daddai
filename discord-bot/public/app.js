@@ -25,6 +25,44 @@ const AppState = {
 };
 
 // ============================================
+// Performance Optimizations
+// ============================================
+
+// Virtual scrolling and lazy loading
+let visibleItems = 50; // Render first 50 items
+let intersectionObserver = null;
+
+function setupLazyLoading() {
+    if (!window.IntersectionObserver) return;
+    
+    intersectionObserver = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                const card = entry.target;
+                if (card.dataset.loaded !== 'true') {
+                    card.dataset.loaded = 'true';
+                    // Card is already rendered, just mark as loaded
+                }
+            }
+        });
+    }, { rootMargin: '100px' });
+}
+
+function observeCards() {
+    if (!intersectionObserver) return;
+    document.querySelectorAll('.memory-card, .document-card').forEach(card => {
+        intersectionObserver.observe(card);
+    });
+}
+
+// Debounce search input
+let searchDebounceTimer;
+function debounceSearch(callback, delay = 200) {
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = setTimeout(callback, delay);
+}
+
+// ============================================
 // Initialization
 // ============================================
 
@@ -38,6 +76,7 @@ function initializeApp() {
     setupKeyboardShortcuts();
     initializeViewMode();
     updatePageTitle();
+    setupLazyLoading(); // NEW: Setup lazy loading
 }
 
 async function loadInitialData() {
@@ -487,8 +526,7 @@ async function loadAllDocuments() {
 // ============================================
 
 function filterMemories() {
-    clearTimeout(AppState.searchTimeout);
-    AppState.searchTimeout = setTimeout(() => {
+    debounceSearch(() => {
         const searchTerm = document.getElementById('searchInput')?.value.toLowerCase() || '';
         const selectedChannelId = document.getElementById('channelFilter')?.value || '';
         const selectedType = document.getElementById('typeFilter')?.value || '';
@@ -524,6 +562,9 @@ function filterMemories() {
             }
             return 0;
         });
+        
+        // Reset visible items for new filter
+        visibleItems = 50;
         
         // Update count
         updateStat('filteredCount', AppState.filteredMemories.length);
@@ -612,21 +653,65 @@ function renderMemories(memories) {
         return;
     }
 
+    // Use requestAnimationFrame for smooth rendering
     requestAnimationFrame(() => {
-        const isGrid = memoriesList.getAttribute('data-view-mode') === 'grid';
         const fragment = document.createDocumentFragment();
+        const renderCount = Math.min(memories.length, visibleItems);
         
-        memories.forEach((memory, index) => {
-            if (!memory || typeof memory !== 'object') return;
+        for (let i = 0; i < renderCount; i++) {
+            const memory = memories[i];
+            if (!memory || typeof memory !== 'object') continue;
             
-            const card = createMemoryCard(memory, index);
+            const card = createMemoryCard(memory, i);
             fragment.appendChild(card);
-        });
+        }
         
         memoriesList.innerHTML = '';
         memoriesList.appendChild(fragment);
+        
+        // Observe cards for lazy loading
+        observeCards();
+        
+        // Load remaining items progressively
+        if (memories.length > renderCount) {
+            setTimeout(() => {
+                loadRemainingMemories(memories.slice(renderCount));
+            }, 0);
+        }
+        
         updateLoadMoreButton();
     });
+}
+
+function loadRemainingMemories(remainingMemories) {
+    const memoriesList = document.getElementById('memoriesList');
+    if (!memoriesList) return;
+    
+    const fragment = document.createDocumentFragment();
+    const batchSize = 25;
+    const batch = remainingMemories.slice(0, batchSize);
+    
+    batch.forEach((memory, index) => {
+        const card = createMemoryCard(memory, visibleItems + index);
+        fragment.appendChild(card);
+    });
+    
+    memoriesList.appendChild(fragment);
+    visibleItems += batch.length;
+    observeCards();
+    
+    // Continue loading if more remain
+    if (remainingMemories.length > batchSize) {
+        if (window.requestIdleCallback) {
+            requestIdleCallback(() => {
+                loadRemainingMemories(remainingMemories.slice(batchSize));
+            }, { timeout: 100 });
+        } else {
+            setTimeout(() => {
+                loadRemainingMemories(remainingMemories.slice(batchSize));
+            }, 50);
+        }
+    }
 }
 
 function createMemoryCard(memory, index) {

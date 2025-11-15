@@ -19,10 +19,10 @@ class EnhancedQueryUnderstanding:
     - Query rewriting for better retrieval
     """
     
-    def __init__(self):
+    def __init__(self, lmstudio_client: Optional[LMStudioClient] = None):
         """Initialize enhanced query understanding."""
         self.query_analyzer = QueryAnalyzer()
-        self.lmstudio_client = LMStudioClient()
+        self.lmstudio_client = lmstudio_client if lmstudio_client is not None else LMStudioClient()
         self.use_llm = self._check_llm_availability()
     
     def _check_llm_availability(self) -> bool:
@@ -110,7 +110,11 @@ Provide a JSON response with:
 13. "needs_memory": Whether past conversations are needed (true/false) - set to true if query references previous conversation or documents mentioned earlier
 14. "needs_relations": Whether user relations are relevant (true/false)
 15. "is_casual": Whether this is casual conversation that doesn't need data retrieval (true/false). Examples: greetings, small talk, simple acknowledgments, invitations like "lets go", "help me", "want to go".
-16. "document_references": List of document names or identifiers mentioned in the query (e.g., ["kohya", "kohya-ss-gui_logs1.txt"]). Include partial names like "kohya" if they likely refer to a document from context.
+16. "document_references": List of document names or identifiers mentioned in the query (e.g., ["kohya", "kohya-ss-gui_logs1.txt", "windows"]). Include:
+    - Explicit document names (e.g., "kohya", "vibecoding")
+    - Topic words that likely refer to documents when used with "discussion", "video", "document", "transcript" (e.g., "windows discussion" -> ["windows"], "vibecoding video" -> ["vibecoding"])
+    - Partial names if they likely refer to a document from context
+    - Extract the main topic word from phrases like "X discussion", "X video", "the X document"
 
 IMPORTANT ROUTING RULES:
 - If query explicitly mentions "document", "doc", "file", or asks about documents, set needs_rag to true and is_casual to false

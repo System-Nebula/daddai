@@ -21,10 +21,10 @@ class LLMItemTracker:
     - Item relationships and properties
     """
     
-    def __init__(self, uri: str = NEO4J_URI, user: str = NEO4J_USER, password: str = NEO4J_PASSWORD):
+    def __init__(self, uri: str = NEO4J_URI, user: str = NEO4J_USER, password: str = NEO4J_PASSWORD, llm_client: Optional[LMStudioClient] = None):
         """Initialize LLM item tracker."""
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
-        self.llm_client = LMStudioClient()
+        self.llm_client = llm_client if llm_client is not None else LMStudioClient()
         self._initialize_schema()
     
     def _initialize_schema(self):

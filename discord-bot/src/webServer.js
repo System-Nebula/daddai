@@ -32,6 +32,10 @@ class WebServer {
      * Setup middleware for request processing
      */
     setupMiddleware() {
+        // Add compression middleware for faster responses
+        const compression = require('compression');
+        this.app.use(compression({ level: 6, threshold: 1024 }));
+        
         // JSON body parser
         this.app.use(express.json());
         

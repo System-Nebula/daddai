@@ -15,9 +15,10 @@ class MultiQueryRetrieval:
     Generates multiple query variations and combines results for better recall.
     """
     
-    def __init__(self):
+    def __init__(self, llm_client: Optional[LMStudioClient] = None):
         """Initialize multi-query retrieval."""
-        self.llm_client = LMStudioClient()
+        from src.clients.lmstudio_client import LMStudioClient as LMStudioClientType
+        self.llm_client = llm_client if llm_client is not None else LMStudioClientType()
         # Cache for query variations
         from cachetools import TTLCache
         self._variation_cache = TTLCache(maxsize=500, ttl=3600)  # 1 hour cache

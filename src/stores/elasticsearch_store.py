@@ -141,6 +141,11 @@ class ElasticsearchStore:
                     },
                     "chunk_count": {"type": "integer"}
                 }
+            },
+            "settings": {
+                "number_of_shards": 1,
+                "number_of_replicas": 0,
+                "refresh_interval": "5s"  # OPTIMIZED: Reduce refresh frequency
             }
         }
         
@@ -179,7 +184,13 @@ class ElasticsearchStore:
             },
             "settings": {
                 "number_of_shards": 1,
-                "number_of_replicas": 0
+                "number_of_replicas": 0,
+                "refresh_interval": "5s",  # OPTIMIZED: Reduce refresh for better write performance
+                "index": {
+                    "max_result_window": 50000,  # OPTIMIZED: Allow larger result sets
+                    "knn": True,  # OPTIMIZED: Enable kNN search
+                    "knn.algo_param.ef_search": 100  # OPTIMIZED: kNN search accuracy/speed tradeoff
+                }
             }
         }
         
@@ -356,12 +367,13 @@ class ElasticsearchStore:
             List of matching chunks with scores
         """
         try:
-            # Build knn query
+            # Build knn query - OPTIMIZED parameters
             knn_query = {
                 "field": "embedding",
                 "query_vector": query_embedding,
                 "k": top_k,
-                "num_candidates": top_k * 10  # More candidates for better accuracy
+                "num_candidates": min(top_k * 20, 1000),  # OPTIMIZED: Cap at 1000 for performance
+                "boost": 1.0
             }
             
             # Add filters

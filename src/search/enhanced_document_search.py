@@ -33,22 +33,26 @@ class EnhancedDocumentSearch:
     - Hybrid Neo4j + Elasticsearch support (if enabled)
     """
     
-    def __init__(self):
+    def __init__(self, document_store=None, neo4j_store=None):
         """Initialize enhanced document search."""
-        # Use hybrid store if Elasticsearch is enabled, otherwise use regular stores
-        if ELASTICSEARCH_ENABLED and HYBRID_STORE_AVAILABLE:
+        # Use provided stores if available, otherwise create new ones
+        if document_store is not None:
+            self.document_store = document_store
+        elif ELASTICSEARCH_ENABLED and HYBRID_STORE_AVAILABLE:
             try:
                 self.document_store = HybridDocumentStore()
                 logger.info("✅ Using HybridDocumentStore (Neo4j + Elasticsearch)")
             except Exception as e:
                 logger.warning(f"Failed to initialize HybridDocumentStore, using regular stores: {e}")
                 self.document_store = DocumentStore()
-                self.neo4j_store = Neo4jStore()
         else:
             self.document_store = DocumentStore()
-            self.neo4j_store = Neo4jStore()
+        
+        self.neo4j_store = neo4j_store if neo4j_store is not None else Neo4jStore()
         
         self.hybrid_search = HybridSearch()
+        # Cache for document chunks to avoid redundant calls
+        self._doc_chunks_cache = {}
     
     def multi_stage_search(self,
                           query: str,
@@ -169,6 +173,16 @@ class EnhancedDocumentSearch:
         if not candidates:
             return []
         
+        # Pre-compute document relevance for all unique documents (cache to avoid redundant calls)
+        doc_relevance_cache = {}
+        unique_doc_ids = set(c.get("doc_id") for c in candidates if c.get("doc_id"))
+        for doc_id in unique_doc_ids:
+            doc_relevance_cache[doc_id] = self._compute_document_relevance(
+                query_embedding,
+                doc_id,
+                None  # file_name not needed if we have doc_id
+            )
+        
         reranked = []
         
         for candidate in candidates:
@@ -184,12 +198,9 @@ class EnhancedDocumentSearch:
             chunk_index = candidate.get("chunk_index", 0)
             position_bonus = max(0.0, 1.0 - (chunk_index / 100.0)) * 0.1  # Up to 10% bonus
             
-            # Factor 4: Document-level relevance
-            doc_relevance = self._compute_document_relevance(
-                query_embedding,
-                candidate.get("doc_id"),
-                candidate.get("file_name")
-            )
+            # Factor 4: Document-level relevance (use cached value)
+            doc_id = candidate.get("doc_id")
+            doc_relevance = doc_relevance_cache.get(doc_id, 0.5)
             
             # Combined score (weighted)
             combined_score = (
@@ -229,21 +240,30 @@ class EnhancedDocumentSearch:
         return min(1.0, score)
     
     def _compute_document_relevance(self,
-                                    query_embedding: List[float],
-                                    doc_id: Optional[str],
-                                    file_name: Optional[str]) -> float:
+                                   query_embedding: List[float],
+                                   doc_id: Optional[str],
+                                   file_name: Optional[str]) -> float:
         """
         Compute document-level relevance score.
         If document has many relevant chunks, boost its score.
+        Uses caching to avoid redundant chunk retrieval.
         """
         if not doc_id and not file_name:
             return 0.5  # Neutral score if no document context
         
-        # Get all chunks for this document
+        # Check cache first
+        cache_key = doc_id or file_name
+        if cache_key in self._doc_chunks_cache:
+            return 0.7  # Boost documents that are explicitly referenced
+        
+        # Get all chunks for this document (only if not cached)
         try:
             if doc_id:
                 # Use document store to get chunks
                 doc_chunks = self.document_store.get_document_chunks(doc_id)
+                # Cache the result (mark that we've seen this doc)
+                if doc_chunks:
+                    self._doc_chunks_cache[cache_key] = True
             else:
                 # Would need to implement filename lookup
                 return 0.5

@@ -28,10 +28,12 @@ class SmartDocumentSelector:
     Uses query analysis, document metadata, and knowledge graph.
     """
     
-    def __init__(self):
+    def __init__(self, document_store=None, embedding_generator=None):
         """Initialize smart document selector."""
-        # Use hybrid store if Elasticsearch is enabled
-        if ELASTICSEARCH_ENABLED and HYBRID_STORE_AVAILABLE:
+        # Use provided stores if available, otherwise create new ones
+        if document_store is not None:
+            self.document_store = document_store
+        elif ELASTICSEARCH_ENABLED and HYBRID_STORE_AVAILABLE:
             try:
                 self.document_store = HybridDocumentStore()
             except Exception as e:
@@ -40,8 +42,11 @@ class SmartDocumentSelector:
         else:
             self.document_store = DocumentStore()
         self.knowledge_graph = KnowledgeGraph()
-        device = USE_GPU if USE_GPU != 'auto' else None
-        self.embedding_generator = EmbeddingGenerator(device=device, batch_size=EMBEDDING_BATCH_SIZE)
+        if embedding_generator is not None:
+            self.embedding_generator = embedding_generator
+        else:
+            device = USE_GPU if USE_GPU != 'auto' else None
+            self.embedding_generator = EmbeddingGenerator(device=device, batch_size=EMBEDDING_BATCH_SIZE)
     
     def should_search_documents(self, query: str, context: Dict[str, Any] = None) -> bool:
         """
@@ -172,35 +177,67 @@ class SmartDocumentSelector:
         
         # Score documents by relevance
         scored_docs = []
+        query_lower = query.lower()
+        query_words = set(query_lower.split())
+        
+        # Extract key topic words from query (remove common words)
+        common_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'about', 'can', 'you', 'search', 'discussion', 'question'}
+        topic_words = [w for w in query_words if w not in common_words and len(w) > 2]
         
         for doc in all_docs:
             score = 0.0
-            
-            # Factor 1: Filename match
             filename = doc.get("file_name", "").lower()
-            query_lower = query.lower()
-            if any(word in filename for word in query_lower.split()):
-                score += 0.3
-            
-            # Factor 2: User document history (if user_id provided)
-            if context and context.get("user_id"):
-                user_history = self.knowledge_graph.get_user_document_history(
-                    context["user_id"],
-                    limit=20
-                )
-                if any(h["doc_id"] == doc["id"] for h in user_history):
-                    score += 0.2
-            
-            # Factor 3: Topic relevance (if knowledge graph has topics)
             doc_id = doc.get("id")
+            
+            # Factor 1: Strong filename/keyword match (boost for exact matches)
+            for word in topic_words:
+                if word in filename:
+                    # Strong boost for keyword matches
+                    score += 0.5
+                elif any(word in filename for word in query_lower.split()):
+                    score += 0.3
+            
+            # Factor 2: Temporal weighting - prioritize recent documents
+            uploaded_at = doc.get("uploaded_at")
+            if uploaded_at:
+                try:
+                    from datetime import datetime
+                    if isinstance(uploaded_at, str):
+                        # Parse ISO format datetime
+                        upload_time = datetime.fromisoformat(uploaded_at.replace('Z', '+00:00'))
+                    else:
+                        upload_time = uploaded_at
+                    
+                    # Boost documents uploaded in last 24 hours
+                    time_diff = (datetime.now(upload_time.tzinfo) - upload_time).total_seconds()
+                    if time_diff < 86400:  # 24 hours
+                        score += 0.4  # Strong boost for very recent documents
+                    elif time_diff < 604800:  # 7 days
+                        score += 0.2  # Moderate boost for recent documents
+                except:
+                    pass
+            
+            # Factor 3: User document history (if user_id provided)
+            if context and context.get("user_id"):
+                try:
+                    user_history = self.knowledge_graph.get_user_document_history(
+                        context["user_id"],
+                        limit=20
+                    )
+                    if any(h["doc_id"] == doc_id for h in user_history):
+                        score += 0.2
+                except:
+                    pass
+            
+            # Factor 4: Topic relevance (if knowledge graph has topics)
             if doc_id:
                 try:
                     # Check if document topics match query
                     topics = self._get_document_topics(doc_id)
-                    query_words = set(query_lower.split())
                     for topic in topics:
-                        if any(word in topic.lower() for word in query_words):
-                            score += 0.2
+                        topic_lower = topic.lower()
+                        if any(word in topic_lower for word in topic_words):
+                            score += 0.3  # Boost for topic matches
                             break
                 except:
                     pass
@@ -240,6 +277,28 @@ class SmartDocumentSelector:
     def _extract_document_references(self, query: str) -> List[str]:
         """Extract document references from query."""
         references = []
+        query_lower = query.lower()
+        
+        # Extract topic words that might refer to documents
+        # Common patterns: "X discussion", "X video", "X document", "the X", "about X"
+        topic_patterns = [
+            r'(\w+)\s+discussion',
+            r'(\w+)\s+video',
+            r'(\w+)\s+document',
+            r'the\s+(\w+)\s+discussion',
+            r'about\s+(\w+)',
+            r'(\w+)\s+question',
+            r'(\w+)\s+transcript'
+        ]
+        
+        import re
+        for pattern in topic_patterns:
+            matches = re.findall(pattern, query_lower)
+            for match in matches:
+                if isinstance(match, tuple):
+                    match = match[0] if match else ''
+                if match and len(match) > 2:  # Ignore very short words
+                    references.append(match)
         
         # Pattern: "in document X", "from file Y", "document named X"
         patterns = [

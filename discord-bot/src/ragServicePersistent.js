@@ -19,14 +19,19 @@ class PersistentRAGService extends EventEmitter {
         this.isReady = false;
         this.reconnectAttempts = 0;
         this.maxReconnectAttempts = 5;
+        this._starting = false; // Guard flag to prevent concurrent starts
         
         this.startServer();
     }
     
     startServer() {
-        if (this.serverProcess) {
-            return; // Already started
+        // CRITICAL: Prevent concurrent server starts
+        if (this.serverProcess || this._starting) {
+            logger.debug('[RAG] Server already started or starting, skipping...');
+            return; // Already started or starting
         }
+        
+        this._starting = true;
         
         logger.info('[RAG] Starting persistent RAG server...');
         
@@ -45,6 +50,7 @@ class PersistentRAGService extends EventEmitter {
             // Check if server is ready
             if (output.includes('RAG server ready!')) {
                 this.isReady = true;
+                this._starting = false; // Clear starting flag
                 this.reconnectAttempts = 0;
                 logger.info('[RAG] Server ready! Processing queued requests...');
                 this.processQueue();
@@ -77,6 +83,7 @@ class PersistentRAGService extends EventEmitter {
             logger.error(`[RAG] Server process exited with code ${code}`);
             this.serverProcess = null;
             this.isReady = false;
+            this._starting = false; // Clear starting flag
             
             // Attempt to reconnect
             if (this.reconnectAttempts < this.maxReconnectAttempts) {
@@ -92,6 +99,7 @@ class PersistentRAGService extends EventEmitter {
         this.serverProcess.on('error', (error) => {
             logger.error('[RAG] Server process error:', { error: error.message, stack: error.stack });
             this.isReady = false;
+            this._starting = false; // Clear starting flag
         });
         
         // Send ping after a short delay to verify connection

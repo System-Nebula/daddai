@@ -3,7 +3,14 @@ Script to clear all documents and memories from both Neo4j and Elasticsearch.
 Use with caution - this will delete ALL data!
 """
 import sys
+import os
 import argparse
+
+# Add project root to path
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from logger_config import logger
 
 def clear_neo4j_documents():
@@ -106,7 +113,7 @@ def clear_elasticsearch_documents():
             logger.info("Elasticsearch not enabled, skipping...")
             return 0
         
-        from elasticsearch_store import ElasticsearchStore
+        from src.stores.elasticsearch_store import ElasticsearchStore
         
         logger.info("Clearing Elasticsearch documents...")
         es_store = ElasticsearchStore()
@@ -225,7 +232,7 @@ def get_counts():
     try:
         from config import ELASTICSEARCH_ENABLED
         if ELASTICSEARCH_ENABLED:
-            from elasticsearch_store import ElasticsearchStore
+            from src.stores.elasticsearch_store import ElasticsearchStore
             
             es_store = ElasticsearchStore()
             

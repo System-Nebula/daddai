@@ -90,7 +90,8 @@ class RAGServer:
                     "source_memories": result.get('source_memories', []),
                     "timing": result.get('timing', {}),
                     "is_casual_conversation": result.get('is_casual_conversation', False),  # Flag for conversational responses
-                    "service_routing": result.get('service_routing', 'rag')  # Indicate which service was used
+                    "service_routing": result.get('service_routing', 'rag'),  # Indicate which service was used
+                    "tool_calls": result.get('tool_calls', [])  # Include tool calls for image generation, etc.
                 }
                 
                 return {"id": request_id, "result": response, "error": None}
