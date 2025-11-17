@@ -1455,16 +1455,17 @@ def create_rag_tools(pipeline) -> LLMToolRegistry:
     # Tool: Generate image
     def generate_image_wrapper(
         prompt: str,
-        negative_prompt: str = "bad hands, blurry, low quality, distorted",
-        width: int = 512,
-        height: int = 512,
-        steps: int = 20,
-        cfg: float = 8.0,
-        seed: Optional[int] = None
+        negative_prompt: str = "blurry, low quality, distorted, realistic, photo, bad anatomy, worst quality, low quality, out of focus, soft focus, motion blur",
+        width: int = 1024,
+        height: int = 1024,
+        steps: int = 10,
+        cfg: float = 1.0,
+        seed: Optional[int] = None,
+        guidance: float = 3.5
     ) -> Dict[str, Any]:
         """
         Wrapper for image generation tool.
-        Generates images using RunPod API with Stable Diffusion 1.5 + LoRA.
+        Generates images using RunPod API with FLUX GGUF models.
         """
         from src.tools.image_generation_tool import generate_image
         
@@ -1475,14 +1476,15 @@ def create_rag_tools(pipeline) -> LLMToolRegistry:
             height=height,
             steps=steps,
             cfg=cfg,
-            seed=seed
+            seed=seed,
+            guidance=guidance
         )
         
         return result
     
     registry.register_tool(LLMTool(
         name="generate_image",
-        description="Generate an image using AI image generation (Stable Diffusion 1.5 + LoRA). Use this tool when users ask to generate, create, make, or draw an image, picture, artwork, or visual content. IMPORTANT: This is the ONLY tool for image generation. DO NOT create dynamic tool names like 'create_dwarf_image' or 'generate_cat_image' - always use 'generate_image' and put the description in the 'prompt' parameter. Returns the path to the generated image file that can be sent to Discord.",
+        description="Generate an image using AI image generation (FLUX GGUF models). Use this tool when users ask to generate, create, make, or draw an image, picture, artwork, or visual content. IMPORTANT: This is the ONLY tool for image generation. DO NOT create dynamic tool names like 'create_dwarf_image' or 'generate_cat_image' - always use 'generate_image' and put the description in the 'prompt' parameter. Returns the path to the generated image file that can be sent to Discord.",
         parameters={
             "type": "object",
             "properties": {
@@ -1492,32 +1494,37 @@ def create_rag_tools(pipeline) -> LLMToolRegistry:
                 },
                 "negative_prompt": {
                     "type": "string",
-                    "description": "Things to avoid in the image (e.g., 'bad hands, blurry, low quality'). Default: 'bad hands, blurry, low quality, distorted'",
-                    "default": "bad hands, blurry, low quality, distorted"
+                    "description": "Things to avoid in the image (e.g., 'blurry, low quality, distorted'). Default: 'blurry, low quality, distorted, realistic, photo, bad anatomy, worst quality, low quality, out of focus, soft focus, motion blur'",
+                    "default": "blurry, low quality, distorted, realistic, photo, bad anatomy, worst quality, low quality, out of focus, soft focus, motion blur"
                 },
                 "width": {
                     "type": "integer",
-                    "description": "Image width in pixels (default: 512)",
-                    "default": 512
+                    "description": "Image width in pixels (default: 1024)",
+                    "default": 1024
                 },
                 "height": {
                     "type": "integer",
-                    "description": "Image height in pixels (default: 512)",
-                    "default": 512
+                    "description": "Image height in pixels (default: 1024)",
+                    "default": 1024
                 },
                 "steps": {
                     "type": "integer",
-                    "description": "Number of sampling steps (default: 20, higher = better quality but slower)",
-                    "default": 20
+                    "description": "Number of sampling steps (default: 10, higher = better quality but slower)",
+                    "default": 10
                 },
                 "cfg": {
                     "type": "number",
-                    "description": "Classifier-free guidance scale (default: 8.0, higher = more adherence to prompt)",
-                    "default": 8.0
+                    "description": "Classifier-free guidance scale (default: 1.0)",
+                    "default": 1.0
                 },
                 "seed": {
                     "type": "integer",
                     "description": "Random seed for reproducibility (optional, leave null for random)"
+                },
+                "guidance": {
+                    "type": "number",
+                    "description": "FLUX guidance scale (default: 3.5, controls how closely the model follows the prompt)",
+                    "default": 3.5
                 }
             },
             "required": ["prompt"]

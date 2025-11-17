@@ -102,19 +102,11 @@ class PersistentRAGService extends EventEmitter {
             this._starting = false; // Clear starting flag
         });
         
-        // Send ping after a short delay to verify connection
-        setTimeout(() => {
-            if (!this.isReady) {
-                this.ping();
-            }
-        }, 3000);
+        // Ping removed - no longer needed for pre-warmup
+        // (User requested to remove pre-warmup messages to LLM)
     }
     
-    ping() {
-        this.queryWithContext('ping', [], null, true).catch(() => {
-            // Ignore ping errors
-        });
-    }
+    // ping() method removed - no longer needed for pre-warmup
     
     handleResponse(response) {
         const requestId = response.id;
@@ -260,7 +252,8 @@ class PersistentRAGService extends EventEmitter {
             
             // Set timeout - longer for URL requests (90s) since they need to fetch transcript, chunk it, and summarize multiple chunks
             // YouTube summarization can take 30-60 seconds for chunk processing alone
-            const timeoutDuration = isPing ? 5000 : (hasUrl ? 90000 : 30000);
+            // Increased to 60s for GLM-4.6 thinking model (needs more time for reasoning)
+            const timeoutDuration = isPing ? 5000 : (hasUrl ? 90000 : 60000);
             const timeout = setTimeout(() => {
                 if (this.pendingRequests.has(requestId)) {
                     this.pendingRequests.delete(requestId);

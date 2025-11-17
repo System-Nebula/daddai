@@ -1,5 +1,5 @@
 """
-Image Generation Tool - Generates images using RunPod API with Stable Diffusion 1.5 + LoRA.
+Image Generation Tool - Generates images using RunPod API with FLUX GGUF models.
 This tool allows the bot to generate images based on text prompts.
 """
 import requests
@@ -8,6 +8,7 @@ import json
 import time
 import os
 import tempfile
+import random
 from typing import Dict, Any, Optional
 from PIL import Image
 from io import BytesIO
@@ -20,43 +21,217 @@ load_dotenv()
 # Configuration
 api_key = os.getenv("RUNPOD_API_KEY")
 endpoint_id = os.getenv("RUNPOD_ENDPOINT_ID", "a48mrbdsbzg35n")
+# FLUX GGUF model configuration
+unet_model = os.getenv("RUNPOD_UNET_MODEL", "flux1-dev-Q8_0.gguf")
+clip_model_1 = os.getenv("RUNPOD_CLIP_MODEL_1", "clip_l.safetensors")
+clip_model_2 = os.getenv("RUNPOD_CLIP_MODEL_2", "t5xxl_fp8_e4m3fn.safetensors")
+vae_model = os.getenv("RUNPOD_VAE_MODEL", "ae.safetensors")
 
 if not api_key:
     logger.warning("RUNPOD_API_KEY not found in environment variables. Image generation will fail.")
 
 
+def query_comfyui_models(comfyui_base_url: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Query ComfyUI API to get available models and node information.
+    This helps diagnose what models are actually available on the server.
+    
+    Args:
+        comfyui_base_url: Optional base URL for ComfyUI server (e.g., https://s3api-us-il-1.runpod.io/)
+    
+    Returns:
+        Dict with available models and node information
+    """
+    if not api_key:
+        return {
+            "success": False,
+            "error": "RUNPOD_API_KEY not configured"
+        }
+    
+    try:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        # Try multiple endpoints
+        endpoints_to_try = []
+        
+        # Method 1: If custom ComfyUI URL provided
+        if comfyui_base_url:
+            base = comfyui_base_url.rstrip('/')
+            endpoints_to_try.append({
+                "name": "Custom ComfyUI URL",
+                "object_info": f"{base}/object_info",
+                "health": f"{base}/health"
+            })
+        
+        # Method 2: RunPod API endpoint (standard ComfyUI template)
+        runpod_base = f"https://api.runpod.ai/v2/{endpoint_id}"
+        endpoints_to_try.append({
+            "name": "RunPod API (standard)",
+            "object_info": f"{runpod_base}/runsync",
+            "health": f"{runpod_base}/health"
+        })
+        
+        # Method 3: RunPod ComfyUI direct endpoint
+        endpoints_to_try.append({
+            "name": "RunPod ComfyUI direct",
+            "object_info": f"{runpod_base}/comfyui/object_info",
+            "health": f"{runpod_base}/comfyui/health"
+        })
+        
+        # Method 4: Try RunPod S3 API (if endpoint_id maps to it)
+        s3_base = f"https://s3api-us-il-1.runpod.io"
+        endpoints_to_try.append({
+            "name": "RunPod S3 API",
+            "object_info": f"{s3_base}/object_info",
+            "health": f"{s3_base}/health"
+        })
+        
+        # Method 5: Try direct ComfyUI port (if exposed)
+        # RunPod ComfyUI templates often expose on port 8188
+        if comfyui_base_url:
+            # Extract base without path to try port variations
+            from urllib.parse import urlparse
+            parsed = urlparse(comfyui_base_url)
+            if parsed.netloc:
+                base_host = parsed.scheme + "://" + parsed.netloc.split(':')[0]
+                endpoints_to_try.append({
+                    "name": "ComfyUI direct port 8188",
+                    "object_info": f"{base_host}:8188/object_info",
+                    "health": f"{base_host}:8188/system_stats"
+                })
+        
+        for endpoint_config in endpoints_to_try:
+            logger.info(f"Trying {endpoint_config['name']}...")
+            
+            # Try health check first
+            try:
+                health_response = requests.get(endpoint_config["health"], headers=headers, timeout=10)
+                if health_response.status_code == 200:
+                    logger.info(f"✅ Health check passed for {endpoint_config['name']}")
+                    health_data = health_response.json()
+                    logger.debug(f"Health data: {json.dumps(health_data, indent=2)}")
+            except Exception as e:
+                logger.debug(f"Health check failed for {endpoint_config['name']}: {e}")
+            
+            # Try object_info endpoint - RunPod might need POST with empty body
+            try:
+                # Try GET first
+                response = requests.get(endpoint_config["object_info"], headers=headers, timeout=10)
+                
+                # If GET fails, try POST (some RunPod endpoints require POST)
+                if response.status_code != 200:
+                    response = requests.post(
+                        endpoint_config["object_info"],
+                        headers=headers,
+                        json={},
+                        timeout=10
+                    )
+                
+                if response.status_code == 200:
+                    object_info = response.json()
+                    logger.info(f"✅ Successfully queried object_info from {endpoint_config['name']}")
+                    
+                    # Handle different response formats
+                    # Sometimes RunPod wraps it, sometimes it's direct
+                    if isinstance(object_info, dict) and "output" in object_info:
+                        object_info = object_info["output"]
+                    elif isinstance(object_info, dict) and "data" in object_info:
+                        object_info = object_info["data"]
+                    
+                    # Extract UNET and CLIP loader information
+                    result = {
+                        "success": True,
+                        "source": endpoint_config["name"],
+                        "unet_loader": {},
+                        "clip_loader": {},
+                        "vae_loader": {},
+                        "checkpoint_loader": {},
+                        "all_nodes": list(object_info.keys()) if isinstance(object_info, dict) else [],
+                        "loader_nodes": []
+                    }
+                    
+                    if isinstance(object_info, dict):
+                        # Check for UNETLoader
+                        if "UNETLoader" in object_info:
+                            result["unet_loader"] = object_info["UNETLoader"]
+                            result["loader_nodes"].append("UNETLoader")
+                            logger.info(f"UNETLoader found: {json.dumps(object_info['UNETLoader'], indent=2)}")
+                        
+                        # Check for CLIPLoader
+                        if "CLIPLoader" in object_info:
+                            result["clip_loader"] = object_info["CLIPLoader"]
+                            result["loader_nodes"].append("CLIPLoader")
+                            logger.info(f"CLIPLoader found: {json.dumps(object_info['CLIPLoader'], indent=2)}")
+                        
+                        # Check for VAELoader
+                        if "VAELoader" in object_info:
+                            result["vae_loader"] = object_info["VAELoader"]
+                            result["loader_nodes"].append("VAELoader")
+                            logger.info(f"VAELoader found: {json.dumps(object_info['VAELoader'], indent=2)}")
+                        
+                        # Check for CheckpointLoaderSimple (standard ComfyUI node)
+                        if "CheckpointLoaderSimple" in object_info:
+                            result["checkpoint_loader"] = object_info["CheckpointLoaderSimple"]
+                            result["loader_nodes"].append("CheckpointLoaderSimple")
+                            logger.info(f"CheckpointLoaderSimple found: {json.dumps(object_info['CheckpointLoaderSimple'], indent=2)}")
+                        
+                        # Find all loader-related nodes
+                        loader_keywords = ["loader", "checkpoint", "unet", "clip", "vae", "model"]
+                        for node_name in object_info.keys():
+                            if any(keyword in node_name.lower() for keyword in loader_keywords):
+                                if node_name not in result["loader_nodes"]:
+                                    result["loader_nodes"].append(node_name)
+                    
+                    return result
+                else:
+                    logger.debug(f"Object info query returned status {response.status_code} for {endpoint_config['name']}: {response.text[:200]}")
+            except Exception as e:
+                logger.debug(f"Object info query failed for {endpoint_config['name']}: {e}")
+                continue
+        
+        return {
+            "success": False,
+            "error": "Could not query ComfyUI API from any endpoint.",
+            "note": "Tried multiple endpoints. You may need to check the ComfyUI web interface directly or use RunPod's console to see available models."
+        }
+        
+    except Exception as e:
+        logger.error(f"Error querying ComfyUI models: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
 def generate_image(
     prompt: str,
-    negative_prompt: str = "bad hands, blurry, low quality, distorted",
-    width: int = 512,
-    height: int = 512,
-    steps: int = 20,
-    cfg: float = 8.0,
+    negative_prompt: str = "blurry, low quality, distorted, realistic, photo, bad anatomy, worst quality, low quality, out of focus, soft focus, motion blur",
+    width: int = 1024,
+    height: int = 1024,
+    steps: int = 10,
+    cfg: float = 1.0,
     seed: Optional[int] = None,
     sampler_name: str = "euler",
-    scheduler: str = "normal",
-    lora_name: str = "epiNoiseoffset_v2.safetensors",
-    lora_strength_model: float = 1.0,
-    lora_strength_clip: float = 1.0,
-    save_path: Optional[str] = None
+    save_path: Optional[str] = None,
+    guidance: float = 3.5
 ) -> Dict[str, Any]:
     """
-    Generate an image using RunPod API with Stable Diffusion 1.5 + LoRA.
+    Generate an image using RunPod API with FLUX GGUF models.
     
     Args:
         prompt: Positive prompt describing what to generate
-        negative_prompt: Negative prompt describing what to avoid (default: "bad hands, blurry, low quality, distorted")
-        width: Image width in pixels (default: 512)
-        height: Image height in pixels (default: 512)
-        steps: Number of sampling steps (default: 20)
-        cfg: Classifier-free guidance scale (default: 8.0)
+        negative_prompt: Negative prompt describing what to avoid (default: "blurry, low quality, distorted, realistic, photo, bad anatomy, worst quality, low quality, out of focus, soft focus, motion blur")
+        width: Image width in pixels (default: 1024)
+        height: Image height in pixels (default: 1024)
+        steps: Number of sampling steps (default: 10)
+        cfg: Classifier-free guidance scale (default: 1.0)
         seed: Random seed for reproducibility (default: None, uses random seed)
         sampler_name: Sampling method (default: "euler")
-        scheduler: Scheduler type (default: "normal")
-        lora_name: LoRA model name (default: "epiNoiseoffset_v2.safetensors")
-        lora_strength_model: LoRA strength for model (default: 1.0)
-        lora_strength_clip: LoRA strength for CLIP (default: 1.0)
         save_path: Optional path to save the image file (default: None, saves to temp directory)
+        guidance: FLUX guidance scale (default: 3.5)
         
     Returns:
         Dict with:
@@ -74,188 +249,206 @@ def generate_image(
         }
     
     try:
-        # API URLs
-        run_url = f"https://api.runpod.ai/v2/{endpoint_id}/run"
-        status_url_template = f"https://api.runpod.ai/v2/{endpoint_id}/status/"
+        # API URL - use runsync endpoint for synchronous execution
+        runsync_url = f"https://api.runpod.ai/v2/{endpoint_id}/runsync"
         
         # Use provided seed or generate random seed
         if seed is None:
-            seed = int(time.time() * 1000) % (2**32)
+            seed = random.randint(0, 2**32 - 1)
         
-        # Build the workflow payload
+        # Build the workflow payload using FLUX GGUF workflow
         workflow = {
             "input": {
                 "workflow": {
-                    "3": {
+                    # DualCLIPLoader - loads both CLIP models
+                    "40": {
                         "inputs": {
-                            "seed": seed,
-                            "steps": steps,
-                            "cfg": cfg,
-                            "sampler_name": sampler_name,
-                            "scheduler": scheduler,
-                            "denoise": 1,
-                            "model": ["10", 0],
-                            "positive": ["6", 0],
-                            "negative": ["7", 0],
-                            "latent_image": ["5", 0]
+                            "clip_name1": clip_model_1,
+                            "clip_name2": clip_model_2,
+                            "type": "flux"
                         },
-                        "class_type": "KSampler",
-                        "_meta": {
-                            "title": "KSampler"
-                        }
+                        "class_type": "DualCLIPLoader"
                     },
-                    "4": {
+                    # UnetLoaderGGUF - loads the UNET model
+                    "47": {
                         "inputs": {
-                            "ckpt_name": "v1-5-pruned-emaonly.ckpt"
+                            "unet_name": unet_model
                         },
-                        "class_type": "CheckpointLoaderSimple",
-                        "_meta": {
-                            "title": "Load Checkpoint"
-                        }
+                        "class_type": "UnetLoaderGGUF"
                     },
-                    "5": {
+                    # VAE Loader - loads the VAE
+                    "vae_loader": {
+                        "inputs": {
+                            "vae_name": vae_model
+                        },
+                        "class_type": "VAELoader"
+                    },
+                    # Positive prompt encoding
+                    "6": {
+                        "inputs": {
+                            "text": prompt,
+                            "clip": ["40", 0]
+                        },
+                        "class_type": "CLIPTextEncode"
+                    },
+                    # FluxGuidance - required for FLUX models
+                    "35": {
+                        "inputs": {
+                            "guidance": guidance,
+                            "conditioning": ["6", 0]
+                        },
+                        "class_type": "FluxGuidance"
+                    },
+                    # Negative prompt encoding
+                    "33": {
+                        "inputs": {
+                            "text": negative_prompt,
+                            "clip": ["40", 0]
+                        },
+                        "class_type": "CLIPTextEncode"
+                    },
+                    # Empty latent image
+                    "27": {
                         "inputs": {
                             "width": width,
                             "height": height,
                             "batch_size": 1
                         },
-                        "class_type": "EmptyLatentImage",
-                        "_meta": {
-                            "title": "Empty Latent Image"
-                        }
+                        "class_type": "EmptySD3LatentImage"
                     },
-                    "6": {
+                    # KSampler - generates the image
+                    "31": {
                         "inputs": {
-                            "text": prompt,
-                            "clip": ["10", 1]
+                            "seed": seed,
+                            "steps": steps,
+                            "cfg": cfg,
+                            "sampler_name": sampler_name,
+                            "scheduler": "simple",
+                            "denoise": 1,
+                            "model": ["47", 0],
+                            "positive": ["35", 0],  # Use FluxGuidance output
+                            "negative": ["33", 0],
+                            "latent_image": ["27", 0]
                         },
-                        "class_type": "CLIPTextEncode",
-                        "_meta": {
-                            "title": "CLIP Text Encode (Prompt)"
-                        }
+                        "class_type": "KSampler"
                     },
-                    "7": {
-                        "inputs": {
-                            "text": negative_prompt,
-                            "clip": ["10", 1]
-                        },
-                        "class_type": "CLIPTextEncode",
-                        "_meta": {
-                            "title": "CLIP Text Encode (Negative)"
-                        }
-                    },
+                    # VAE Decode - converts latent to image
                     "8": {
                         "inputs": {
-                            "samples": ["3", 0],
-                            "vae": ["4", 2]
+                            "samples": ["31", 0],
+                            "vae": ["vae_loader", 0]
                         },
-                        "class_type": "VAEDecode",
-                        "_meta": {
-                            "title": "VAE Decode"
-                        }
+                        "class_type": "VAEDecode"
                     },
+                    # Save Image
                     "9": {
                         "inputs": {
-                            "filename_prefix": "ComfyUI_SD15",
+                            "filename_prefix": "ComfyUI",
                             "images": ["8", 0]
                         },
-                        "class_type": "SaveImage",
-                        "_meta": {
-                            "title": "Save Image"
-                        }
-                    },
-                    "10": {
-                        "inputs": {
-                            "lora_name": lora_name,
-                            "strength_model": lora_strength_model,
-                            "strength_clip": lora_strength_clip,
-                            "model": ["4", 0],
-                            "clip": ["4", 1]
-                        },
-                        "class_type": "LoraLoader",
-                        "_meta": {
-                            "title": "Load LoRA"
-                        }
+                        "class_type": "SaveImage"
                     }
                 }
             }
         }
         
-        # Send initial request
+        # Send request
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
         
         logger.info(f"🎨 Starting image generation with prompt: {prompt[:50]}...")
-        response = requests.post(run_url, headers=headers, json=workflow, timeout=30)
+        logger.debug(f"Using UNET model: {unet_model}, CLIP models: {clip_model_1}, {clip_model_2}, VAE: {vae_model}")
+        logger.debug(f"Settings: steps={steps}, cfg={cfg}, guidance={guidance}, size={width}x{height}, seed={seed}")
+        
+        response = requests.post(runsync_url, headers=headers, json=workflow, timeout=600)
         
         if response.status_code != 200:
             error_msg = f"API request failed with status {response.status_code}: {response.text}"
             logger.error(error_msg)
+            logger.error(f"Workflow being sent uses UNET: {unet_model}, CLIP: {clip_model_1}, {clip_model_2}")
             return {
                 "success": False,
                 "error": error_msg
             }
         
-        response_data = response.json()
-        job_id = response_data.get('id')
+        result = response.json()
+        job_id = result.get("id", "N/A")
         
-        if not job_id:
-            error_msg = f"API response did not include a job ID. Response: {json.dumps(response_data, indent=2)}"
-            logger.error(error_msg)
-            return {
-                "success": False,
-                "error": error_msg
-            }
+        logger.info(f"✅ Job ID: {job_id}")
         
-        logger.info(f"✅ Job started with ID: {job_id}")
-        
-        # Poll for job status
-        status_url = status_url_template + job_id
-        poll_count = 0
-        max_polls = 120  # 10 minutes max (5 second intervals)
-        
-        while poll_count < max_polls:
-            logger.debug(f"Polling job status... (attempt {poll_count + 1})")
-            status_response = requests.get(status_url, headers=headers, timeout=30)
-            status_data = status_response.json()
-            job_status = status_data.get('status')
+        # Check if job is still in queue/progress (runsync might return immediately)
+        if result.get("status") in ["IN_QUEUE", "IN_PROGRESS"]:
+            logger.info("Job is queued/running, polling for completion...")
+            status_url = f"https://api.runpod.ai/v2/{endpoint_id}/status/{job_id}"
+            max_polls = 120
+            poll_count = 0
             
-            if job_status == 'COMPLETED':
-                logger.info("✅ Job completed successfully!")
+            while poll_count < max_polls:
+                time.sleep(5)
+                status_response = requests.get(status_url, headers=headers, timeout=60)
+                if status_response.status_code == 200:
+                    result = status_response.json()
+                    status = result.get('status', 'UNKNOWN')
+                    if poll_count % 10 == 0:
+                        logger.debug(f"Polling status: {status} (attempt {poll_count + 1})")
+                    if status not in ["IN_QUEUE", "IN_PROGRESS"]:
+                        break
+                poll_count += 1
+        
+        # Check for errors
+        if "error" in result:
+            error_msg = result["error"]
+            logger.error(f"Job error: {error_msg}")
+            return {
+                "success": False,
+                "error": error_msg,
+                "job_id": job_id
+            }
+        
+        # Extract image data
+        if "output" in result:
+            output = result["output"]
+            images = output.get("images", [])
+            
+            if not images:
+                error_msg = "No images in job output"
+                logger.error(error_msg)
+                logger.debug(f"Full response: {json.dumps(result, indent=2)[:1000]}")
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "job_id": job_id
+                }
+            
+            # Get first image
+            image_data = images[0]
+            img_type = image_data.get("type", "base64")
+            data = image_data.get("data", "")
+            filename = image_data.get("filename", "generated_image.png")
+            
+            if img_type == "base64":
+                if not data:
+                    error_msg = "No image data in response"
+                    logger.error(error_msg)
+                    return {
+                        "success": False,
+                        "error": error_msg,
+                        "job_id": job_id
+                    }
                 
+                # Decode base64 image to verify it's valid
                 try:
-                    # Extract image data
-                    output = status_data.get('output', {})
-                    images = output.get('images', [])
-                    
-                    if not images:
-                        error_msg = "No images in job output"
-                        logger.error(error_msg)
-                        return {
-                            "success": False,
-                            "error": error_msg,
-                            "job_id": job_id
-                        }
-                    
-                    # Get first image
-                    image_data = images[0]
-                    image_base64 = image_data.get('data')
-                    filename = image_data.get('filename', 'generated_image.png')
-                    
-                    if not image_base64:
-                        error_msg = "No image data in response"
-                        logger.error(error_msg)
-                        return {
-                            "success": False,
-                            "error": error_msg,
-                            "job_id": job_id
-                        }
-                    
-                    # Decode base64 image to verify it's valid
-                    image_bytes = base64.b64decode(image_base64)
+                    image_bytes = base64.b64decode(data)
                     image = Image.open(BytesIO(image_bytes))
+                    
+                    # Check if image is mostly white/blank
+                    gray = image.convert('L')
+                    avg_brightness = sum(gray.getdata()) / (gray.size[0] * gray.size[1])
+                    
+                    if avg_brightness > 240:
+                        logger.warning(f"Image appears to be mostly white/blank (brightness: {avg_brightness:.1f}/255)")
                     
                     # Only save image if save_path is explicitly provided
                     image_path = None
@@ -264,12 +457,11 @@ def generate_image(
                         image.save(image_path)
                         logger.info(f"💾 Image saved to: {image_path}")
                     else:
-                        # Don't save to disk - just return base64 data
                         logger.info(f"✅ Image generated successfully (not saving to disk)")
                     
                     return {
                         "success": True,
-                        "image_base64": image_base64,  # Always include base64 for Discord attachment
+                        "image_base64": data,  # Always include base64 for Discord attachment
                         "image_path": image_path,  # Only set if save_path was provided
                         "filename": filename,
                         "job_id": job_id,
@@ -279,56 +471,51 @@ def generate_image(
                         "height": height,
                         "steps": steps,
                         "cfg": cfg,
-                        "seed": seed
+                        "seed": seed,
+                        "guidance": guidance
                     }
                     
-                except (KeyError, IndexError, TypeError, Exception) as e:
+                except Exception as e:
                     error_msg = f"Error processing image data: {str(e)}"
                     logger.error(error_msg, exc_info=True)
-                    
-                    # Try to provide debug info
-                    debug_data = json.loads(json.dumps(status_data))
-                    try:
-                        if 'output' in debug_data and 'images' in debug_data['output']:
-                            for img in debug_data['output']['images']:
-                                if 'data' in img:
-                                    original_length = len(img['data'])
-                                    img['data'] = f"<base64 data redacted, original length: {original_length}>"
-                    except Exception:
-                        pass
-                    
-                    logger.debug(f"Full response (redacted): {json.dumps(debug_data, indent=2)}")
-                    
                     return {
                         "success": False,
                         "error": error_msg,
                         "job_id": job_id
                     }
-            
-            elif job_status in ['IN_QUEUE', 'IN_PROGRESS']:
-                time.sleep(5)
-                poll_count += 1
+            elif img_type == "s3_url":
+                logger.info(f"Image is at S3 URL: {data}")
+                return {
+                    "success": True,
+                    "image_url": data,
+                    "filename": filename,
+                    "job_id": job_id,
+                    "prompt": prompt,
+                    "negative_prompt": negative_prompt,
+                    "width": width,
+                    "height": height,
+                    "steps": steps,
+                    "cfg": cfg,
+                    "seed": seed,
+                    "guidance": guidance
+                }
             else:
-                error_msg = f"Job execution failed or was cancelled. Status: {job_status}"
+                error_msg = f"Unknown image type: {img_type}"
                 logger.error(error_msg)
-                if 'error' in status_data:
-                    error_msg += f" Error details: {status_data['error']}"
-                
                 return {
                     "success": False,
                     "error": error_msg,
-                    "job_id": job_id,
-                    "status": job_status
+                    "job_id": job_id
                 }
-        
-        # Timeout
-        error_msg = f"Job did not complete within expected time (max {max_polls * 5} seconds)"
-        logger.error(error_msg)
-        return {
-            "success": False,
-            "error": error_msg,
-            "job_id": job_id
-        }
+        else:
+            error_msg = "No output in response"
+            logger.error(error_msg)
+            logger.debug(f"Full response: {json.dumps(result, indent=2)[:1000]}")
+            return {
+                "success": False,
+                "error": error_msg,
+                "job_id": job_id
+            }
         
     except requests.exceptions.Timeout:
         error_msg = "Request timed out. The API may be slow or unavailable."

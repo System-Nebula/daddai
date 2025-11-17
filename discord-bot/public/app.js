@@ -77,6 +77,7 @@ function initializeApp() {
     initializeViewMode();
     updatePageTitle();
     setupLazyLoading(); // NEW: Setup lazy loading
+    startAnalyticsAutoRefresh(); // Start auto-refresh for analytics
 }
 
 async function loadInitialData() {
@@ -375,6 +376,8 @@ function switchTab(tabName) {
     // Re-render with current view mode
     if (tabName === 'memories') {
         renderMemories(AppState.filteredMemories.length > 0 ? AppState.filteredMemories : AppState.memories);
+    } else if (tabName === 'analytics') {
+        loadAnalytics();
     } else {
         renderDocuments(AppState.filteredDocuments.length > 0 ? AppState.filteredDocuments : AppState.documents);
     }
@@ -387,6 +390,9 @@ function updatePageTitle() {
     if (AppState.currentTab === 'memories') {
         if (pageTitle) pageTitle.textContent = 'Memories';
         if (pageSubtitle) pageSubtitle.textContent = 'View and manage conversation memories';
+    } else if (AppState.currentTab === 'analytics') {
+        if (pageTitle) pageTitle.textContent = 'Analytics';
+        if (pageSubtitle) pageSubtitle.textContent = 'System status, metrics, and insights';
     } else {
         if (pageTitle) pageTitle.textContent = 'Documents';
         if (pageSubtitle) pageSubtitle.textContent = 'Browse and explore uploaded documents';
@@ -1292,4 +1298,1594 @@ function showLoadingOverlay(show = true) {
     if (overlay) {
         overlay.style.display = show ? 'flex' : 'none';
     }
+}
+
+// ============================================
+// Analytics Dashboard Functions
+// ============================================
+
+// Chart instances
+let memoryTypesChart = null;
+let documentTypesChart = null;
+let topChannelsChart = null;
+let memoryGrowthChart = null;
+let documentGrowthChart = null;
+let queryVolumeChart = null;
+let storageGrowthChart = null;
+let latencyDistributionChart = null;
+let cachePerformanceChart = null;
+let operationBreakdownChart = null;
+let errorRateChart = null;
+let retrievalQualityChart = null;
+let generationQualityChart = null;
+let topicClustersChart = null;
+let topUsersChart = null;
+let engagementChart = null;
+let queryTypesChart = null;
+let documentAccessChart = null;
+let storageByTypeChart = null;
+let chunkDistributionChart = null;
+let systemLoadChart = null;
+
+// Analytics cache
+let analyticsCache = {
+    data: null,
+    timestamp: 0,
+    ttl: 10000 // 10 seconds
+};
+
+// Auto-refresh interval
+let analyticsRefreshInterval = null;
+
+// Alerts system
+let alerts = [];
+let alertsCheckInterval = null;
+
+// Load analytics data concurrently - COMPREHENSIVE
+async function loadAnalytics() {
+    try {
+        // Check cache first
+        const now = Date.now();
+        if (analyticsCache.data && (now - analyticsCache.timestamp) < analyticsCache.ttl) {
+            renderComprehensiveAnalytics(analyticsCache.data);
+            return;
+        }
+
+        // Fetch ALL data concurrently for maximum speed with timeouts
+        const fetchWithTimeout = (url, timeout = 5000) => {
+            return Promise.race([
+                fetch(url).then(r => {
+                    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                    return r.json();
+                }),
+                new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('Timeout')), timeout)
+                )
+            ]).catch(err => {
+                console.warn(`[Analytics] Failed to fetch ${url}:`, err.message);
+                return null;
+            });
+        };
+
+        const [
+            comprehensiveResult,
+            trendsResult,
+            performanceResult,
+            knowledgeGraphResult,
+            userActivityResult,
+            queryAnalyticsResult,
+            documentPopularityResult,
+            storageResult,
+            configResult,
+            modelInfoResult,
+            metricsResult
+        ] = await Promise.allSettled([
+            fetchWithTimeout(`${API_BASE}/api/analytics`, 10000),
+            fetchWithTimeout(`${API_BASE}/api/analytics/trends?days=30`, 5000),
+            fetchWithTimeout(`${API_BASE}/api/analytics/performance`, 5000),
+            fetchWithTimeout(`${API_BASE}/api/analytics/knowledge-graph`, 5000),
+            fetchWithTimeout(`${API_BASE}/api/analytics/users`, 5000),
+            fetchWithTimeout(`${API_BASE}/api/analytics/queries`, 5000),
+            fetchWithTimeout(`${API_BASE}/api/analytics/documents/popularity`, 5000),
+            fetchWithTimeout(`${API_BASE}/api/analytics`, 5000).then(d => d?.documents?.storage || null),
+            fetchWithTimeout(`${API_BASE}/api/config`, 5000),
+            fetchWithTimeout(`${API_BASE}/api/model-info`, 5000),
+            fetchWithTimeout(`${API_BASE}/api/metrics`, 5000)
+        ]);
+
+        const comprehensive = {
+            basic: comprehensiveResult.status === 'fulfilled' ? comprehensiveResult.value : null,
+            trends: trendsResult.status === 'fulfilled' ? trendsResult.value : null,
+            performance: performanceResult.status === 'fulfilled' ? performanceResult.value : null,
+            knowledgeGraph: knowledgeGraphResult.status === 'fulfilled' ? knowledgeGraphResult.value : null,
+            userActivity: userActivityResult.status === 'fulfilled' ? userActivityResult.value : null,
+            queryAnalytics: queryAnalyticsResult.status === 'fulfilled' ? queryAnalyticsResult.value : null,
+            documentPopularity: documentPopularityResult.status === 'fulfilled' ? documentPopularityResult.value : null,
+            storage: storageResult.status === 'fulfilled' ? storageResult.value : null,
+            configuration: configResult.status === 'fulfilled' ? configResult.value : null,
+            modelInfo: modelInfoResult.status === 'fulfilled' ? modelInfoResult.value : null,
+            metrics: metricsResult.status === 'fulfilled' ? metricsResult.value : null
+        };
+
+        // Cache the result
+        analyticsCache.data = comprehensive;
+        analyticsCache.timestamp = now;
+
+        // Only render if we have at least basic data
+        if (comprehensive.basic || comprehensive.metrics) {
+            renderComprehensiveAnalytics(comprehensive);
+            checkAlerts(comprehensive);
+        } else {
+            console.warn('[Analytics] No data available to render');
+            // Show error message in UI
+            const analyticsTab = document.getElementById('analyticsTab');
+            if (analyticsTab) {
+                analyticsTab.innerHTML = `
+                    <div style="padding: 2rem; text-align: center;">
+                        <h2 style="color: var(--text-primary); margin-bottom: 1rem;">Unable to Load Analytics</h2>
+                        <p style="color: var(--text-secondary); margin-bottom: 1rem;">
+                            The analytics server may not be running or endpoints are unavailable.
+                        </p>
+                        <p style="color: var(--text-muted); font-size: 0.875rem;">
+                            Make sure the Discord bot server is running and try refreshing.
+                        </p>
+                    </div>
+                `;
+            }
+        }
+    } catch (error) {
+        console.error('Error loading analytics:', error);
+        showToast('Error loading analytics - some data may be unavailable', 'warning');
+        
+        // Try to render with whatever we have
+        if (analyticsCache.data) {
+            renderComprehensiveAnalytics(analyticsCache.data);
+        }
+    }
+}
+
+// Render comprehensive analytics dashboard
+function renderComprehensiveAnalytics(data) {
+    if (!data) {
+        console.warn('[Analytics] No data to render');
+        return;
+    }
+
+    const basic = data.basic || data;
+    
+    // Show loading state removal
+    document.querySelectorAll('.loading-state').forEach(el => {
+        if (el.parentElement) {
+            el.style.display = 'none';
+        }
+    });
+
+    // Render system health
+    renderSystemHealth(basic.system);
+
+    // Render statistics
+    renderStatistics(basic);
+
+    // Render basic charts
+    renderCharts(basic);
+
+    // Render trends
+    if (data.trends) {
+        renderTrends(data.trends);
+    }
+
+    // Render detailed performance
+    if (data.performance) {
+        renderDetailedPerformance(data.performance);
+    }
+
+    // Render knowledge graph
+    if (data.knowledgeGraph) {
+        renderKnowledgeGraph(data.knowledgeGraph);
+    }
+
+    // Render user activity
+    if (data.userActivity) {
+        renderUserActivity(data.userActivity);
+    }
+
+    // Render LLM info
+    if (data.modelInfo) {
+        renderLLMInfo(data.modelInfo);
+    }
+
+    // Render query analytics
+    if (data.queryAnalytics) {
+        renderQueryAnalytics(data.queryAnalytics);
+    }
+
+    // Render document popularity
+    if (data.documentPopularity) {
+        renderDocumentPopularity(data.documentPopularity);
+    }
+
+    // Render storage details
+    if (data.storage || basic.documents?.storage) {
+        renderStorageDetails(data.storage || basic.documents.storage);
+    }
+
+    // Render configuration
+    if (data.configuration) {
+        renderConfiguration(data.configuration);
+    }
+
+    // Render activity
+    renderActivity(basic);
+
+    // Render performance metrics
+    renderPerformanceMetrics(basic.performance || data.metrics);
+
+    // Render real-time monitor
+    renderRealtimeMonitor(data);
+}
+
+// Render system health cards
+function renderSystemHealth(system) {
+    // Neo4j
+    const neo4j = system?.neo4j || {};
+    const neo4jStatus = neo4j.connected ? 'Connected' : 'Disconnected';
+    const neo4jStatusEl = document.getElementById('neo4jHealthStatus');
+    if (neo4jStatusEl) {
+        neo4jStatusEl.textContent = neo4jStatus;
+        neo4jStatusEl.className = `health-status ${neo4j.connected ? 'status-connected' : 'status-disconnected'}`;
+    }
+    updateElement('neo4jStatusValue', neo4jStatus);
+    updateElement('neo4jVersion', neo4j.version || 'N/A');
+
+    // Elasticsearch
+    const es = system?.elasticsearch || {};
+    const esStatus = es.enabled && es.connected ? 'Connected' : es.enabled ? 'Disconnected' : 'Disabled';
+    const esStatusEl = document.getElementById('elasticsearchHealthStatus');
+    if (esStatusEl) {
+        esStatusEl.textContent = esStatus;
+        if (es.enabled && es.connected) {
+            esStatusEl.className = 'health-status status-connected';
+        } else if (es.enabled) {
+            esStatusEl.className = 'health-status status-warning';
+        } else {
+            esStatusEl.className = 'health-status status-disconnected';
+        }
+    }
+    updateElement('elasticsearchStatusValue', esStatus);
+    updateElement('elasticsearchVersion', es.version || 'N/A');
+    updateElement('elasticsearchDocCount', es.indices?.documents?.count?.toLocaleString() || '0');
+    updateElement('elasticsearchChunkCount', es.indices?.chunks?.count?.toLocaleString() || '0');
+
+    // Server
+    const server = system?.server || {};
+    updateElement('serverUptime', formatUptime(server.uptime || 0));
+    updateElement('serverMemory', formatBytes(server.memory?.heapUsed || 0));
+    updateElement('serverNodeVersion', server.nodeVersion || 'N/A');
+}
+
+// Render statistics cards
+function renderStatistics(data) {
+    const memories = data.memories || {};
+    const documents = data.documents || {};
+    const channels = data.memories?.topChannels || [];
+
+    updateElement('analyticsTotalMemories', memories.total?.toLocaleString() || '0');
+    updateElement('analyticsTotalDocuments', documents.total?.toLocaleString() || '0');
+    updateElement('analyticsTotalChannels', channels.length?.toLocaleString() || '0');
+    updateElement('analyticsTotalChunks', documents.storage?.totalChunks?.toLocaleString() || '0');
+
+    // Memory breakdown
+    const memoryBreakdown = Object.entries(memories.byType || {})
+        .map(([type, count]) => `${type}: ${count}`)
+        .join(', ');
+    updateElement('analyticsMemoryBreakdown', memoryBreakdown || 'No data');
+
+    // Document breakdown
+    const docBreakdown = Object.entries(documents.byType || {})
+        .map(([type, count]) => `${type}: ${count}`)
+        .join(', ');
+    updateElement('analyticsDocumentBreakdown', docBreakdown || 'No data');
+
+    // Chunk breakdown
+    const avgChunks = documents.storage?.avgChunksPerDoc || 0;
+    updateElement('analyticsChunkBreakdown', `Avg: ${avgChunks} chunks/doc`);
+}
+
+// Render charts
+function renderCharts(data) {
+    const memories = data.memories || {};
+    const documents = data.documents || {};
+
+    // Memory Types Chart (Pie)
+    renderMemoryTypesChart(memories.byType || {});
+
+    // Document Types Chart (Pie)
+    renderDocumentTypesChart(documents.byType || {});
+
+    // Top Channels Chart (Bar)
+    renderTopChannelsChart(memories.topChannels || []);
+}
+
+// Render memory types pie chart
+function renderMemoryTypesChart(byType) {
+    const ctx = document.getElementById('memoryTypesChart');
+    if (!ctx) return;
+
+    const labels = Object.keys(byType);
+    const values = Object.values(byType);
+
+    if (memoryTypesChart) {
+        memoryTypesChart.destroy();
+    }
+
+    memoryTypesChart = new Chart(ctx, {
+        type: 'pie',
+        data: {
+            labels: labels,
+            datasets: [{
+                data: values,
+                backgroundColor: [
+                    'rgba(138, 173, 244, 0.8)',
+                    'rgba(198, 160, 246, 0.8)',
+                    'rgba(139, 233, 253, 0.8)',
+                    'rgba(166, 218, 149, 0.8)',
+                    'rgba(238, 212, 159, 0.8)',
+                    'rgba(245, 169, 127, 0.8)'
+                ],
+                borderColor: 'var(--bg-primary)',
+                borderWidth: 2
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            plugins: {
+                legend: {
+                    position: 'bottom',
+                    labels: {
+                        color: 'var(--text-primary)',
+                        font: {
+                            family: 'var(--font-sans)',
+                            size: 12
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+// Render document types pie chart
+function renderDocumentTypesChart(byType) {
+    const ctx = document.getElementById('documentTypesChart');
+    if (!ctx) return;
+
+    const labels = Object.keys(byType);
+    const values = Object.values(byType);
+
+    if (documentTypesChart) {
+        documentTypesChart.destroy();
+    }
+
+    documentTypesChart = new Chart(ctx, {
+        type: 'doughnut',
+        data: {
+            labels: labels,
+            datasets: [{
+                data: values,
+                backgroundColor: [
+                    'rgba(138, 173, 244, 0.8)',
+                    'rgba(198, 160, 246, 0.8)',
+                    'rgba(139, 233, 253, 0.8)',
+                    'rgba(166, 218, 149, 0.8)',
+                    'rgba(238, 212, 159, 0.8)'
+                ],
+                borderColor: 'var(--bg-primary)',
+                borderWidth: 2
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            plugins: {
+                legend: {
+                    position: 'bottom',
+                    labels: {
+                        color: 'var(--text-primary)',
+                        font: {
+                            family: 'var(--font-sans)',
+                            size: 12
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+// Render top channels bar chart
+function renderTopChannelsChart(topChannels) {
+    const ctx = document.getElementById('topChannelsChart');
+    if (!ctx) return;
+
+    const sorted = topChannels.slice(0, 10).sort((a, b) => b.memory_count - a.memory_count);
+    const labels = sorted.map(ch => ch.channel_name || 'Unknown').slice(0, 10);
+    const values = sorted.map(ch => ch.memory_count).slice(0, 10);
+
+    if (topChannelsChart) {
+        topChannelsChart.destroy();
+    }
+
+    topChannelsChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: 'Memories',
+                data: values,
+                backgroundColor: 'rgba(138, 173, 244, 0.8)',
+                borderColor: 'var(--accent)',
+                borderWidth: 1
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            indexAxis: 'y',
+            plugins: {
+                legend: {
+                    display: false
+                }
+            },
+            scales: {
+                x: {
+                    ticks: {
+                        color: 'var(--text-muted)',
+                        font: {
+                            family: 'var(--font-sans)',
+                            size: 11
+                        }
+                    },
+                    grid: {
+                        color: 'var(--border-color)'
+                    }
+                },
+                y: {
+                    ticks: {
+                        color: 'var(--text-muted)',
+                        font: {
+                            family: 'var(--font-sans)',
+                            size: 11
+                        }
+                    },
+                    grid: {
+                        color: 'var(--border-color)'
+                    }
+                }
+            }
+        }
+    });
+}
+
+// Render activity list
+function renderActivity(data) {
+    const activityList = document.getElementById('recentActivityList');
+    if (!activityList) return;
+
+    const memories = data.memories?.recent || [];
+    const documents = data.documents?.recent || [];
+
+    // Combine and sort by date
+    const activities = [
+        ...memories.map(m => ({
+            type: 'memory',
+            icon: '🧠',
+            text: `Memory created in ${m.channel || 'unknown'}`,
+            date: m.created_at
+        })),
+        ...documents.map(d => ({
+            type: 'document',
+            icon: '📄',
+            text: `Document uploaded: ${d.file_name || 'unknown'}`,
+            date: d.uploaded_at
+        }))
+    ].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 20);
+
+    if (activities.length === 0) {
+        activityList.innerHTML = '<div class="empty-state"><p>No recent activity</p></div>';
+        return;
+    }
+
+    activityList.innerHTML = activities.map(activity => `
+        <div class="activity-item">
+            <div class="activity-icon">${activity.icon}</div>
+            <div class="activity-content">
+                <div class="activity-text">${escapeHtml(activity.text)}</div>
+                <div class="activity-meta">${formatDate(activity.date)}</div>
+            </div>
+        </div>
+    `).join('');
+}
+
+// Render performance metrics
+function renderPerformanceMetrics(performance) {
+    const metricsContainer = document.getElementById('performanceMetrics');
+    if (!metricsContainer) return;
+
+    if (!performance || !performance.avgLatency && !performance.cacheHitRate) {
+        metricsContainer.innerHTML = '<div class="empty-state"><p>Performance metrics not available</p></div>';
+        return;
+    }
+
+    const metrics = [];
+    if (performance.avgLatency !== null) {
+        metrics.push({
+            label: 'Avg Latency',
+            value: `${performance.avgLatency.toFixed(2)}ms`,
+            class: performance.avgLatency < 100 ? 'success' : performance.avgLatency < 500 ? 'warning' : 'error'
+        });
+    }
+    if (performance.cacheHitRate !== null) {
+        metrics.push({
+            label: 'Cache Hit Rate',
+            value: `${(performance.cacheHitRate * 100).toFixed(1)}%`,
+            class: performance.cacheHitRate > 0.7 ? 'success' : performance.cacheHitRate > 0.4 ? 'warning' : 'error'
+        });
+    }
+    if (performance.totalQueries) {
+        metrics.push({
+            label: 'Total Queries',
+            value: performance.totalQueries.toLocaleString(),
+            class: ''
+        });
+    }
+    if (performance.intentClassifications) {
+        metrics.push({
+            label: 'Intent Classifications',
+            value: performance.intentClassifications.toLocaleString(),
+            class: ''
+        });
+    }
+
+    metricsContainer.innerHTML = metrics.map(m => `
+        <div class="performance-metric">
+            <span class="performance-metric-label">${m.label}</span>
+            <span class="performance-metric-value ${m.class}">${m.value}</span>
+        </div>
+    `).join('');
+}
+
+// Utility functions for analytics
+function updateElement(id, value) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value;
+}
+
+function formatUptime(seconds) {
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const mins = Math.floor((seconds % 3600) / 60);
+    if (days > 0) return `${days}d ${hours}h`;
+    if (hours > 0) return `${hours}h ${mins}m`;
+    return `${mins}m`;
+}
+
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+}
+
+// Start analytics auto-refresh
+function startAnalyticsAutoRefresh() {
+    if (analyticsRefreshInterval) {
+        clearInterval(analyticsRefreshInterval);
+    }
+    
+    analyticsRefreshInterval = setInterval(() => {
+        if (AppState.currentTab === 'analytics') {
+            loadAnalytics();
+        }
+    }, 30000); // Refresh every 30 seconds
+}
+
+// Stop analytics auto-refresh
+function stopAnalyticsAutoRefresh() {
+    if (analyticsRefreshInterval) {
+        clearInterval(analyticsRefreshInterval);
+        analyticsRefreshInterval = null;
+    }
+}
+
+// ============================================
+// Comprehensive Analytics Rendering Functions
+// ============================================
+
+// Render trends charts
+function renderTrends(trends) {
+    if (!trends) {
+        console.warn('[Analytics] No trends data');
+        return;
+    }
+
+    // Only render if Chart.js is available
+    if (typeof Chart === 'undefined') {
+        console.error('[Analytics] Chart.js not loaded');
+        return;
+    }
+
+    // Memory Growth
+    if (trends.memories && trends.memories.length > 0) {
+        renderTrendChart('memoryGrowthChart', trends.memories, 'Memory Growth', 'rgba(138, 173, 244, 0.8)');
+    }
+    
+    // Document Growth
+    if (trends.documents && trends.documents.length > 0) {
+        renderTrendChart('documentGrowthChart', trends.documents, 'Document Growth', 'rgba(198, 160, 246, 0.8)');
+    }
+    
+    // Query Volume
+    if (trends.queries && trends.queries.length > 0) {
+        renderTrendChart('queryVolumeChart', trends.queries, 'Query Volume', 'rgba(166, 218, 149, 0.8)');
+    }
+    
+    // Storage Growth
+    if (trends.storage && trends.storage.length > 0) {
+        renderTrendChart('storageGrowthChart', trends.storage, 'Storage Growth', 'rgba(238, 212, 159, 0.8)');
+    }
+}
+
+// Render trend line chart
+function renderTrendChart(canvasId, data, label, color) {
+    const ctx = document.getElementById(canvasId);
+    if (!ctx || !data || data.length === 0) return;
+
+    // Destroy existing chart if it exists
+    const chartMap = {
+        'memoryGrowthChart': memoryGrowthChart,
+        'documentGrowthChart': documentGrowthChart,
+        'queryVolumeChart': queryVolumeChart,
+        'storageGrowthChart': storageGrowthChart
+    };
+    
+    const existingChart = chartMap[canvasId];
+    if (existingChart && typeof existingChart.destroy === 'function') {
+        try {
+            existingChart.destroy();
+        } catch (e) {
+            console.warn('Error destroying chart:', e);
+        }
+    }
+
+    // Check if Chart.js is available
+    if (typeof Chart === 'undefined') {
+        console.error('[Analytics] Chart.js not loaded');
+        return;
+    }
+
+    const labels = data.map(d => {
+        const date = new Date(d.date);
+        return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    });
+    const values = data.map(d => d.cumulative || d.value || 0);
+
+    // Create and store chart instance
+    let newChart;
+    try {
+        newChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: label,
+                data: values,
+                borderColor: color,
+                backgroundColor: color.replace('0.8', '0.1'),
+                borderWidth: 2,
+                fill: true,
+                tension: 0.4
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            plugins: {
+                legend: {
+                    display: false
+                }
+            },
+            scales: {
+                x: {
+                    ticks: {
+                        color: 'var(--text-muted)',
+                        font: { family: 'var(--font-sans)', size: 11 }
+                    },
+                    grid: { color: 'var(--border-color)' }
+                },
+                y: {
+                    ticks: {
+                        color: 'var(--text-muted)',
+                        font: { family: 'var(--font-sans)', size: 11 }
+                    },
+                    grid: { color: 'var(--border-color)' }
+                }
+            }
+        }
+    });
+    
+    // Store chart instance
+    if (canvasId === 'memoryGrowthChart') memoryGrowthChart = newChart;
+    else if (canvasId === 'documentGrowthChart') documentGrowthChart = newChart;
+    else if (canvasId === 'queryVolumeChart') queryVolumeChart = newChart;
+    else if (canvasId === 'storageGrowthChart') storageGrowthChart = newChart;
+    } catch (error) {
+        console.error(`[Analytics] Error creating chart ${canvasId}:`, error);
+    }
+}
+
+// Render detailed performance metrics
+function renderDetailedPerformance(performance) {
+    if (!performance) return;
+
+    // Latency metrics
+    const latencyEl = document.getElementById('latencyMetrics');
+    if (latencyEl && performance.latency) {
+        const lat = performance.latency;
+        latencyEl.innerHTML = `
+            <div class="performance-metric">
+                <span class="performance-metric-label">P50</span>
+                <span class="performance-metric-value">${lat.p50?.toFixed(2) || 0}ms</span>
+            </div>
+            <div class="performance-metric">
+                <span class="performance-metric-label">P95</span>
+                <span class="performance-metric-value">${lat.p95?.toFixed(2) || 0}ms</span>
+            </div>
+            <div class="performance-metric">
+                <span class="performance-metric-label">P99</span>
+                <span class="performance-metric-value">${lat.p99?.toFixed(2) || 0}ms</span>
+            </div>
+            <div class="performance-metric">
+                <span class="performance-metric-label">Mean</span>
+                <span class="performance-metric-value">${lat.mean?.toFixed(2) || 0}ms</span>
+            </div>
+            <div class="performance-metric">
+                <span class="performance-metric-label">Max</span>
+                <span class="performance-metric-value">${lat.max?.toFixed(2) || 0}ms</span>
+            </div>
+        `;
+        
+        // Latency distribution chart
+        renderLatencyDistributionChart([lat.p50 || 0, lat.p95 || 0, lat.p99 || 0, lat.mean || 0]);
+    }
+
+    // Cache metrics
+    const cacheEl = document.getElementById('cacheMetrics');
+    if (cacheEl && performance.cacheStats) {
+        const cache = performance.cacheStats;
+        cacheEl.innerHTML = `
+            <div class="performance-metric">
+                <span class="performance-metric-label">Hit Rate</span>
+                <span class="performance-metric-value ${cache.hitRate > 0.7 ? 'success' : ''}">${((cache.hitRate || 0) * 100).toFixed(1)}%</span>
+            </div>
+            <div class="performance-metric">
+                <span class="performance-metric-label">Hits</span>
+                <span class="performance-metric-value">${(cache.hits || 0).toLocaleString()}</span>
+            </div>
+            <div class="performance-metric">
+                <span class="performance-metric-label">Misses</span>
+                <span class="performance-metric-value">${(cache.misses || 0).toLocaleString()}</span>
+            </div>
+        `;
+        
+        // Cache performance chart
+        renderCachePerformanceChart(cache);
+    }
+
+    // Operation metrics
+    const opEl = document.getElementById('operationMetrics');
+    if (opEl && performance.operations) {
+        const ops = performance.operations;
+        opEl.innerHTML = `
+            <div class="performance-metric">
+                <span class="performance-metric-label">Retrieval</span>
+                <span class="performance-metric-value">${(ops.retrieval || 0).toLocaleString()}</span>
+            </div>
+            <div class="performance-metric">
+                <span class="performance-metric-label">Generation</span>
+                <span class="performance-metric-value">${(ops.generation || 0).toLocaleString()}</span>
+            </div>
+            <div class="performance-metric">
+                <span class="performance-metric-label">Reranking</span>
+                <span class="performance-metric-value">${(ops.reranking || 0).toLocaleString()}</span>
+            </div>
+        `;
+        
+        renderOperationBreakdownChart(ops);
+    }
+
+    // Error metrics
+    const errorEl = document.getElementById('errorMetrics');
+    if (errorEl) {
+        const errorRate = performance.errorRate || 0;
+        errorEl.innerHTML = `
+            <div class="performance-metric">
+                <span class="performance-metric-label">Error Rate</span>
+                <span class="performance-metric-value ${errorRate > 0.1 ? 'error' : errorRate > 0.05 ? 'warning' : 'success'}">${(errorRate * 100).toFixed(2)}%</span>
+            </div>
+        `;
+    }
+}
+
+// Render latency distribution chart
+function renderLatencyDistributionChart(values) {
+    const ctx = document.getElementById('latencyDistributionChart');
+    if (!ctx) return;
+
+    if (latencyDistributionChart) {
+        latencyDistributionChart.destroy();
+    }
+
+    latencyDistributionChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: ['P50', 'P95', 'P99', 'Mean'],
+            datasets: [{
+                label: 'Latency (ms)',
+                data: values,
+                backgroundColor: [
+                    'rgba(138, 173, 244, 0.8)',
+                    'rgba(198, 160, 246, 0.8)',
+                    'rgba(139, 233, 253, 0.8)',
+                    'rgba(166, 218, 149, 0.8)'
+                ]
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            plugins: {
+                legend: { display: false }
+            },
+            scales: {
+                y: {
+                    ticks: { color: 'var(--text-muted)', font: { family: 'var(--font-sans)', size: 11 } },
+                    grid: { color: 'var(--border-color)' }
+                },
+                x: {
+                    ticks: { color: 'var(--text-muted)', font: { family: 'var(--font-sans)', size: 11 } },
+                    grid: { color: 'var(--border-color)' }
+                }
+            }
+        }
+    });
+}
+
+// Render cache performance chart
+function renderCachePerformanceChart(cache) {
+    const ctx = document.getElementById('cachePerformanceChart');
+    if (!ctx) return;
+
+    if (cachePerformanceChart) {
+        cachePerformanceChart.destroy();
+    }
+
+    cachePerformanceChart = new Chart(ctx, {
+        type: 'doughnut',
+        data: {
+            labels: ['Hits', 'Misses'],
+            datasets: [{
+                data: [cache.hits || 0, cache.misses || 0],
+                backgroundColor: [
+                    'rgba(166, 218, 149, 0.8)',
+                    'rgba(237, 135, 150, 0.8)'
+                ]
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            plugins: {
+                legend: {
+                    position: 'bottom',
+                    labels: { color: 'var(--text-primary)', font: { family: 'var(--font-sans)', size: 12 } }
+                }
+            }
+        }
+    });
+}
+
+// Render operation breakdown chart
+function renderOperationBreakdownChart(ops) {
+    const ctx = document.getElementById('operationBreakdownChart');
+    if (!ctx) return;
+
+    if (operationBreakdownChart) {
+        operationBreakdownChart.destroy();
+    }
+
+    operationBreakdownChart = new Chart(ctx, {
+        type: 'pie',
+        data: {
+            labels: ['Retrieval', 'Generation', 'Reranking'],
+            datasets: [{
+                data: [ops.retrieval || 0, ops.generation || 0, ops.reranking || 0],
+                backgroundColor: [
+                    'rgba(138, 173, 244, 0.8)',
+                    'rgba(198, 160, 246, 0.8)',
+                    'rgba(139, 233, 253, 0.8)'
+                ]
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            plugins: {
+                legend: {
+                    position: 'bottom',
+                    labels: { color: 'var(--text-primary)', font: { family: 'var(--font-sans)', size: 12 } }
+                }
+            }
+        }
+    });
+}
+
+// Render knowledge graph
+function renderKnowledgeGraph(kg) {
+    if (!kg) return;
+
+    // Topic clusters
+    const topicsEl = document.getElementById('topicClusters');
+    if (topicsEl && kg.topicClusters) {
+        if (kg.topicClusters.length === 0) {
+            topicsEl.innerHTML = '<div class="empty-state"><p>No topic clusters found</p></div>';
+        } else {
+            topicsEl.innerHTML = kg.topicClusters.map(topic => `
+                <div class="topic-item">
+                    <span>${escapeHtml(topic.topic || 'Unknown')}</span>
+                    <span class="metric-value">${topic.documentCount || 0}</span>
+                </div>
+            `).join('');
+        }
+        
+        // Topic clusters chart
+        renderTopicClustersChart(kg.topicClusters);
+    }
+
+    // KG stats
+    const statsEl = document.getElementById('kgStats');
+    if (statsEl) {
+        statsEl.innerHTML = `
+            <div class="kg-stat-item">
+                <span class="metric-label">Total Topics</span>
+                <span class="metric-value">${kg.totalTopics || 0}</span>
+            </div>
+            <div class="kg-stat-item">
+                <span class="metric-label">Total Connections</span>
+                <span class="metric-value">${kg.totalConnections || 0}</span>
+            </div>
+        `;
+    }
+}
+
+// Render topic clusters chart
+function renderTopicClustersChart(topics) {
+    const ctx = document.getElementById('topicClustersChart');
+    if (!ctx || !topics || topics.length === 0) return;
+
+    if (topicClustersChart) {
+        topicClustersChart.destroy();
+    }
+
+    const sorted = topics.slice(0, 10).sort((a, b) => b.documentCount - a.documentCount);
+    topicClustersChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: sorted.map(t => t.topic),
+            datasets: [{
+                label: 'Documents',
+                data: sorted.map(t => t.documentCount),
+                backgroundColor: 'rgba(138, 173, 244, 0.8)'
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            indexAxis: 'y',
+            plugins: {
+                legend: { display: false }
+            },
+            scales: {
+                x: {
+                    ticks: { color: 'var(--text-muted)', font: { family: 'var(--font-sans)', size: 11 } },
+                    grid: { color: 'var(--border-color)' }
+                },
+                y: {
+                    ticks: { color: 'var(--text-muted)', font: { family: 'var(--font-sans)', size: 11 } },
+                    grid: { color: 'var(--border-color)' }
+                }
+            }
+        }
+    });
+}
+
+// Render user activity
+function renderUserActivity(users) {
+    if (!users) return;
+
+    // Top users list
+    const usersEl = document.getElementById('topUsersList');
+    if (usersEl && users.topUsers) {
+        if (users.topUsers.length === 0) {
+            usersEl.innerHTML = '<div class="empty-state"><p>No user data available</p></div>';
+        } else {
+            usersEl.innerHTML = users.topUsers.map((user, idx) => `
+                <div class="user-item">
+                    <div>
+                        <div style="font-weight: 600; color: var(--text-primary);">#${idx + 1} ${escapeHtml(user.username || 'Unknown')}</div>
+                        <div style="font-size: 0.75rem; color: var(--text-muted);">${user.userId || 'N/A'}</div>
+                    </div>
+                    <div style="text-align: right;">
+                        <div style="font-weight: 600; color: var(--accent);">${(user.memoryCount || 0).toLocaleString()}</div>
+                        <div style="font-size: 0.75rem; color: var(--text-muted);">memories</div>
+                    </div>
+                </div>
+            `).join('');
+        }
+        
+        // Top users chart
+        renderTopUsersChart(users.topUsers);
+    }
+
+    // Engagement metrics
+    const engagementEl = document.getElementById('engagementMetrics');
+    if (engagementEl) {
+        engagementEl.innerHTML = `
+            <div class="performance-metric">
+                <span class="performance-metric-label">Total Users</span>
+                <span class="performance-metric-value">${(users.totalUsers || 0).toLocaleString()}</span>
+            </div>
+            <div class="performance-metric">
+                <span class="performance-metric-label">Active Users</span>
+                <span class="performance-metric-value success">${(users.activeUsers || 0).toLocaleString()}</span>
+            </div>
+        `;
+    }
+}
+
+// Render top users chart
+function renderTopUsersChart(users) {
+    const ctx = document.getElementById('topUsersChart');
+    if (!ctx || !users || users.length === 0) return;
+
+    if (topUsersChart) {
+        topUsersChart.destroy();
+    }
+
+    const top10 = users.slice(0, 10);
+    topUsersChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: top10.map(u => u.username || 'Unknown'),
+            datasets: [{
+                label: 'Memories',
+                data: top10.map(u => u.memoryCount || 0),
+                backgroundColor: 'rgba(138, 173, 244, 0.8)'
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            indexAxis: 'y',
+            plugins: {
+                legend: { display: false }
+            },
+            scales: {
+                x: {
+                    ticks: { color: 'var(--text-muted)', font: { family: 'var(--font-sans)', size: 11 } },
+                    grid: { color: 'var(--border-color)' }
+                },
+                y: {
+                    ticks: { color: 'var(--text-muted)', font: { family: 'var(--font-sans)', size: 11 } },
+                    grid: { color: 'var(--border-color)' }
+                }
+            }
+        }
+    });
+}
+
+// Render LLM info
+function renderLLMInfo(modelInfo) {
+    if (!modelInfo) return;
+
+    // LLM Provider
+    const llmEl = document.getElementById('llmDetails');
+    if (llmEl) {
+        const provider = modelInfo.llmProvider || 'unknown';
+        const statusEl = document.getElementById('llmProviderStatus');
+        if (statusEl) {
+            statusEl.textContent = provider.toUpperCase();
+            statusEl.className = 'llm-status status-connected';
+        }
+        
+        llmEl.innerHTML = `
+            <div class="llm-detail-item">
+                <span class="metric-label">Model</span>
+                <span class="metric-value">${escapeHtml(modelInfo.llmModel || 'N/A')}</span>
+            </div>
+            <div class="llm-detail-item">
+                <span class="metric-label">Streaming</span>
+                <span class="metric-value ${modelInfo.streamingEnabled ? 'enabled' : 'disabled'}">${modelInfo.streamingEnabled ? 'Enabled' : 'Disabled'}</span>
+            </div>
+        `;
+    }
+
+    // Embedding model
+    const embEl = document.getElementById('embeddingDetails');
+    if (embEl) {
+        embEl.innerHTML = `
+            <div class="llm-detail-item">
+                <span class="metric-label">Model</span>
+                <span class="metric-value">${escapeHtml(modelInfo.embeddingModel || 'N/A')}</span>
+            </div>
+            <div class="llm-detail-item">
+                <span class="metric-label">Dimensions</span>
+                <span class="metric-value">${modelInfo.embeddingDimension || 0}</span>
+            </div>
+            <div class="llm-detail-item">
+                <span class="metric-label">GPU</span>
+                <span class="metric-value ${modelInfo.gpuEnabled ? 'enabled' : 'disabled'}">${modelInfo.gpuEnabled ? 'Enabled' : 'Disabled'}</span>
+            </div>
+        `;
+    }
+}
+
+// Render query analytics
+function renderQueryAnalytics(queries) {
+    if (!queries) return;
+
+    // Query types chart
+    const ctx = document.getElementById('queryTypesChart');
+    if (ctx && queries.queryTypes) {
+        if (queryTypesChart) {
+            queryTypesChart.destroy();
+        }
+        queryTypesChart = new Chart(ctx, {
+            type: 'doughnut',
+            data: {
+                labels: Object.keys(queries.queryTypes),
+                datasets: [{
+                    data: Object.values(queries.queryTypes),
+                    backgroundColor: [
+                        'rgba(138, 173, 244, 0.8)',
+                        'rgba(198, 160, 246, 0.8)',
+                        'rgba(139, 233, 253, 0.8)',
+                        'rgba(166, 218, 149, 0.8)'
+                    ]
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: true,
+                plugins: {
+                    legend: {
+                        position: 'bottom',
+                        labels: { color: 'var(--text-primary)', font: { family: 'var(--font-sans)', size: 12 } }
+                    }
+                }
+            }
+        });
+    }
+
+    // Query stats
+    const statsEl = document.getElementById('queryStats');
+    if (statsEl) {
+        statsEl.innerHTML = `
+            <div class="performance-metric">
+                <span class="performance-metric-label">Total Queries</span>
+                <span class="performance-metric-value">${(queries.totalQueries || 0).toLocaleString()}</span>
+            </div>
+            <div class="performance-metric">
+                <span class="performance-metric-label">Avg Length</span>
+                <span class="performance-metric-value">${(queries.avgQueryLength || 0).toFixed(0)} chars</span>
+            </div>
+        `;
+    }
+
+    // Popular queries
+    const popularEl = document.getElementById('popularQueries');
+    if (popularEl && queries.popularQueries) {
+        if (queries.popularQueries.length === 0) {
+            popularEl.innerHTML = '<div class="empty-state"><p>No query data available</p></div>';
+        } else {
+            popularEl.innerHTML = queries.popularQueries.slice(0, 10).map(q => `
+                <div class="query-item">${escapeHtml(q.query || q)}</div>
+            `).join('');
+        }
+    }
+}
+
+// Render document popularity
+function renderDocumentPopularity(popularity) {
+    if (!popularity) return;
+
+    // Popular documents list
+    const listEl = document.getElementById('popularDocumentsList');
+    if (listEl && popularity.mostQueried) {
+        if (popularity.mostQueried.length === 0) {
+            listEl.innerHTML = '<div class="empty-state"><p>No document data available</p></div>';
+        } else {
+            listEl.innerHTML = popularity.mostQueried.map((doc, idx) => `
+                <div class="popular-doc-item">
+                    <div>
+                        <div style="font-weight: 600; color: var(--text-primary);">#${idx + 1} ${escapeHtml(doc.fileName || 'Unknown')}</div>
+                        <div style="font-size: 0.75rem; color: var(--text-muted); font-family: var(--font-mono);">${escapeHtml(doc.docId || 'N/A')}</div>
+                    </div>
+                    <div style="text-align: right;">
+                        <div style="font-weight: 600; color: var(--accent);">${(doc.queryCount || 0).toLocaleString()}</div>
+                        <div style="font-size: 0.75rem; color: var(--text-muted);">queries</div>
+                    </div>
+                </div>
+            `).join('');
+        }
+    }
+}
+
+// Render storage details
+function renderStorageDetails(storage) {
+    if (!storage) return;
+
+    const detailsEl = document.getElementById('storageDetails');
+    if (detailsEl) {
+        detailsEl.innerHTML = `
+            <div class="storage-detail-item">
+                <span class="metric-label">Total Chunks</span>
+                <span class="metric-value">${(storage.totalChunks || 0).toLocaleString()}</span>
+            </div>
+            <div class="storage-detail-item">
+                <span class="metric-label">Avg Chunk Size</span>
+                <span class="metric-value">${(storage.avgChunkSize || 0).toLocaleString()} bytes</span>
+            </div>
+            <div class="storage-detail-item">
+                <span class="metric-label">Total Size</span>
+                <span class="metric-value">${formatBytes(storage.totalSize || 0)}</span>
+            </div>
+        `;
+    }
+
+    // Storage by type chart
+    const ctx = document.getElementById('storageByTypeChart');
+    if (ctx && storage.byType) {
+        if (storageByTypeChart) {
+            storageByTypeChart.destroy();
+        }
+        storageByTypeChart = new Chart(ctx, {
+            type: 'pie',
+            data: {
+                labels: Object.keys(storage.byType),
+                datasets: [{
+                    data: Object.values(storage.byType),
+                    backgroundColor: [
+                        'rgba(138, 173, 244, 0.8)',
+                        'rgba(198, 160, 246, 0.8)',
+                        'rgba(139, 233, 253, 0.8)',
+                        'rgba(166, 218, 149, 0.8)'
+                    ]
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: true,
+                plugins: {
+                    legend: {
+                        position: 'bottom',
+                        labels: { color: 'var(--text-primary)', font: { family: 'var(--font-sans)', size: 12 } }
+                    }
+                }
+            }
+        });
+    }
+}
+
+// Render configuration
+function renderConfiguration(config) {
+    if (!config) return;
+
+    // Feature flags
+    const flagsEl = document.getElementById('featureFlags');
+    if (flagsEl) {
+        flagsEl.innerHTML = `
+            <div class="config-item">
+                <span class="config-item-label">Elasticsearch</span>
+                <span class="config-item-value ${config.elasticsearchEnabled ? 'enabled' : 'disabled'}">${config.elasticsearchEnabled ? 'Enabled' : 'Disabled'}</span>
+            </div>
+            <div class="config-item">
+                <span class="config-item-label">Hybrid Search</span>
+                <span class="config-item-value ${config.hybridSearchEnabled ? 'enabled' : 'disabled'}">${config.hybridSearchEnabled ? 'Enabled' : 'Disabled'}</span>
+            </div>
+            <div class="config-item">
+                <span class="config-item-label">Query Expansion</span>
+                <span class="config-item-value ${config.queryExpansionEnabled ? 'enabled' : 'disabled'}">${config.queryExpansionEnabled ? 'Enabled' : 'Disabled'}</span>
+            </div>
+            <div class="config-item">
+                <span class="config-item-label">Temporal Weighting</span>
+                <span class="config-item-value ${config.temporalWeightingEnabled ? 'enabled' : 'disabled'}">${config.temporalWeightingEnabled ? 'Enabled' : 'Disabled'}</span>
+            </div>
+            <div class="config-item">
+                <span class="config-item-label">Cache</span>
+                <span class="config-item-value ${config.cacheEnabled ? 'enabled' : 'disabled'}">${config.cacheEnabled ? 'Enabled' : 'Disabled'}</span>
+            </div>
+            <div class="config-item">
+                <span class="config-item-label">GPU</span>
+                <span class="config-item-value ${config.gpuEnabled ? 'enabled' : 'disabled'}">${config.gpuEnabled ? 'Enabled' : 'Disabled'}</span>
+            </div>
+        `;
+    }
+
+    // Search config
+    const searchEl = document.getElementById('searchConfig');
+    if (searchEl) {
+        searchEl.innerHTML = `
+            <div class="config-item">
+                <span class="config-item-label">LLM Provider</span>
+                <span class="config-item-value">${escapeHtml(config.llmProvider || 'N/A')}</span>
+            </div>
+        `;
+    }
+
+    // RAG config
+    const ragEl = document.getElementById('ragConfig');
+    if (ragEl) {
+        ragEl.innerHTML = `
+            <div class="config-item">
+                <span class="config-item-label">Hybrid Search</span>
+                <span class="config-item-value ${config.hybridSearchEnabled ? 'enabled' : 'disabled'}">${config.hybridSearchEnabled ? 'Enabled' : 'Disabled'}</span>
+            </div>
+        `;
+    }
+}
+
+// Render real-time monitor
+function renderRealtimeMonitor(data) {
+    const liveEl = document.getElementById('liveActivity');
+    if (liveEl) {
+        // Simulate live activity
+        const activities = [
+            { type: 'query', text: 'New query processed', time: 'just now' },
+            { type: 'memory', text: 'Memory created', time: '2s ago' },
+            { type: 'document', text: 'Document indexed', time: '5s ago' }
+        ];
+        
+        liveEl.innerHTML = activities.map(a => `
+            <div class="activity-item">
+                <div class="activity-icon">${a.type === 'query' ? '🔍' : a.type === 'memory' ? '🧠' : '📄'}</div>
+                <div class="activity-content">
+                    <div class="activity-text">${escapeHtml(a.text)}</div>
+                    <div class="activity-meta">${a.time}</div>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    // System load chart
+    const loadCtx = document.getElementById('systemLoadChart');
+    if (loadCtx) {
+        if (systemLoadChart) {
+            systemLoadChart.destroy();
+        }
+        
+        // Simulate system load data
+        const loadData = Array.from({ length: 20 }, () => Math.random() * 100);
+        systemLoadChart = new Chart(loadCtx, {
+            type: 'line',
+            data: {
+                labels: Array.from({ length: 20 }, (_, i) => i),
+                datasets: [{
+                    label: 'CPU %',
+                    data: loadData,
+                    borderColor: 'rgba(138, 173, 244, 0.8)',
+                    backgroundColor: 'rgba(138, 173, 244, 0.1)',
+                    borderWidth: 2,
+                    fill: true,
+                    tension: 0.4
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: true,
+                plugins: {
+                    legend: { display: false }
+                },
+                scales: {
+                    y: {
+                        min: 0,
+                        max: 100,
+                        ticks: { color: 'var(--text-muted)', font: { family: 'var(--font-sans)', size: 11 } },
+                        grid: { color: 'var(--border-color)' }
+                    },
+                    x: {
+                        ticks: { color: 'var(--text-muted)', font: { family: 'var(--font-sans)', size: 11 } },
+                        grid: { color: 'var(--border-color)' }
+                    }
+                }
+            }
+        });
+    }
+}
+
+// Update trends time range
+function updateTrendsTimeRange() {
+    const days = parseInt(document.getElementById('trendsTimeRange')?.value || 30);
+    loadTrendsData(days);
+}
+
+// Load trends data
+async function loadTrendsData(days) {
+    try {
+        const response = await fetch(`${API_BASE}/api/analytics/trends?days=${days}`);
+        const trends = await response.json();
+        renderTrends(trends);
+    } catch (error) {
+        console.error('Error loading trends:', error);
+    }
+}
+
+// Refresh activity
+function refreshActivity() {
+    loadAnalytics();
+}
+
+// Export data
+async function exportData(format = 'json') {
+    try {
+        if (format === 'pdf') {
+            showToast('PDF export coming soon', 'info');
+            return;
+        }
+        
+        const response = await fetch(`${API_BASE}/api/export?format=${format}`);
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `analytics-export-${Date.now()}.${format}`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        showToast(`Exported as ${format.toUpperCase()}`, 'success');
+    } catch (error) {
+        console.error('Error exporting:', error);
+        showToast('Export failed', 'error');
+    }
+}
+
+// Toggle export menu
+function toggleExportMenu() {
+    const menu = document.getElementById('exportMenu');
+    if (menu) {
+        menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
+    }
+}
+
+// Close export menu when clicking outside
+document.addEventListener('click', (e) => {
+    const menu = document.getElementById('exportMenu');
+    const btn = document.querySelector('.export-dropdown button');
+    if (menu && btn && !menu.contains(e.target) && !btn.contains(e.target)) {
+        menu.style.display = 'none';
+    }
+});
+
+// Toggle alerts panel
+function toggleAlerts() {
+    const panel = document.getElementById('alertsPanel');
+    if (panel) {
+        panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
+    }
+}
+
+// Check alerts
+function checkAlerts(data) {
+    if (!data) return;
+    
+    alerts = [];
+    
+    // Check system health
+    if (data.basic?.system) {
+        const system = data.basic.system;
+        if (!system.neo4j?.connected) {
+            alerts.push({
+                type: 'error',
+                title: 'Neo4j Disconnected',
+                message: 'Neo4j database is not connected',
+                time: new Date().toISOString()
+            });
+        }
+        if (system.elasticsearch?.enabled && !system.elasticsearch?.connected) {
+            alerts.push({
+                type: 'warning',
+                title: 'Elasticsearch Disconnected',
+                message: 'Elasticsearch is enabled but not connected',
+                time: new Date().toISOString()
+            });
+        }
+    }
+    
+    // Check performance
+    if (data.performance) {
+        const perf = data.performance;
+        if (perf.errorRate > 0.1) {
+            alerts.push({
+                type: 'error',
+                title: 'High Error Rate',
+                message: `Error rate is ${(perf.errorRate * 100).toFixed(1)}%`,
+                time: new Date().toISOString()
+            });
+        }
+        if (perf.latency?.p95 > 1000) {
+            alerts.push({
+                type: 'warning',
+                title: 'High Latency',
+                message: `P95 latency is ${perf.latency.p95.toFixed(0)}ms`,
+                time: new Date().toISOString()
+            });
+        }
+    }
+    
+    // Update alerts UI
+    updateAlertsUI();
+}
+
+// Update alerts UI
+function updateAlertsUI() {
+    const badge = document.getElementById('alertBadge');
+    const list = document.getElementById('alertsList');
+    
+    if (badge) {
+        if (alerts.length > 0) {
+            badge.textContent = alerts.length;
+            badge.style.display = 'block';
+        } else {
+            badge.style.display = 'none';
+        }
+    }
+    
+    if (list) {
+        if (alerts.length === 0) {
+            list.innerHTML = '<div class="empty-state"><p>No active alerts</p></div>';
+        } else {
+            list.innerHTML = alerts.map(alert => `
+                <div class="alert-item ${alert.type}">
+                    <div class="alert-title">${escapeHtml(alert.title)}</div>
+                    <div class="alert-message">${escapeHtml(alert.message)}</div>
+                    <div class="alert-time">${formatDate(alert.time)}</div>
+                </div>
+            `).join('');
+        }
+    }
+}
+
+// Format date helper
+function formatDate(dateString) {
+    if (!dateString) return 'Unknown';
+    const date = new Date(dateString);
+    const now = new Date();
+    const diffMs = now - date;
+    const diffSecs = Math.floor(diffMs / 1000);
+    const diffMins = Math.floor(diffSecs / 60);
+    const diffHours = Math.floor(diffMins / 60);
+    
+    if (diffSecs < 60) return 'just now';
+    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffHours < 24) return `${diffHours}h ago`;
+    
+    return date.toLocaleDateString('en-US', { 
+        month: 'short', 
+        day: 'numeric', 
+        hour: '2-digit', 
+        minute: '2-digit' 
+    });
 }

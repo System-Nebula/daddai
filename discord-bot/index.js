@@ -14,7 +14,12 @@ const ConfigManager = require('./src/configManager');
 const logger = require('./src/logger');
 const rateLimiter = require('./src/rateLimiter');
 const userContext = require('./src/userContext');
-const gopherAgent = require('./src/gopherAgent');
+// Use persistent GopherAgent service by default (much faster, no process spawning)
+// Set USE_GOPHER_AGENT_HTTP=true to use HTTP mode instead
+const usePersistentGopherAgent = process.env.USE_GOPHER_AGENT_HTTP !== 'true';
+const gopherAgent = usePersistentGopherAgent 
+    ? require('./src/gopherAgentPersistent')
+    : require('./src/gopherAgent');
 
 // Create Discord client with reconnection settings
 const client = new Client({
@@ -556,12 +561,16 @@ client.on(Events.MessageCreate, async (message) => {
         }
         
         // Route based on handler
+        logger.info(`🎯 Routing to handler: ${handler}, shouldRespond: ${shouldRespond}`);
         if (handler === 'rag' || handler === 'tools' || handler === 'memory' || handler === 'action') {
+            logger.info(`📞 Calling handleQuestion with handler: ${handler}`);
             await handleQuestion(message, routingResult);
         } else if (handler === 'chat') {
+            logger.info(`💬 Calling handleQuestion for chat handler`);
             await handleQuestion(message, routingResult);
         } else {
             // Unknown handler, default to question handling
+            logger.info(`❓ Calling handleQuestion with unknown handler: ${handler}`);
             await handleQuestion(message, routingResult);
         }
         
@@ -814,18 +823,27 @@ async function handleQuestion(message, routingResult = null) {
     const channelId = message.channel.id;
     const username = message.author.username;
     
+    logger.info(`🔵 handleQuestion called: userId=${userId}, handler=${routingResult?.handler || 'none'}`);
+    
     try {
+        logger.info(`📋 Step 1: Getting user context...`);
         // Get user context for personalization
         const userCtx = await userContext.getUserContext(userId, username, channelId);
+        logger.info(`✅ User context retrieved`);
         
+        logger.info(`📋 Step 2: Getting conversation history...`);
         const conversationHistory = await conversationManager.getConversation(userId);
+        logger.info(`✅ Conversation history retrieved (${conversationHistory.length} messages)`);
         
+        logger.info(`📋 Step 3: Extracting question...`);
         // Extract question (remove bot mention)
         let question = message.content
             .replace(new RegExp(`<@!?${client.user.id}>`, 'g'), '')
             .trim();
+        logger.info(`✅ Question extracted: "${question.substring(0, 50)}..."`);
         
         if (!question) {
+            logger.warn(`⚠️ Empty question, sending reply`);
             await message.reply({
                 content: 'Please ask a question!',
                 allowedMentions: { repliedUser: false }
@@ -833,9 +851,11 @@ async function handleQuestion(message, routingResult = null) {
             return;
         }
         
+        logger.info(`📋 Step 4: Processing routing result...`);
         // Use routing result from GopherAgent if available
         const intent = routingResult?.intent || {};
         let handler = routingResult?.handler || 'rag';
+        logger.info(`✅ Handler determined: ${handler}, intent: ${JSON.stringify(intent)}`);
         
         // CRITICAL: Check for URLs - URLs ALWAYS need tools, even if GopherAgent says casual
         const hasUrl = /(?:https?:\/\/|www\.|youtube\.com|youtu\.be)/i.test(question);
@@ -876,11 +896,26 @@ async function handleQuestion(message, routingResult = null) {
             .trim();
         
         // Show typing indicator
-        await message.channel.sendTyping();
+        logger.info(`📋 Step 5: Sending typing indicator...`);
+        try {
+            await Promise.race([
+                message.channel.sendTyping(),
+                new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('sendTyping timeout')), 5000)
+                )
+            ]);
+            logger.info(`✅ Typing indicator sent`);
+        } catch (error) {
+            logger.warn(`⚠️ Typing indicator failed or timed out: ${error.message}, continuing anyway...`);
+            // Continue even if typing indicator fails
+        }
         
         let response;
         let useRAG = false;
+        logger.info(`📋 Step 6: Initializing response variables...`);
+        logger.info(`✅ Response variables initialized: response=${response ? 'SET' : 'NULL'}, useRAG=${useRAG}`);
         
+        logger.info(`📋 Step 7: Starting document detection logic...`);
         // LLM-based document detection - no pattern matching
         // The RAG pipeline uses LLM query analysis to detect document references automatically
         // We only handle explicit "list all documents" queries and explicit filename comparisons here
@@ -1134,22 +1169,106 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
         }
         
         // Determine if we need RAG or simple chat (use cleaned question for detection)
-        console.log(`🔍 Response check: response=${response ? 'SET' : 'NOT SET'}, isCompareDocs=${isCompareDocs}`);
+        logger.info(`📋 Step 8: Determining RAG vs chat...`);
+        logger.info(`🔍 Response check: response=${response ? 'SET' : 'NOT SET'}, isCompareDocs=${isCompareDocs}, handler=${handler}`);
+        
+        // Check if question references document content before trusting GopherAgent classification
+        // This handles cases where GopherAgent says "casual" but the question mentions document topics
+        // Also runs if GopherAgent times out or returns null (to catch document references even when classification fails)
+        let hasDocumentReference = false;
+        if (!hasUrl) {
+            // Run detection if GopherAgent said casual OR if GopherAgent failed/timed out (intent is null/undefined)
+            const shouldCheckDocumentRef = !intent || intent.is_casual === true;
+            if (shouldCheckDocumentRef) {
+                // Quick check: if question mentions terms that might be from documents
+                // Check for capitalized proper nouns or technical terms that suggest document content
+                const questionWords = cleanedQuestion.toLowerCase().split(/\s+/);
+                const documentIndicators = [
+                    'kagi', 'vlad', 'prelovac', 'search engine', 'youtube', 'transcript',
+                    'summary', 'summarized', 'document', 'article', 'paper', 'video'
+                ];
+                
+                // Check if any document indicators appear in the question
+                for (const indicator of documentIndicators) {
+                    if (cleanedQuestion.toLowerCase().includes(indicator)) {
+                        hasDocumentReference = true;
+                        logger.info(`📄 Document reference detected: "${indicator}" - forcing RAG even though GopherAgent said casual`);
+                        break;
+                    }
+                }
+                
+                // Also check memory for recent document summaries that might be referenced
+                if (!hasDocumentReference) {
+                    try {
+                        // Use a broader search to find any memories that might be relevant
+                        const recentMemories = await Promise.race([
+                            memoryService.getUserMemories(
+                                channelId,
+                                cleanedQuestion,
+                                5,  // Check top 5 memories
+                                userId
+                            ),
+                            new Promise((resolve) => setTimeout(() => resolve([]), 2000)) // 2s timeout for memory check
+                        ]);
+                        
+                        // If memories contain document summaries or Q&A about documents, likely a document reference
+                        if (recentMemories && recentMemories.length > 0) {
+                            const memoryText = recentMemories.map(m => m.content || '').join(' ').toLowerCase();
+                            const questionLower = cleanedQuestion.toLowerCase();
+                            
+                            // Check if memories mention documents, summaries, or contain Q&A format
+                            const hasDocumentFormat = (memoryText.includes('q:') && memoryText.includes('a:')) || 
+                                                     memoryText.includes('summary') || 
+                                                     memoryText.includes('document') ||
+                                                     memoryText.includes('transcript') ||
+                                                     memoryText.includes('youtube');
+                            
+                            if (hasDocumentFormat) {
+                                // Extract key terms from question (words longer than 3 chars, excluding common words)
+                                const commonWords = ['what', 'about', 'think', 'thought', 'pretty', 'neat', 'favorite', 'thing', 'how', 'you', 'your', 'the', 'and', 'was', 'were'];
+                                const keyTerms = questionWords.filter(word => 
+                                    word.length > 3 && 
+                                    !commonWords.includes(word) &&
+                                    !word.match(/^[^a-z]*$/) // Exclude non-alphabetic
+                                );
+                                
+                                // Check if any key terms from question appear in memory content
+                                const questionMatchesMemory = keyTerms.some(term => memoryText.includes(term));
+                                
+                                if (questionMatchesMemory) {
+                                    hasDocumentReference = true;
+                                    logger.info(`📄 Document reference detected via memory match - key terms: ${keyTerms.filter(t => memoryText.includes(t)).join(', ')}`);
+                                }
+                            }
+                        }
+                    } catch (error) {
+                        logger.debug(`Could not check memories for document reference: ${error.message}`);
+                    }
+                }
+            }
+        }
         
         // 🤖 AGENTIC ROUTING: Use GopherAgent's routing decision
         // Override pattern-based detection with agentic routing if available
         // CRITICAL: URLs always need tools, even if GopherAgent says casual
+        // CRITICAL: Document references always need RAG, even if GopherAgent says casual
         if (hasUrl) {
             useRAG = true;  // URLs need RAG pipeline for tool calling
             logger.debug(`🌐 URL detected - forcing RAG pipeline for tool calling`);
+        } else if (hasDocumentReference) {
+            useRAG = true;  // Document references need RAG to find relevant content
+            logger.info(`📄 Document reference detected - forcing RAG pipeline (overriding GopherAgent casual classification)`);
         } else if (routingResult && intent) {
             useRAG = intent.needs_rag === true || handler === 'rag' || handler === 'tools';
-            logger.debug(`🤖 Using GopherAgent routing: needs_rag=${intent.needs_rag}, handler=${handler}`);
+            logger.info(`🤖 Using GopherAgent routing: needs_rag=${intent.needs_rag}, handler=${handler}, useRAG=${useRAG}`);
         }
+        logger.info(`✅ useRAG determined: ${useRAG}`);
         
         // IMPORTANT: Don't overwrite response if it's already set (e.g., from comparison)
         // Use original question (with mentions) for needsRAG to detect state queries about other users
+        logger.info(`📋 Step 9: Checking if RAG query needed...`);
         if (!response && (useRAG || needsRAG(question))) {
+            logger.info(`📋 RAG query will be executed (useRAG=${useRAG}, needsRAG=${needsRAG(question)})`);
             useRAG = true;
             
             // Special handling for document listing queries
@@ -1215,8 +1334,8 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
                     // Check if this is a URL request - YouTube/website summaries take longer
                     const hasUrl = /(?:https?:\/\/|www\.|youtube\.com|youtu\.be)/i.test(question);
                     // Use longer timeout for URL requests (90s) since they need to fetch and summarize content
-                    // Regular requests use 30s timeout for faster fallback
-                    const timeoutDuration = hasUrl ? 90000 : 30000;
+                    // Increased to 60s for GLM-4.6 thinking model (needs more time for reasoning)
+                    const timeoutDuration = hasUrl ? 90000 : 60000;
                     
                     response = await Promise.race([
                         ragService.queryWithContext(
@@ -1403,25 +1522,40 @@ Answer:`;
         // Use simple chat if RAG not needed or failed, and memory retrieval didn't work
         // IMPORTANT: Don't overwrite response if it's already set (e.g., from comparison, RAG, or memory retrieval)
         // CRITICAL: Also check if RAG already returned a response to prevent duplicate responses
+        logger.info(`📋 Step 10: Checking if chat service needed...`);
+        logger.info(`   response=${response ? 'SET' : 'NULL'}, hasRAGResponse=${hasRAGResponse}, useRAG=${useRAG}`);
         if (!response && !hasRAGResponse) {
+            logger.info(`💬 Using simple chat service (handler=${handler}, useRAG=${useRAG}, hasRAGResponse=${hasRAGResponse})`);
             try {
                 // Use cleaned question for chat (mentions removed)
+                logger.info(`📤 Calling chatService.chat with question: "${cleanedQuestion.substring(0, 50)}..."`);
+                logger.info(`📤 Conversation history length: ${conversationHistory.length}`);
+                const chatStartTime = Date.now();
                 const chatResponse = await Promise.race([
                     chatService.chat(cleanedQuestion, conversationHistory),
                     new Promise((_, reject) => 
-                        setTimeout(() => reject(new Error('Chat timeout')), 30000)
+                        setTimeout(() => reject(new Error('Chat timeout')), 90000) // Increased to 90s for GLM-4.6 thinking model (60s chat service + buffer)
                     )
                 ]);
-                
+                const chatElapsed = Date.now() - chatStartTime;
+                logger.info(`✅ Chat service responded in ${chatElapsed}ms: ${chatResponse ? chatResponse.substring(0, 100) : 'empty'}...`);
                 response = {
                     answer: chatResponse,
                     context_chunks: 0,
                     memories_used: 0
                 };
             } catch (error) {
-                console.error('Chat error:', error);
-                throw error;
+                logger.error(`❌ Chat service error: ${error.message}`);
+                logger.error(`   Stack: ${error.stack}`);
+                // Don't throw - fall through to error response below
+                response = {
+                    answer: `Sorry, I encountered an error: ${error.message}. Please try again.`,
+                    context_chunks: 0,
+                    memories_used: 0
+                };
             }
+        } else {
+            logger.info(`⏭️ Skipping chat service: response=${response ? 'SET' : 'NULL'}, hasRAGResponse=${hasRAGResponse}`);
         }
         
         // Final check: ensure response exists before proceeding
@@ -1437,7 +1571,16 @@ Answer:`;
         }
         
         // Save conversation turn (use original question with mentions preserved for context)
-        await conversationManager.addMessage(userId, question, response.answer, message.channel.id);
+        // Only save if answer is not empty (to avoid validation errors)
+        if (response.answer && response.answer.trim()) {
+            try {
+                await conversationManager.addMessage(userId, question, response.answer, message.channel.id);
+            } catch (error) {
+                logger.warn('Error saving conversation (non-critical):', { error: error.message });
+            }
+        } else {
+            logger.debug('Skipping conversation save - empty answer');
+        }
         
         // Store bot response as separate memory so it can reference itself (non-blocking)
         if (response.answer && response.answer.length > 20) {
@@ -1808,9 +1951,12 @@ Answer:`;
             
         } else {
             // Single page embed
+            // Handle empty answer - provide fallback message
+            const embedDescription = answer && answer.trim() ? answer : 'I received your message, but I\'m still thinking... Please try again in a moment.';
+            
             const embed = new EmbedBuilder()
                 .setColor(isYouTubeResponse ? 0xFF0000 : 0x5865F2) // Red for YouTube, blurple for others
-                .setDescription(answer)
+                .setDescription(embedDescription)
                 .setFooter({ 
                     text: 'Response',
                     iconURL: client.user.displayAvatarURL()
@@ -1844,11 +1990,14 @@ Answer:`;
                 });
             }
             
-            embed.addFields({
-                name: '📊 Context',
-                value: `${response.context_chunks || 0} chunks retrieved`,
-                inline: true
-            });
+            // Only show context if chunks were actually retrieved
+            if (response.context_chunks && response.context_chunks > 0) {
+                embed.addFields({
+                    name: '📊 Context',
+                    value: `${response.context_chunks} chunks retrieved`,
+                    inline: true
+                });
+            }
             
             const replyOptions = {
                 embeds: [embed],
@@ -1950,11 +2099,14 @@ client.on(Events.InteractionCreate, async interaction => {
                         });
                     }
                     
-                    embed.addFields({
-                        name: '📊 Context',
-                        value: `${state.sourceInfo.chunkCount || 0} chunks retrieved`,
-                        inline: true
-                    });
+                    // Only show context if chunks were actually retrieved
+                    if (state.sourceInfo.chunkCount && state.sourceInfo.chunkCount > 0) {
+                        embed.addFields({
+                            name: '📊 Context',
+                            value: `${state.sourceInfo.chunkCount} chunks retrieved`,
+                            inline: true
+                        });
+                    }
                 }
                 
                 return embed;

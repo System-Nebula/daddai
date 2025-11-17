@@ -1,4 +1,4 @@
-const CACHE_NAME = 'gopherbot-v1';
+const CACHE_NAME = 'gopherbot-v2';
 const API_CACHE_TIME = 30000; // 30 seconds
 
 self.addEventListener('install', (event) => {
@@ -31,51 +31,46 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
-    // Cache API responses with short TTL
+    // For API requests, just pass through to network without any caching
+    // This avoids service worker issues with API responses
     if (event.request.url.includes('/api/')) {
-        event.respondWith(
-            caches.open(CACHE_NAME).then((cache) => {
-                return cache.match(event.request).then((response) => {
-                    if (response) {
-                        const cachedTime = response.headers.get('sw-cached-time');
-                        const now = Date.now();
-                        if (cachedTime && (now - parseInt(cachedTime)) < API_CACHE_TIME) {
-                            return response;
-                        }
-                    }
-                    return fetch(event.request).then((fetchResponse) => {
-                        if (fetchResponse.ok) {
-                            const responseClone = fetchResponse.clone();
-                            const headers = new Headers(responseClone.headers);
-                            headers.set('sw-cached-time', now.toString());
-                            const modifiedResponse = new Response(responseClone.body, {
-                                status: responseClone.status,
-                                statusText: responseClone.statusText,
-                                headers: headers
-                            });
-                            cache.put(event.request, modifiedResponse);
-                        }
-                        return fetchResponse;
-                    }).catch(() => {
-                        // Return cached response if network fails
-                        return cache.match(event.request);
-                    });
-                });
-            })
-        );
-    } else {
-        // Cache static assets
-        event.respondWith(
-            caches.match(event.request).then((response) => {
-                return response || fetch(event.request).then((fetchResponse) => {
-                    if (fetchResponse.ok) {
-                        const cache = caches.open(CACHE_NAME);
-                        cache.then(c => c.put(event.request, fetchResponse.clone()));
-                    }
-                    return fetchResponse;
-                });
-            })
-        );
+        event.respondWith(fetch(event.request));
+        return;
     }
+    
+    // Only handle static assets with caching
+    event.respondWith(
+        caches.match(event.request).then((cachedResponse) => {
+            if (cachedResponse) {
+                // Return cached version immediately, but update in background
+                fetch(event.request).then((networkResponse) => {
+                    if (networkResponse && networkResponse.ok) {
+                        caches.open(CACHE_NAME).then((cache) => {
+                            cache.put(event.request, networkResponse.clone());
+                        });
+                    }
+                }).catch(() => {
+                    // Ignore network errors for background updates
+                });
+                return cachedResponse;
+            }
+            // No cache, fetch from network
+            return fetch(event.request).then((networkResponse) => {
+                if (networkResponse && networkResponse.ok) {
+                    const responseClone = networkResponse.clone();
+                    caches.open(CACHE_NAME).then((cache) => {
+                        cache.put(event.request, responseClone);
+                    });
+                }
+                return networkResponse;
+            }).catch((error) => {
+                // If network fails for static assets, return a basic error page
+                return new Response('Network error', {
+                    status: 503,
+                    statusText: 'Service Unavailable'
+                });
+            });
+        })
+    );
 });
 

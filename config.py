@@ -21,6 +21,31 @@ LMSTUDIO_MODEL = os.getenv("LMSTUDIO_MODEL", "local-model")
 LMSTUDIO_TIMEOUT = int(os.getenv("LMSTUDIO_TIMEOUT", "30"))  # Reduced from 60s to 30s for faster failure
 LMSTUDIO_MAX_RETRIES = int(os.getenv("LMSTUDIO_MAX_RETRIES", "3"))
 
+# OpenAI-Compatible Provider Configuration
+# Set LLM_PROVIDER to choose provider: "lmstudio", "openai", "chutes", or "custom"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "chutes").lower()
+
+# OpenAI Configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+
+# Chutes AI Configuration
+CHUTES_API_KEY = os.getenv("CHUTES_API_KEY", None)
+CHUTES_BASE_URL = os.getenv("CHUTES_BASE_URL", "https://llm.chutes.ai/v1")
+CHUTES_MODEL = os.getenv("CHUTES_MODEL", "deepseek-ai/DeepSeek-V3-0324")
+# Default to false - existing chutes work without input_args wrapper
+# Set to true only if your Chutes configuration specifically requires it
+CHUTES_USE_INPUT_ARGS_WRAPPER = os.getenv("CHUTES_USE_INPUT_ARGS_WRAPPER", "false").lower() == "true"
+
+# Custom Provider Configuration
+CUSTOM_LLM_BASE_URL = os.getenv("CUSTOM_LLM_BASE_URL", None)
+CUSTOM_LLM_API_KEY = os.getenv("CUSTOM_LLM_API_KEY", None)
+CUSTOM_LLM_MODEL = os.getenv("CUSTOM_LLM_MODEL", None)
+
+# Streaming Configuration
+LLM_STREAMING_ENABLED = os.getenv("LLM_STREAMING_ENABLED", "false").lower() == "true"
+
 # Embedding Configuration
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")  # Local sentence transformer model
 EMBEDDING_DIMENSION = 384  # Dimension for all-MiniLM-L6-v2

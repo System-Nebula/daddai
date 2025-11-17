@@ -349,11 +349,11 @@ def summarize_website(url: str, max_length: int = 50000, save_to_documents: bool
                 chunker = TranscriptChunker(max_chunk_size=3000, overlap=200)
                 chunks = chunker.smart_chunk(full_text)
                 
-                # Get LMStudio client for summarization (lazy import to avoid circular deps)
+                # Get LLM client for summarization (uses factory to support multiple providers)
                 try:
-                    from src.clients.lmstudio_client import LMStudioClient
-                    from config import LMSTUDIO_BASE_URL
-                    summarizer = TranscriptSummarizer(lmstudio_client=LMStudioClient(base_url=LMSTUDIO_BASE_URL))
+                    from src.clients.llm_client_factory import get_default_llm_client
+                    llm_client = get_default_llm_client()
+                    summarizer = TranscriptSummarizer(lmstudio_client=llm_client)  # Works with any LLM client
                     article_title = content_data.get('title', 'Article')
                     smart_summary = summarizer.summarize_chunks(
                         chunks, 

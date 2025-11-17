@@ -9,6 +9,7 @@ Enhanced RAG Pipeline integrating all advanced features:
 from typing import List, Dict, Any, Optional
 import numpy as np
 import time
+import json
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from cachetools import TTLCache
@@ -433,10 +434,12 @@ class EnhancedRAGPipeline(RAGPipeline):
             "generate an image", "generate image", "generate a image",
             "create an image", "create image", "create a image",
             "make an image", "make image", "make a image",
+            "make me an image", "make me a image", "make me image",
             "draw an image", "draw image", "draw a image",
             "generate a picture", "generate picture", "generate an picture",
             "create a picture", "create picture", "create an picture",
             "make a picture", "make picture", "make an picture",
+            "make me a picture", "make me an picture", "make me picture",
             "draw a picture", "draw picture", "draw an picture",
             "generate artwork", "create artwork", "make artwork",
             "generate art", "create art", "make art"
@@ -1815,7 +1818,7 @@ Examples:
         answer = self.lmstudio_client.generate_response(
             messages=messages,
             temperature=0.8,  # Higher temperature for more natural conversation
-            max_tokens=200  # Shorter responses for casual conversation
+            max_tokens=2000  # Increased for GLM-4.6 thinking model (reasoning uses ~500-1000 tokens, then needs ~200-500 for response)
         )
         generation_time = time.time() - generation_start
         
@@ -2059,6 +2062,72 @@ Examples:
         # Add tool schemas to system message
         tool_schemas = self.tool_registry.get_tools_schema()
         
+        # Check if URL is in question for tool filtering
+        question_lower = question.lower()
+        has_url_in_question = any([
+            "http://" in question or "https://" in question,
+            "www." in question and ("." in question.split("www.")[1][:50] if "www." in question else False),
+            "youtube.com" in question_lower or "youtu.be" in question_lower
+        ])
+        
+        # Filter tools based on query context to avoid context overflow
+        # For URL queries, prioritize URL-related tools
+        if tool_schemas and has_url_in_question:
+            # When URL is detected, prioritize URL tools and reduce others
+            url_tools = ["summarize_website", "summarize_youtube"]
+            prioritized_tools = []
+            other_tools = []
+            
+            for tool in tool_schemas:
+                tool_name = tool.get("function", {}).get("name", "")
+                if tool_name in url_tools:
+                    prioritized_tools.append(tool)
+                else:
+                    other_tools.append(tool)
+            
+            # Keep URL tools + a few essential tools (max 5 total to save context)
+            essential_tools = ["get_memories", "search_documents", "list_documents"]
+            essential_tool_list = [t for t in other_tools if t.get("function", {}).get("name") in essential_tools]
+            
+            # Combine: URL tools + essential tools (limit to 5 total)
+            filtered_tools = prioritized_tools + essential_tool_list[:max(0, 5 - len(prioritized_tools))]
+            tool_schemas = filtered_tools
+            logger.info(f"🔧 Filtered tools for URL query: {len(tool_schemas)} tools (from {len(self.tool_registry.get_tools_schema())} total)")
+        
+        # Log tool information for debugging
+        if tool_schemas:
+            tool_names = [tool.get("function", {}).get("name", "unknown") for tool in tool_schemas]
+            tool_schema_size = len(json.dumps(tool_schemas))
+            logger.info(f"🔧 Tool preparation: {len(tool_schemas)} tools registered")
+            logger.info(f"   Tool names: {', '.join(tool_names[:10])}{'...' if len(tool_names) > 10 else ''}")
+            logger.info(f"   Tool schema size: {tool_schema_size / 1024:.2f} KB ({tool_schema_size:,} bytes)")
+            
+            # Estimate token count (rough: 1 token ≈ 4 chars)
+            estimated_tokens = tool_schema_size / 4
+            logger.info(f"   Estimated tokens: ~{int(estimated_tokens)} tokens")
+            
+            # Estimate total context size (system message + tool schemas + user messages)
+            system_msg_size = len(messages[0].get("content", "")) if messages else 0
+            user_msg_size = sum(len(msg.get("content", "")) for msg in messages[1:] if msg.get("role") == "user")
+            total_estimated_tokens = (system_msg_size + tool_schema_size + user_msg_size) / 4
+            
+            logger.info(f"   Total estimated context: ~{int(total_estimated_tokens)} tokens (system: {int(system_msg_size/4)}, tools: {int(estimated_tokens)}, user: {int(user_msg_size/4)})")
+            
+            # If estimated tokens exceed 3500 (safe margin for 4096 context), reduce tools further
+            if total_estimated_tokens > 3500 and len(tool_schemas) > 3:
+                logger.warning(f"⚠️ Context size ({int(total_estimated_tokens)} tokens) exceeds safe limit - reducing tools further")
+                # Keep only the most essential tools
+                essential_only = []
+                for tool in tool_schemas:
+                    tool_name = tool.get("function", {}).get("name", "")
+                    if tool_name in ["summarize_website", "summarize_youtube", "generate_image"]:
+                        essential_only.append(tool)
+                    elif len(essential_only) < 3:  # Keep max 3 tools total
+                        essential_only.append(tool)
+                
+                tool_schemas = essential_only[:3]
+                logger.info(f"   Reduced to {len(tool_schemas)} essential tools to fit context window")
+        
         if tool_schemas and len(messages) > 0:
             # Enhance system message with tool information
             system_msg = messages[0].get("content", "")
@@ -2142,24 +2211,43 @@ Examples:
             
             # Check for image generation requests
             question_lower_for_image_check = question.lower()
+            # Use regex patterns to handle variations like "make me an image", "create for me a picture", etc.
+            import re
+            image_generation_patterns = [
+                r'\b(?:generate|create|make|draw)\s+(?:me\s+)?(?:an?\s+)?(?:image|picture|artwork|art)\b',
+                r'\b(?:generate|create|make|draw)\s+(?:an?\s+)?(?:image|picture|artwork|art)\s+(?:for\s+me|please)?\b',
+                r'\b(?:generate|create|make|draw)\s+(?:a\s+)?(?:image|picture|artwork|art)\b',
+                r'\b(?:generate|create|make|draw)\s+(?:an?\s+)?(?:image|picture|artwork|art)\s+of\b',
+                r'\b(?:generate|create|make|draw)\s+(?:an?\s+)?(?:image|picture|artwork|art)\s+with\b',
+            ]
+            # Also check for simple keyword matches (backward compatibility)
             image_generation_keywords = [
                 "generate an image", "generate image", "generate a image",
                 "create an image", "create image", "create a image",
                 "make an image", "make image", "make a image",
+                "make me an image", "make me a image", "make me image",
                 "draw an image", "draw image", "draw a image",
                 "generate a picture", "generate picture", "generate an picture",
                 "create a picture", "create picture", "create an picture",
                 "make a picture", "make picture", "make an picture",
+                "make me a picture", "make me an picture", "make me picture",
                 "draw a picture", "draw picture", "draw an picture",
                 "generate artwork", "create artwork", "make artwork",
                 "generate art", "create art", "make art"
             ]
-            has_image_generation = any(keyword in question_lower_for_image_check for keyword in image_generation_keywords)
+            has_image_generation = (
+                any(re.search(pattern, question_lower_for_image_check) for pattern in image_generation_patterns) or
+                any(keyword in question_lower_for_image_check for keyword in image_generation_keywords)
+            )
             
             if has_image_generation:
                 # Extract prompt from question (everything after "generate/create/make/draw")
                 import re
-                prompt_match = re.search(r'(?:generate|create|make|draw)\s+(?:an?\s+)?(?:image|picture|artwork|art)\s+(?:of|with|:)?\s*(.+?)(?:\s*$|\s*\?|\s*!)', question_lower_for_image_check, re.IGNORECASE)
+                # Handle variations like "make me an image of...", "create for me a picture of...", etc.
+                prompt_match = re.search(r'(?:generate|create|make|draw)\s+(?:me\s+)?(?:an?\s+)?(?:image|picture|artwork|art)\s+(?:of|with|:)?\s*(.+?)(?:\s*$|\s*\?|\s*!)', question_lower_for_image_check, re.IGNORECASE)
+                if not prompt_match:
+                    # Fallback: try without "me"
+                    prompt_match = re.search(r'(?:generate|create|make|draw)\s+(?:an?\s+)?(?:image|picture|artwork|art)\s+(?:of|with|:)?\s*(.+?)(?:\s*$|\s*\?|\s*!)', question_lower_for_image_check, re.IGNORECASE)
                 example_prompt = prompt_match.group(1).strip() if prompt_match else "a cat wearing a hat"
                 if not example_prompt or len(example_prompt) < 3:
                     example_prompt = "a cat wearing a hat"
@@ -2210,7 +2298,11 @@ Examples:
                     tools_description += f"  Parameters: {param_list}\n"
             
             messages[0]["content"] = system_msg + tools_description
-        
+            
+            # Log final system message size
+            final_system_size = len(messages[0]["content"])
+            logger.info(f"📝 Final system message size: {final_system_size:,} chars ({final_system_size / 1024:.2f} KB)")
+            
         # Add user context to tool calls
         tool_context = {
             "user_id": user_id,
@@ -2223,24 +2315,105 @@ Examples:
         current_messages = messages.copy()
         
         while iteration < max_iterations:
-            # Generate response
-            response = self.lmstudio_client.generate_response(
-                messages=current_messages,
-                temperature=temperature,
-                max_tokens=max_tokens
-            )
+            # Generate response with native function calling if tools are available
+            # This allows DeepSeek and other providers to use structured tool calls
+            generate_kwargs = {
+                "messages": current_messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens
+            }
             
-            logger.info(f"🔧 [Tool Call Iteration {iteration + 1}] LLM response length: {len(response)}")
-            logger.debug(f"🔧 [Tool Call Iteration {iteration + 1}] LLM response preview: {response[:500]}")
+            # Pass tools for native function calling (OpenAI format)
+            # This is much more reliable than text-based tool calling
+            if tool_schemas and len(tool_schemas) > 0:
+                generate_kwargs["tools"] = tool_schemas
+                # For image generation, try to force the tool call
+                # Some providers support {"type": "function", "function": {"name": "generate_image"}}
+                if has_image_generation:
+                    # Try to force generate_image tool call if provider supports it
+                    generate_image_tool = next((tool for tool in tool_schemas if tool.get("function", {}).get("name") == "generate_image"), None)
+                    if generate_image_tool:
+                        try:
+                            generate_kwargs["tool_choice"] = {"type": "function", "function": {"name": "generate_image"}}
+                        except:
+                            # Fallback to auto if provider doesn't support forced tool choice
+                            generate_kwargs["tool_choice"] = "auto"
+                    else:
+                        generate_kwargs["tool_choice"] = "auto"
+                else:
+                    generate_kwargs["tool_choice"] = "auto"
             
-            # Check for tool calls
-            tool_calls = self.tool_parser.parse_tool_calls(response)
-            logger.info(f"🔧 [Tool Call Iteration {iteration + 1}] Parsed {len(tool_calls)} tool calls")
+            # Log before making API call
+            logger.info(f"🚀 Making LLM API call (iteration {iteration + 1}/{max_iterations})")
+            if tool_schemas:
+                logger.info(f"   Sending {len(tool_schemas)} tools to API")
+            
+            import time
+            api_call_start = time.time()
+            response = self.lmstudio_client.generate_response(**generate_kwargs)
+            api_call_elapsed = time.time() - api_call_start
+            logger.info(f"✅ LLM API call completed in {api_call_elapsed:.2f}s")
+            
+            # Handle empty or None responses (common with thinking models)
+            if not response:
+                response = ""
+                logger.warning(f"🔧 [Tool Call Iteration {iteration + 1}] Empty response from LLM")
+            
+            # Handle dict responses (tool calls from native function calling)
+            native_tool_calls = None
+            if isinstance(response, dict):
+                content = response.get('content', '')
+                native_tool_calls = response.get('tool_calls')
+                if native_tool_calls:
+                    # Convert OpenAI tool_calls format to our format
+                    parsed_tool_calls = []
+                    for tc in native_tool_calls:
+                        try:
+                            args = tc['function']['arguments']
+                            if isinstance(args, str):
+                                args = json.loads(args)
+                            parsed_tool_calls.append({
+                                "name": tc['function']['name'],
+                                "arguments": args
+                            })
+                        except Exception as e:
+                            logger.warning(f"Failed to parse tool call: {e}")
+                    native_tool_calls = parsed_tool_calls
+                response = content  # Use content for text parsing
+            
+            logger.info(f"🔧 [Tool Call Iteration {iteration + 1}] LLM response length: {len(response) if response else 0}")
+            logger.debug(f"🔧 [Tool Call Iteration {iteration + 1}] LLM response preview: {response[:500] if response else 'None'}")
+            
+            # Check for tool calls (native function calling takes priority)
+            if native_tool_calls:
+                tool_calls = native_tool_calls
+                logger.info(f"🔧 [Tool Call Iteration {iteration + 1}] Using {len(tool_calls)} native tool calls from API")
+            else:
+                # Fallback to text-based parsing
+                tool_calls = self.tool_parser.parse_tool_calls(response)
+                logger.info(f"🔧 [Tool Call Iteration {iteration + 1}] Parsed {len(tool_calls)} tool calls from text")
             
             if not tool_calls:
                 # No tool calls detected
-                # Check if URL is present and we should force tool call
+                # CRITICAL: Check for image generation requests FIRST - these should always trigger tool calls
                 question_lower = question.lower()
+                image_generation_keywords_check = [
+                    "generate an image", "generate image", "generate a image",
+                    "create an image", "create image", "create a image",
+                    "make an image", "make image", "make a image",
+                    "make me an image", "make me a image", "make me image",
+                    "draw an image", "draw image", "draw a image",
+                    "generate a picture", "generate picture", "generate an picture",
+                    "create a picture", "create picture", "create an picture",
+                    "make a picture", "make picture", "make an picture",
+                    "make me a picture", "make me an picture", "make me picture",
+                    "draw a picture", "draw picture", "draw an picture",
+                    "generate artwork", "create artwork", "make artwork",
+                    "generate art", "create art", "make art"
+                ]
+                has_image_gen_request = any(keyword in question_lower for keyword in image_generation_keywords_check)
+                
+                # Check if URL is present and we should force tool call
                 has_url = any([
                     "http://" in question or "https://" in question,
                     "www." in question and ("." in question.split("www.")[1][:50] if "www." in question else False),
@@ -2293,20 +2466,7 @@ Examples:
                             continue
                 
                 # Check if image generation is requested but no tool called
-                image_generation_keywords_check = [
-                    "generate an image", "generate image", "generate a image",
-                    "create an image", "create image", "create a image",
-                    "make an image", "make image", "make a image",
-                    "draw an image", "draw image", "draw a image",
-                    "generate a picture", "generate picture", "generate an picture",
-                    "create a picture", "create picture", "create an picture",
-                    "make a picture", "make picture", "make an picture",
-                    "draw a picture", "draw picture", "draw an picture",
-                    "generate artwork", "create artwork", "make artwork",
-                    "generate art", "create art", "make art"
-                ]
-                has_image_gen_request = any(keyword in question_lower for keyword in image_generation_keywords_check)
-                
+                # (This check was moved earlier, but we still need it here as a fallback)
                 if has_image_gen_request and iteration == 0:
                     response_lower = response.lower()
                     tool_already_called = "generate_image" in response_lower
@@ -2318,9 +2478,13 @@ Examples:
                             "role": "assistant",
                             "content": response
                         })
-                        # Extract prompt from question
+                        # Extract prompt from question - handle "make me an image of..." variations
                         import re
-                        prompt_match = re.search(r'(?:generate|create|make|draw)\s+(?:an?\s+)?(?:image|picture|artwork|art)\s+(?:of|with|:)?\s*(.+?)(?:\s*$|\s*\?|\s*!)', question, re.IGNORECASE)
+                        # Try with "me" first (e.g., "make me an image of a dog")
+                        prompt_match = re.search(r'(?:generate|create|make|draw)\s+(?:me\s+)?(?:an?\s+)?(?:image|picture|artwork|art)\s+(?:of|with|:)?\s*(.+?)(?:\s*$|\s*\?|\s*!)', question, re.IGNORECASE)
+                        if not prompt_match:
+                            # Fallback without "me"
+                            prompt_match = re.search(r'(?:generate|create|make|draw)\s+(?:an?\s+)?(?:image|picture|artwork|art)\s+(?:of|with|:)?\s*(.+?)(?:\s*$|\s*\?|\s*!)', question, re.IGNORECASE)
                         extracted_prompt = prompt_match.group(1).strip() if prompt_match else question
                         # Clean up the prompt - remove common prefixes
                         extracted_prompt = re.sub(r'^(?:of|with|:)\s*', '', extracted_prompt, flags=re.IGNORECASE).strip()
@@ -2369,10 +2533,12 @@ Examples:
                 "generate an image", "generate image", "generate a image",
                 "create an image", "create image", "create a image",
                 "make an image", "make image", "make a image",
+                "make me an image", "make me a image", "make me image",
                 "draw an image", "draw image", "draw a image",
                 "generate a picture", "generate picture", "generate an picture",
                 "create a picture", "create picture", "create an picture",
                 "make a picture", "make picture", "make an picture",
+                "make me a picture", "make me an picture", "make me picture",
                 "draw a picture", "draw picture", "draw an picture",
                 "generate artwork", "create artwork", "make artwork",
                 "generate art", "create art", "make art"
@@ -3042,12 +3208,44 @@ Examples:
                 # The good response used 240 tokens, so we want at least that much
                 summary_max_tokens = max(max_tokens, 500) if url_content_fetched else max_tokens
                 
-                final_response = self.lmstudio_client.generate_response(
-                    messages=current_messages,
-                    temperature=temperature,
-                    max_tokens=summary_max_tokens
-                )
-                logger.info(f"✅ Generated final response after URL content fetch (length: {len(final_response)})")
+                # Try to generate final response with timeout handling
+                try:
+                    logger.info(f"🚀 Generating final response with {len(current_messages)} messages, system msg size: {len(current_messages[0].get('content', '')) if current_messages else 0} chars")
+                    final_response = self.lmstudio_client.generate_response(
+                        messages=current_messages,
+                        temperature=temperature,
+                        max_tokens=summary_max_tokens
+                    )
+                    logger.info(f"✅ Generated final response after URL content fetch (length: {len(final_response)})")
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.error(f"❌ Final response generation failed: {error_msg}")
+                    if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                        # If timeout, use the tool result summary directly as fallback
+                        logger.warning(f"⏱️ Final response timed out - using tool result summary as fallback")
+                        # Extract the summary from tool results if available
+                        tool_summary = None
+                        for msg in reversed(current_messages):
+                            content = msg.get('content', '')
+                            if 'Tool summarize_youtube result' in content or 'Tool summarize_website result' in content:
+                                # Try to extract the summary part
+                                if 'Summary:' in content:
+                                    tool_summary = content.split('Summary:')[-1].strip()
+                                    break
+                                elif 'summary:' in content:
+                                    tool_summary = content.split('summary:')[-1].strip()
+                                    break
+                        
+                        if tool_summary:
+                            final_response = f"Here's a summary:\n\n{tool_summary[:1000]}..." if len(tool_summary) > 1000 else tool_summary
+                            logger.info(f"✅ Using tool summary as fallback response (length: {len(final_response)})")
+                        else:
+                            # Last resort: use a simple message
+                            final_response = "I successfully fetched the content, but had trouble generating a detailed summary. The content has been saved to your documents."
+                            logger.warning(f"⚠️ No tool summary found - using generic fallback")
+                    else:
+                        # Re-raise if it's not a timeout
+                        raise
                 
                 # Log a warning if the response contains forbidden phrases or placeholder text
                 response_lower = final_response.lower()

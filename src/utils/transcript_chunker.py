@@ -469,10 +469,11 @@ Summary:"""
             logger.debug("LMStudio client not available, using chunk excerpt")
             return chunk_text[:500]  # Fallback
         
-        # Check connection
+        # Check connection (if method exists)
         try:
-            if not self.lmstudio_client.check_connection():
-                return chunk_text[:500]
+            if hasattr(self.lmstudio_client, 'check_connection'):
+                if not self.lmstudio_client.check_connection():
+                    return chunk_text[:500]
         except Exception:
             return chunk_text[:500]
         

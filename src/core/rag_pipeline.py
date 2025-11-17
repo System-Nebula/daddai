@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 from src.stores.neo4j_store import Neo4jStore
 from src.processors.embedding_generator import EmbeddingGenerator
-from src.clients.lmstudio_client import LMStudioClient
+from src.clients.llm_client_factory import get_default_llm_client
 from config import ELASTICSEARCH_ENABLED
 from src.stores.memory_store import MemoryStore
 from src.stores.document_store import DocumentStore
@@ -76,7 +76,8 @@ class RAGPipeline:
         device = USE_GPU if USE_GPU != 'auto' else None
         self.embedding_generator = EmbeddingGenerator(device=device, batch_size=EMBEDDING_BATCH_SIZE)
         
-        self.lmstudio_client = LMStudioClient()
+        # Use client factory to support multiple providers (LMStudio, Chutes, OpenAI, etc.)
+        self.lmstudio_client = get_default_llm_client()  # Can be any provider based on LLM_PROVIDER config
         
         # Initialize hybrid search and query expansion
         self.hybrid_search = HybridSearch(semantic_weight=0.7, keyword_weight=0.3)

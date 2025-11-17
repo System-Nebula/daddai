@@ -143,6 +143,11 @@ Respond ONLY with valid JSON, no other text."""
                 max_tokens=300
             )
             
+            # Handle empty or None responses (common with thinking models)
+            if not response or (isinstance(response, str) and not response.strip()):
+                logger.warning(f"Empty response from LLM in query analysis, using pattern-based analysis only")
+                return {}
+            
             # Try multiple methods to extract JSON
             llm_result = {}
             

@@ -1,435 +1,378 @@
-/**
- * GopherAgent - JavaScript wrapper for Python GopherAgent
- * Provides fast, agentic message routing for Discord bot.
- */
 const { spawn } = require('child_process');
+const http = require('http');
 const path = require('path');
-const logger = require('./logger');
 
 class GopherAgent {
     constructor() {
         this.pythonPath = process.env.PYTHON_PATH || 'python';
-        this.agentScript = path.join(__dirname, '..', '..', 'src', 'agents', 'gopher_agent_api.py');
-        this.cache = new Map();
-        this.cacheTTL = 5 * 60 * 1000; // 5 minutes
-        this.pendingRequests = new Map();
-        this.timeout = 60000; // 60 second timeout (increased for LLM inference overhead)
-        
-        // Try HTTP server first (faster), fallback to subprocess
-        this.useHttpServer = process.env.GOPHER_AGENT_HTTP === 'true';
-        this.httpBaseUrl = process.env.GOPHER_AGENT_URL || 'http://localhost:8765';
-        
-        // OPTIMIZED: Create HTTP client with connection pooling
-        if (this.useHttpServer) {
-            const axios = require('axios');
-            const http = require('http');
-            const https = require('https');
-            
-            this.httpClient = axios.create({
-                baseURL: this.httpBaseUrl,
-                timeout: this.timeout,
-                headers: { 'Content-Type': 'application/json' },
-                // OPTIMIZED: Connection pooling
-                httpAgent: new http.Agent({
-                    keepAlive: true,
-                    keepAliveMsecs: 1000,
-                    maxSockets: 10,
-                    maxFreeSockets: 5
-                }),
-                httpsAgent: new https.Agent({
-                    keepAlive: true,
-                    keepAliveMsecs: 1000,
-                    maxSockets: 10,
-                    maxFreeSockets: 5
-                })
-            });
-        }
-        
-        logger.info(`🤖 GopherAgent initialized (mode: ${this.useHttpServer ? 'HTTP' : 'subprocess'})`);
+        this.useHttp = process.env.GOPHER_AGENT_HTTP === 'true';
+        this.httpHost = process.env.GOPHER_AGENT_HOST || 'localhost';
+        this.httpPort = process.env.GOPHER_AGENT_PORT || '8765';
+        this.timeout = 15000; // 15 second timeout
     }
-    
-    /**
-     * Classify message intent using GopherAgent
-     * @param {string} message - Message text
-     * @param {Object} context - Context (hasAttachments, isMentioned, recentMessages, etc.)
-     * @returns {Promise<Object>} Intent classification result
-     */
-    async classifyIntent(message, context = {}) {
-        // Check cache first
-        const cacheKey = this._getCacheKey(message, context);
-        const cached = this.cache.get(cacheKey);
-        if (cached && Date.now() - cached.timestamp < this.cacheTTL) {
-            logger.debug('GopherAgent cache hit');
-            return { ...cached.data, cached: true };
-        }
-        
-        // Check if request is already pending (deduplication)
-        if (this.pendingRequests.has(cacheKey)) {
-            logger.debug('GopherAgent request deduplication');
-            return await this.pendingRequests.get(cacheKey);
-        }
-        
-        // Create new request
-        const requestPromise = this._callPythonAgent('classify_intent', {
-            message,
-            context
-        });
-        
-        this.pendingRequests.set(cacheKey, requestPromise);
-        
-        try {
-            const result = await requestPromise;
-            
-            // Cache result
-            this.cache.set(cacheKey, {
-                data: result,
-                timestamp: Date.now()
-            });
-            
-            // Clean up pending request
-            this.pendingRequests.delete(cacheKey);
-            
-            return { ...result, cached: false };
-        } catch (error) {
-            this.pendingRequests.delete(cacheKey);
-            // If timeout, return fallback result instead of throwing
-            if (error.code === 'TIMEOUT' || error.message.includes('timeout')) {
-                logger.warn(`GopherAgent timeout, using fallback`);
-                return this._getFallbackResult(message, context, 'classify_intent');
-            }
-            throw error;
-        }
-    }
-    
+
     /**
      * Route message to appropriate handler
-     * @param {string} message - Message text
-     * @param {Object} context - Context
-     * @param {Object} intentResult - Pre-computed intent (optional)
-     * @returns {Promise<Object>} Routing result
+     * @param {string} message - User's message
+     * @param {Object} context - Context object (has_attachments, is_mentioned, etc.)
+     * @returns {Promise<Object>} Routing result with handler, intent, etc.
      */
-    async routeMessage(message, context = {}, intentResult = null) {
-        // CRITICAL: Add deduplication for routeMessage as well
-        const cacheKey = this._getCacheKey(message, context) + '_route';
-        const cached = this.cache.get(cacheKey);
-        if (cached && Date.now() - cached.timestamp < this.cacheTTL) {
-            logger.debug('GopherAgent routeMessage cache hit');
-            return { ...cached.data, cached: true };
-        }
-        
-        // Check if request is already pending (deduplication)
-        if (this.pendingRequests.has(cacheKey)) {
-            logger.debug('GopherAgent routeMessage request deduplication');
-            return await this.pendingRequests.get(cacheKey);
-        }
-        
-        // Create routing promise
-        const routePromise = (async () => {
-            // Get intent if not provided
-            if (!intentResult) {
-                intentResult = await this.classifyIntent(message, context);
-            }
-            
-            // Route based on intent
-            const intent = intentResult.intent || 'ignore';
-            const routing = intentResult.routing || 'chat';
-            const shouldRespond = intentResult.should_respond !== false;
-            
-            // Determine handler
-            let handler = 'ignore';
-            if (!shouldRespond) {
-                handler = 'ignore';
-            } else if (intent === 'upload' || context.hasAttachments) {
-                handler = 'upload';
-            } else if (intent === 'action' || routing === 'action') {
-                handler = 'action';
-            } else if (routing === 'rag' || intentResult.needs_rag) {
-                handler = 'rag';
-            } else if (routing === 'tools' || intentResult.needs_tools) {
-                handler = 'tools';
-            } else if (routing === 'memory' || intentResult.needs_memory) {
-                handler = 'memory';
-            } else if (routing === 'chat' || intent === 'casual') {
-                handler = 'chat';
-            } else {
-                handler = 'chat'; // Default fallback
-            }
-            
-            const result = {
-                handler,
-                intent: intentResult,
-                routing_confidence: intentResult.confidence || 0.5
-            };
-            
-            // Cache result
-            this.cache.set(cacheKey, {
-                data: result,
-                timestamp: Date.now()
-            });
-            
-            return result;
-        })();
-        
-        this.pendingRequests.set(cacheKey, routePromise);
-        
-        try {
-            const result = await routePromise;
-            this.pendingRequests.delete(cacheKey);
-            return { ...result, cached: false };
-        } catch (error) {
-            this.pendingRequests.delete(cacheKey);
-            throw error;
+    async routeMessage(message, context = {}) {
+        if (this.useHttp) {
+            return this._routeMessageHttp(message, context);
+        } else {
+            return this._routeMessageProcess(message, context);
         }
     }
-    
+
     /**
-     * Batch classify multiple messages
-     * @param {Array<{message: string, context: Object}>} messages - Messages to classify
-     * @returns {Promise<Array<Object>>} Classification results
+     * Classify message intent
+     * @param {string} message - User's message
+     * @param {Object} context - Context object
+     * @param {boolean} useCache - Whether to use cache
+     * @returns {Promise<Object>} Intent classification result
      */
-    async batchClassify(messages) {
-        return await this._callPythonAgent('batch_classify', { messages });
-    }
-    
-    /**
-     * Get performance metrics
-     * @returns {Promise<Object>} Metrics
-     */
-    async getMetrics() {
-        return await this._callPythonAgent('get_metrics', {});
-    }
-    
-    /**
-     * Clear cache
-     */
-    clearCache() {
-        this.cache.clear();
-        logger.info('GopherAgent cache cleared');
-    }
-    
-    /**
-     * Call Python GopherAgent API (HTTP or subprocess)
-     * @private
-     */
-    _callPythonAgent(method, params) {
-        // Try HTTP server first if enabled
-        if (this.useHttpServer) {
-            return this._callHttpAgent(method, params);
-        }
-        
-        // Fallback to subprocess
-        return this._callSubprocessAgent(method, params);
-    }
-    
-    /**
-     * Call GopherAgent via HTTP (faster)
-     * OPTIMIZED: Uses connection pooling
-     * @private
-     */
-    async _callHttpAgent(method, params) {
-        const endpoint = method === 'classify_intent' ? '/classify_intent' :
-                        method === 'route_message' ? '/route_message' :
-                        method === 'get_metrics' ? '/get_metrics' : null;
-        
-        if (!endpoint) {
-            throw new Error(`Unknown method: ${method}`);
-        }
-        
-        try {
-            // OPTIMIZED: Use pooled HTTP client with timeout
-            // CRITICAL: Use Promise.race to prevent both HTTP and subprocess from completing
-            const httpPromise = this.httpClient.post(endpoint, params);
-            const timeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => reject(new Error('HTTP timeout')), this.timeout);
-            });
-            
-            const response = await Promise.race([httpPromise, timeoutPromise]);
-            return response.data;
-        } catch (error) {
-            // Only fallback if it's a real error (not just timeout from race)
-            if (error.message === 'HTTP timeout' || error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
-                logger.warn(`GopherAgent HTTP call failed (${error.message}), falling back to subprocess`);
-                // Fallback to subprocess
-                return this._callSubprocessAgent(method, params);
-            }
-            // Re-throw other errors
-            throw error;
+    async classifyIntent(message, context = {}, useCache = true) {
+        if (this.useHttp) {
+            return this._classifyIntentHttp(message, context, useCache);
+        } else {
+            return this._classifyIntentProcess(message, context, useCache);
         }
     }
-    
+
     /**
-     * Call Python GopherAgent API via subprocess
-     * @private
+     * Route message via HTTP API
      */
-    _callSubprocessAgent(method, params) {
+    async _routeMessageHttp(message, context) {
         return new Promise((resolve, reject) => {
+            const postData = JSON.stringify({
+                message: message,
+                context: context
+            });
+
+            const options = {
+                hostname: this.httpHost,
+                port: this.httpPort,
+                path: '/route_message',
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(postData)
+                },
+                timeout: this.timeout
+            };
+
+            const req = http.request(options, (res) => {
+                let data = '';
+
+                res.on('data', (chunk) => {
+                    data += chunk;
+                });
+
+                res.on('end', () => {
+                    if (res.statusCode !== 200) {
+                        try {
+                            const error = JSON.parse(data);
+                            reject(new Error(error.error || `HTTP ${res.statusCode}: ${data}`));
+                        } catch {
+                            reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+                        }
+                        return;
+                    }
+
+                    try {
+                        const result = JSON.parse(data);
+                        resolve(result);
+                    } catch (error) {
+                        reject(new Error(`Failed to parse response: ${error.message}`));
+                    }
+                });
+            });
+
+            req.on('error', (error) => {
+                reject(new Error(`HTTP request failed: ${error.message}`));
+            });
+
+            req.on('timeout', () => {
+                req.destroy();
+                reject(new Error('GopherAgent HTTP request timeout'));
+            });
+
+            req.write(postData);
+            req.end();
+        });
+    }
+
+    /**
+     * Classify intent via HTTP API
+     */
+    async _classifyIntentHttp(message, context, useCache) {
+        return new Promise((resolve, reject) => {
+            const postData = JSON.stringify({
+                message: message,
+                context: context,
+                use_cache: useCache
+            });
+
+            const options = {
+                hostname: this.httpHost,
+                port: this.httpPort,
+                path: '/classify_intent',
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(postData)
+                },
+                timeout: this.timeout
+            };
+
+            const req = http.request(options, (res) => {
+                let data = '';
+
+                res.on('data', (chunk) => {
+                    data += chunk;
+                });
+
+                res.on('end', () => {
+                    if (res.statusCode !== 200) {
+                        try {
+                            const error = JSON.parse(data);
+                            reject(new Error(error.error || `HTTP ${res.statusCode}: ${data}`));
+                        } catch {
+                            reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+                        }
+                        return;
+                    }
+
+                    try {
+                        const result = JSON.parse(data);
+                        resolve(result);
+                    } catch (error) {
+                        reject(new Error(`Failed to parse response: ${error.message}`));
+                    }
+                });
+            });
+
+            req.on('error', (error) => {
+                reject(new Error(`HTTP request failed: ${error.message}`));
+            });
+
+            req.on('timeout', () => {
+                req.destroy();
+                reject(new Error('GopherAgent HTTP request timeout'));
+            });
+
+            req.write(postData);
+            req.end();
+        });
+    }
+
+    /**
+     * Route message via Python process
+     */
+    async _routeMessageProcess(message, context) {
+        return new Promise((resolve, reject) => {
+            // Create a temporary Python script to call route_message
+            const scriptPath = path.join(__dirname, '..', '..', 'src', 'api', 'gopher_agent_server.py');
+            
+            // Calculate project root from current file location
+            const projectRoot = path.resolve(path.join(__dirname, '..', '..'));
+            
+            // We'll use a Python script that calls the agent directly
+            const pythonScript = `
+import sys
+import json
+import os
+from pathlib import Path
+
+# Add project root to path (passed as environment variable)
+project_root = os.environ.get('DOCLING_PROJECT_ROOT')
+if project_root:
+    project_root = Path(project_root).resolve()
+    if project_root.exists() and str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
+from src.agents.gopher_agent import get_gopher_agent
+
+try:
+    message = sys.argv[1]
+    context_str = sys.argv[2] if len(sys.argv) > 2 else '{}'
+    context = json.loads(context_str)
+    
+    agent = get_gopher_agent()
+    result = agent.route_message(message, context)
+    
+    print(json.dumps(result))
+except Exception as e:
+    print(json.dumps({'error': str(e), 'error_type': type(e).__name__}), file=sys.stderr)
+    sys.exit(1)
+`;
+
             const args = [
-                this.agentScript,
-                '--method', method,
-                '--params', JSON.stringify(params)
+                '-c',
+                pythonScript,
+                message,
+                JSON.stringify(context)
             ];
-            
-            // Set working directory to project root for proper Python imports
-            const projectRoot = path.join(__dirname, '..', '..');
-            
+
             const pythonProcess = spawn(this.pythonPath, args, {
-                stdio: ['pipe', 'pipe', 'pipe'],
-                cwd: projectRoot,
                 env: {
                     ...process.env,
-                    PYTHONPATH: projectRoot  // Add project root to PYTHONPATH
+                    DOCLING_PROJECT_ROOT: projectRoot
                 }
             });
-            
+
             let stdout = '';
             let stderr = '';
-            
+
             const timeout = setTimeout(() => {
-                pythonProcess.kill('SIGTERM');
-                // Give it a moment to clean up, then force kill
-                setTimeout(() => {
-                    try {
-                        pythonProcess.kill('SIGKILL');
-                    } catch (e) {
-                        // Process already dead
-                    }
-                }, 1000);
-                const error = new Error(`GopherAgent ${method} timeout after ${this.timeout}ms`);
-                error.code = 'TIMEOUT';
-                reject(error);
+                pythonProcess.kill();
+                reject(new Error('GopherAgent timeout'));
             }, this.timeout);
-            
+
             pythonProcess.stdout.on('data', (data) => {
                 stdout += data.toString();
             });
-            
+
             pythonProcess.stderr.on('data', (data) => {
                 stderr += data.toString();
             });
-            
+
             pythonProcess.on('close', (code) => {
                 clearTimeout(timeout);
-                
+
                 if (code !== 0) {
-                    logger.error(`GopherAgent error (code ${code}): ${stderr}`);
                     reject(new Error(`GopherAgent error: ${stderr || 'Unknown error'}`));
                     return;
                 }
-                
+
                 try {
                     // Extract JSON from stdout
                     const jsonMatch = stdout.match(/\{[\s\S]*\}/);
                     if (jsonMatch) {
                         const result = JSON.parse(jsonMatch[0]);
-                        resolve(result);
+                        if (result.error) {
+                            reject(new Error(result.error));
+                        } else {
+                            resolve(result);
+                        }
                     } else {
                         reject(new Error('Invalid response from GopherAgent'));
                     }
                 } catch (error) {
-                    logger.error(`Failed to parse GopherAgent response: ${stdout.substring(0, 500)}`);
-                    reject(error);
+                    reject(new Error(`Failed to parse response: ${error.message}`));
                 }
             });
-            
+
             pythonProcess.on('error', (error) => {
                 clearTimeout(timeout);
                 reject(new Error(`Failed to start GopherAgent: ${error.message}`));
             });
         });
     }
-    
+
     /**
-     * Generate cache key
-     * @private
+     * Classify intent via Python process
      */
-    _getCacheKey(message, context) {
-        const keyData = {
-            message: message.toLowerCase().trim(),
-            hasAttachments: context.hasAttachments || false,
-            isMentioned: context.isMentioned || false
-        };
-        return JSON.stringify(keyData);
-    }
+    async _classifyIntentProcess(message, context, useCache) {
+        return new Promise((resolve, reject) => {
+            // Calculate project root from current file location
+            const projectRoot = path.resolve(path.join(__dirname, '..', '..'));
+            
+            const pythonScript = `
+import sys
+import json
+import os
+from pathlib import Path
+
+# Add project root to path (passed as environment variable)
+project_root = os.environ.get('DOCLING_PROJECT_ROOT')
+if project_root:
+    project_root = Path(project_root).resolve()
+    if project_root.exists() and str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
+from src.agents.gopher_agent import get_gopher_agent
+
+try:
+    message = sys.argv[1]
+    context_str = sys.argv[2] if len(sys.argv) > 2 else '{}'
+    context = json.loads(context_str)
+    use_cache = sys.argv[3].lower() == 'true' if len(sys.argv) > 3 else True
     
-    /**
-     * Get fallback result when GopherAgent times out or fails
-     * @private
-     */
-    _getFallbackResult(message, context, method) {
-        const messageLower = message.toLowerCase();
-        
-        // Quick pattern-based fallback
-        const hasUrl = /https?:\/\//.test(message) || /youtube\.com|youtu\.be/.test(messageLower);
-        const hasAttachment = context.hasAttachments;
-        const isGreeting = /^(hi|hello|hey|greetings)/i.test(message.trim());
-        
-        if (method === 'classify_intent') {
-            if (hasUrl) {
-                return {
-                    intent: 'question',
-                    should_respond: true,
-                    confidence: 0.8,
-                    routing: 'tools',
-                    needs_rag: false,
-                    needs_tools: true,
-                    needs_memory: false,
-                    is_casual: false,
-                    document_references: [],
-                    fallback: true
-                };
-            }
-            if (hasAttachment) {
-                return {
-                    intent: 'upload',
-                    should_respond: true,
-                    confidence: 0.9,
-                    routing: 'upload',
-                    needs_rag: false,
-                    needs_tools: false,
-                    needs_memory: false,
-                    is_casual: false,
-                    document_references: [],
-                    fallback: true
-                };
-            }
-            if (isGreeting) {
-                return {
-                    intent: 'casual',
-                    should_respond: true,
-                    confidence: 0.7,
-                    routing: 'chat',
-                    needs_rag: false,
-                    needs_tools: false,
-                    needs_memory: false,
-                    is_casual: true,
-                    document_references: [],
-                    fallback: true
-                };
-            }
-            // Default: treat as question needing RAG
-            return {
-                intent: 'question',
-                should_respond: true,
-                confidence: 0.5,
-                routing: 'rag',
-                needs_rag: true,
-                needs_tools: false,
-                needs_memory: false,
-                is_casual: false,
-                document_references: [],
-                fallback: true
-            };
-        }
-        
-        // Fallback for route_message
-        return {
-            handler: hasUrl ? 'tools' : (isGreeting ? 'chat' : 'rag'),
-            intent: this._getFallbackResult(message, context, 'classify_intent'),
-            routing_confidence: 0.5,
-            fallback: true
-        };
+    agent = get_gopher_agent()
+    result = agent.classify_intent(message, context, use_cache=use_cache)
+    
+    print(json.dumps(result))
+except Exception as e:
+    print(json.dumps({'error': str(e), 'error_type': type(e).__name__}), file=sys.stderr)
+    sys.exit(1)
+`;
+
+            const args = [
+                '-c',
+                pythonScript,
+                message,
+                JSON.stringify(context),
+                useCache.toString()
+            ];
+
+            const pythonProcess = spawn(this.pythonPath, args, {
+                env: {
+                    ...process.env,
+                    DOCLING_PROJECT_ROOT: projectRoot
+                }
+            });
+
+            let stdout = '';
+            let stderr = '';
+
+            const timeout = setTimeout(() => {
+                pythonProcess.kill();
+                reject(new Error('GopherAgent timeout'));
+            }, this.timeout);
+
+            pythonProcess.stdout.on('data', (data) => {
+                stdout += data.toString();
+            });
+
+            pythonProcess.stderr.on('data', (data) => {
+                stderr += data.toString();
+            });
+
+            pythonProcess.on('close', (code) => {
+                clearTimeout(timeout);
+
+                if (code !== 0) {
+                    reject(new Error(`GopherAgent error: ${stderr || 'Unknown error'}`));
+                    return;
+                }
+
+                try {
+                    // Extract JSON from stdout
+                    const jsonMatch = stdout.match(/\{[\s\S]*\}/);
+                    if (jsonMatch) {
+                        const result = JSON.parse(jsonMatch[0]);
+                        if (result.error) {
+                            reject(new Error(result.error));
+                        } else {
+                            resolve(result);
+                        }
+                    } else {
+                        reject(new Error('Invalid response from GopherAgent'));
+                    }
+                } catch (error) {
+                    reject(new Error(`Failed to parse response: ${error.message}`));
+                }
+            });
+
+            pythonProcess.on('error', (error) => {
+                clearTimeout(timeout);
+                reject(new Error(`Failed to start GopherAgent: ${error.message}`));
+            });
+        });
     }
 }
 
+// Export singleton instance
 module.exports = new GopherAgent();
-

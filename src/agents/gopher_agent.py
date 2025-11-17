@@ -12,11 +12,11 @@ from cachetools import TTLCache
 from concurrent.futures import ThreadPoolExecutor
 import torch
 
-from src.clients.lmstudio_client import LMStudioClient
+from src.clients.llm_client_factory import get_default_llm_client
 from src.processors.embedding_generator import EmbeddingGenerator
 from config import (
-    LMSTUDIO_BASE_URL, LMSTUDIO_MODEL, USE_GPU, EMBEDDING_BATCH_SIZE,
-    CACHE_ENABLED, CACHE_MAX_SIZE, CACHE_TTL_SECONDS, LMSTUDIO_TIMEOUT
+    USE_GPU, EMBEDDING_BATCH_SIZE,
+    CACHE_ENABLED, CACHE_MAX_SIZE, CACHE_TTL_SECONDS
 )
 from logger_config import logger
 
@@ -33,20 +33,20 @@ class GopherAgent:
     """
     
     def __init__(self, 
-                 llm_client: Optional[LMStudioClient] = None,
+                 llm_client = None,  # Can be any LLM client (LMStudioClient, OpenAICompatibleClient, etc.)
                  embedding_generator: Optional[EmbeddingGenerator] = None,
                  cache_ttl: int = 300):  # 5 minute cache
         """
         Initialize GopherAgent.
         
         Args:
-            llm_client: LMStudio client (auto-created if None)
+            llm_client: LLM client (auto-created using factory if None, supports multiple providers)
             embedding_generator: Embedding generator (auto-created if None)
             cache_ttl: Cache TTL in seconds (default: 5 minutes)
         """
-        # Initialize LLM client
+        # Initialize LLM client (use factory to support multiple providers)
         if llm_client is None:
-            self.llm_client = LMStudioClient()
+            self.llm_client = get_default_llm_client()
         else:
             self.llm_client = llm_client
         
@@ -118,13 +118,8 @@ class GopherAgent:
         """
         start_time = time.time()
         
-        # Quick pattern-based check for common cases (faster than LLM)
-        quick_result = self._quick_pattern_check(message, context)
-        if quick_result:
-            quick_result["latency_ms"] = (time.time() - start_time) * 1000
-            quick_result["cached"] = False
-            quick_result["pattern_match"] = True
-            return quick_result
+        # Skip quick pattern check - always use LLM for classification
+        # (User wants LLM to always respond, even for simple greetings)
         
         # Check cache first
         cache_key = None
@@ -153,15 +148,18 @@ class GopherAgent:
         
         self.metrics["cache_misses"] += 1
         
+        # Normalize attachment detection (handle both camelCase and snake_case)
+        has_attachments = context and (context.get("hasAttachments") or context.get("has_attachments") or False)
+        
         # Build context string
         context_str = ""
         if context:
             if context.get("recent_messages"):
                 recent = context["recent_messages"][:3]  # Last 3 messages
                 context_str += f"\nRecent messages: {json.dumps(recent, ensure_ascii=False)}"
-            if context.get("has_attachments"):
+            if has_attachments:
                 context_str += "\nMessage has file attachments."
-            if context.get("is_mentioned"):
+            if context.get("is_mentioned") or context.get("isMentioned"):
                 context_str += "\nBot was mentioned in message."
         
         # OPTIMIZED: Fast LLM classification prompt (shorter for speed)
@@ -171,13 +169,21 @@ class GopherAgent:
         # Shorter context
         short_context_str = ""
         if context:
-            if context.get("has_attachments"):
+            if has_attachments:
                 short_context_str += "\nHas attachments."
-            if context.get("is_mentioned"):
+            if context.get("is_mentioned") or context.get("isMentioned"):
                 short_context_str += "\nMentioned."
         
-        # More concise prompt
+        # More concise prompt with explicit guidance for greetings and document detection
         prompt = f"""Classify intent. JSON only.
+
+Rules:
+- Greetings (hi, hello, hey, how are you, etc.) → routing:"chat", needs_rag:false, is_casual:true
+- Questions about documents/files → routing:"rag", needs_rag:true
+- If message mentions topics/subjects that might be from documents (proper nouns, technical terms, specific people/companies/products), check if it's asking about information → routing:"rag", needs_rag:true
+- Examples of document references: mentioning specific people/companies (e.g., "kagi", "vlad", "prelovac"), asking "what did you think about X" where X might be from a document, asking "what's your favorite thing about X" where X was recently discussed
+- If user asks about something that was recently summarized or discussed in documents → routing:"rag", needs_rag:true
+- Only use RAG if explicitly asking about documents or information retrieval is needed
 
 "{message_truncated}"{short_context_str}
 
@@ -192,22 +198,95 @@ class GopherAgent:
         
         try:
             # OPTIMIZED: Fast LLM call (low temperature for consistency, reduced tokens for speed)
-            # Use shorter timeout for faster responses
+            # Use reasonable timeout (15s for classification - thinking models may need more time)
             try:
-                response = self.llm_client.generate_response(
-                    messages=[
-                        {"role": "system", "content": "Fast intent classifier. JSON only."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.1,  # Low temperature for consistent classification
-                    max_tokens=120  # OPTIMIZED: Reduced from 150 for faster generation
-                )
+                # Temporarily adjust timeout for classification
+                original_timeout = getattr(self.llm_client, 'timeout', 30)
+                if hasattr(self.llm_client, 'timeout'):
+                    self.llm_client.timeout = 30  # Increased to 30s for GLM-4.6 thinking model (needs more time for reasoning)
+                
+                try:
+                    response = self.llm_client.generate_response(
+                        messages=[
+                            {"role": "system", "content": "Fast intent classifier. JSON only."},
+                            {"role": "user", "content": prompt}
+                        ],
+                        temperature=0.1,  # Low temperature for consistent classification
+                        max_tokens=1500  # Increased significantly for GLM-4.6 thinking model (reasoning uses ~500-800 tokens, then needs ~100-200 for JSON)
+                    )
+                finally:
+                    # Restore original timeout
+                    if hasattr(self.llm_client, 'timeout'):
+                        self.llm_client.timeout = original_timeout
             except Exception as e:
                 logger.warning(f"LLM call failed in GopherAgent: {e}, using fallback")
-                if future:
-                    future.set_exception(e)
+                if future and not future.done():
+                    try:
+                        future.set_exception(e)
+                    except Exception:
+                        pass  # Future might already be done
                     self.pending_requests.pop(cache_key, None)
                 raise
+            
+            # Handle empty or None responses (common with thinking models)
+            # Retry once with a slightly longer prompt if we get empty response
+            if not response or (isinstance(response, str) and not response.strip()):
+                logger.warning(f"Empty response from LLM, retrying with more explicit prompt")
+                # Retry with a more explicit prompt
+                retry_prompt = f"""You must classify this message intent. Respond with ONLY valid JSON, no other text.
+
+Rules:
+- Greetings (hi, hello, hey, how are you, etc.) → routing:"chat", needs_rag:false, is_casual:true
+- Questions about documents/files → routing:"rag", needs_rag:true
+- Only use RAG if explicitly asking about documents or information retrieval is needed
+
+Message: "{message_truncated}"{short_context_str}
+
+Required JSON format:
+{{"intent":"question|command|casual|action|upload|ignore","should_respond":true|false,"confidence":0.0-1.0,"routing":"rag|chat|tools|memory|action","needs_rag":true|false,"needs_tools":true|false,"needs_memory":true|false,"is_casual":true|false}}
+
+Respond now with JSON only:"""
+                
+                try:
+                    original_timeout = getattr(self.llm_client, 'timeout', 30)
+                    if hasattr(self.llm_client, 'timeout'):
+                        self.llm_client.timeout = 15
+                    try:
+                        response = self.llm_client.generate_response(
+                            messages=[
+                                {"role": "system", "content": "You are a fast intent classifier. You MUST respond with valid JSON only. No thinking, no explanation, just JSON."},
+                                {"role": "user", "content": retry_prompt}
+                            ],
+                            temperature=0.1,
+                            max_tokens=100
+                        )
+                    finally:
+                        if hasattr(self.llm_client, 'timeout'):
+                            self.llm_client.timeout = original_timeout
+                    
+                    # Check if retry worked
+                    if response and isinstance(response, str) and response.strip():
+                        logger.info(f"Retry succeeded, got response: {response[:100]}")
+                    else:
+                        logger.warning(f"Retry also returned empty response, using fallback")
+                        return self._fallback_classify(message, context, start_time)
+                except Exception as retry_error:
+                    logger.warning(f"Retry failed: {retry_error}, using fallback")
+                    return self._fallback_classify(message, context, start_time)
+            
+            # For Chutes thinking models, the response might be in reasoning_content
+            # Try to extract JSON from reasoning if it's a long reasoning response
+            if isinstance(response, str) and len(response) > 500 and 'reasoning' in response.lower():
+                # This might be reasoning_content - try to extract JSON from it
+                import re
+                json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response, re.DOTALL)
+                if json_match:
+                    try:
+                        parsed_json = json.loads(json_match.group(0))
+                        logger.info(f"Extracted JSON from reasoning_content")
+                        return parsed_json
+                    except json.JSONDecodeError:
+                        pass  # Fall through to normal parsing
             
             # Parse JSON response
             result = self._parse_json_response(response)
@@ -227,16 +306,22 @@ class GopherAgent:
                 self.intent_cache[cache_key] = result.copy()
             
             # Complete future for deduplication
-            if future:
-                future.set_result(result)
+            if future and not future.done():
+                try:
+                    future.set_result(result)
+                except Exception:
+                    pass  # Future might already be done
                 self.pending_requests.pop(cache_key, None)
             
             return result
             
         except Exception as e:
-            # Complete future with exception
-            if future:
-                future.set_exception(e)
+            # Complete future with exception (only if not already done)
+            if future and not future.done():
+                try:
+                    future.set_exception(e)
+                except Exception:
+                    pass  # Future might already be done or set
                 self.pending_requests.pop(cache_key, None)
             
             logger.error(f"Error classifying intent: {e}", exc_info=True)
@@ -267,6 +352,9 @@ class GopherAgent:
         start_time = time.time()
         reasoning_parts = []
         
+        # Normalize attachment detection (handle both camelCase and snake_case)
+        has_attachments = context and (context.get("hasAttachments") or context.get("has_attachments") or False)
+        
         # Get intent if not provided
         if intent_result is None:
             intent_result = self.classify_intent(message, context)
@@ -276,6 +364,8 @@ class GopherAgent:
         routing = intent_result.get("routing", "chat")
         should_respond = intent_result.get("should_respond", False)
         confidence = intent_result.get("confidence", 0.5)
+        is_casual = intent_result.get("is_casual", False)
+        needs_rag = intent_result.get("needs_rag", False)
         
         # Enhanced URL detection with better patterns
         message_lower = message.lower()
@@ -301,6 +391,13 @@ class GopherAgent:
         ]
         has_image_generation = any(keyword in message_lower for keyword in image_generation_keywords)
         
+        # Check for greetings explicitly (greetings should ALWAYS go to chat, not RAG)
+        greeting_keywords = ["hi", "hello", "hey", "greetings", "hiya", "howdy", "sup", "yo", "wassup", "what's up", "whats up", "how are you", "how are u", "how r u", "how's it going", "hows it going"]
+        is_greeting = any(greeting in message_lower for greeting in greeting_keywords)
+        bot_name_patterns = ["gophie", "gopher", "bot", "gopherbot"]
+        has_bot_name = any(name in message_lower for name in bot_name_patterns)
+        is_greeting_with_bot = has_bot_name and is_greeting
+        
         # Enhanced context analysis
         has_recent_context = context and context.get("recent_messages") and len(context.get("recent_messages", [])) > 0
         is_follow_up = has_recent_context and any(
@@ -308,11 +405,12 @@ class GopherAgent:
         )
         
         # Determine handler with smarter logic
+        # PRIORITY: Chat/casual/greetings BEFORE RAG (greetings should never trigger RAG)
         handler = None
         if not should_respond:
             handler = "ignore"
             reasoning_parts.append("should_respond=false")
-        elif intent == "upload" or (context and context.get("hasAttachments")):
+        elif intent == "upload" or has_attachments:
             handler = "upload"
             reasoning_parts.append("file attachment detected")
         elif intent == "action" or routing == "action":
@@ -334,10 +432,13 @@ class GopherAgent:
             intent_result["is_casual"] = False  # URLs are not casual
             reasoning_parts.append("URL detected - requires tool execution")
             logger.info(f"🌐 URL detected in message - forcing tools handler")
-        # Enhanced: Check for document references in context
-        elif routing == "rag" or intent_result.get("needs_rag", False):
-            handler = "rag"
-            reasoning_parts.append("document query detected")
+        # CRITICAL: Greetings ALWAYS go to chat (never RAG) - check this BEFORE RAG check
+        elif is_greeting or is_greeting_with_bot or is_casual or routing == "chat" or intent == "casual":
+            handler = "chat"
+            intent_result["needs_rag"] = False  # Force needs_rag to False for greetings/casual
+            intent_result["is_casual"] = True  # Ensure is_casual is True
+            reasoning_parts.append("greeting/casual conversation - using chat handler")
+            logger.info(f"💬 Greeting/casual message detected - routing to chat (not RAG)")
         # Enhanced: Check for tool-related keywords
         elif routing == "tools" or intent_result.get("needs_tools", False):
             handler = "tools"
@@ -356,17 +457,22 @@ class GopherAgent:
             else:
                 handler = "chat"
                 reasoning_parts.append("follow-up conversation")
-        elif routing == "chat" or intent == "casual":
-            handler = "chat"
-            reasoning_parts.append("casual conversation")
+        # RAG only if explicitly needed (needs_rag=True or routing="rag")
+        # AND not a greeting/casual message (double-check)
+        elif (routing == "rag" or needs_rag) and not is_greeting and not is_casual:
+            handler = "rag"
+            reasoning_parts.append("document query detected")
         else:
-            handler = "rag"  # Default to RAG for better information retrieval
-            reasoning_parts.append("default to RAG for information retrieval")
+            # Default to chat (not RAG) - greetings and casual messages should go through LLM
+            handler = "chat"
+            intent_result["needs_rag"] = False
+            reasoning_parts.append("default to chat handler")
+            logger.info(f"💬 Default routing to chat (not RAG)")
         
         # Adjust confidence based on context
         if has_url and handler == "tools":
             confidence = max(confidence, 0.95)  # High confidence for URL routing
-        elif context and context.get("hasAttachments") and handler == "upload":
+        elif has_attachments and handler == "upload":
             confidence = max(confidence, 0.95)  # High confidence for upload routing
         
         latency_ms = (time.time() - start_time) * 1000
@@ -465,6 +571,11 @@ class GopherAgent:
     
     def _parse_json_response(self, response: str) -> Dict[str, Any]:
         """Parse JSON from LLM response (handles markdown code blocks)."""
+        # Handle None or empty responses
+        if not response:
+            logger.warning(f"Empty response received, using default classification")
+            return self._get_default_classification()
+        
         # Try to extract JSON from response
         import re
         
@@ -483,19 +594,24 @@ class GopherAgent:
         try:
             return json.loads(json_str)
         except json.JSONDecodeError:
-            logger.warning(f"Failed to parse JSON from response: {response[:200]}")
+            logger.warning(f"Failed to parse JSON from response: {response[:200] if response else 'None'}")
             # Return default classification
-            return {
-                "intent": "question",
-                "should_respond": True,
-                "confidence": 0.5,
-                "routing": "rag",
-                "needs_rag": True,
-                "needs_tools": False,
-                "needs_memory": False,
-                "is_casual": False,
-                "document_references": []
-            }
+            return self._get_default_classification()
+    
+    def _get_default_classification(self) -> Dict[str, Any]:
+        """Get default classification when parsing fails."""
+        # Default to chat (not RAG) - let the LLM handle it
+        return {
+            "intent": "question",
+            "should_respond": True,
+            "confidence": 0.5,
+            "routing": "chat",
+            "needs_rag": False,
+            "needs_tools": False,
+            "needs_memory": False,
+            "is_casual": False,
+            "document_references": []
+        }
     
     def _fallback_classify(self, message: str, context: Optional[Dict[str, Any]], start_time: float) -> Dict[str, Any]:
         """Fallback pattern-based classification when LLM fails."""
@@ -503,7 +619,17 @@ class GopherAgent:
         
         # Pattern matching
         has_question_mark = "?" in message
-        is_greeting = any(word in message_lower for word in ["hi", "hello", "hey", "greetings"])
+        is_greeting = any(word in message_lower for word in ["hi", "hello", "hey", "greetings", "hiya", "howdy", "sup", "yo"])
+        
+        # Check for bot name in greeting (e.g., "hey gophie", "hi gopher")
+        bot_name_patterns = ["gophie", "gopher", "bot", "gopherbot"]
+        has_bot_name = any(name in message_lower for name in bot_name_patterns)
+        is_greeting_with_bot = has_bot_name and is_greeting
+        
+        # Check for casual greeting questions (e.g., "how are you", "what's up")
+        casual_questions = ["how are you", "how are u", "how r u", "what's up", "whats up", "wassup", "how's it going", "hows it going"]
+        is_casual_question = any(q in message_lower for q in casual_questions)
+        
         is_command = message_lower.startswith("/") or any(word in message_lower for word in ["do this", "please", "can you"])
         has_action_words = any(word in message_lower for word in ["give", "transfer", "set", "take"])
         
@@ -511,13 +637,21 @@ class GopherAgent:
         should_respond = True
         routing = "rag"
         
-        if context and context.get("has_attachments"):
+        # Normalize attachment detection (handle both camelCase and snake_case)
+        has_attachments = context and (context.get("hasAttachments") or context.get("has_attachments") or False)
+        
+        if has_attachments:
             intent = "upload"
             routing = "upload"
+        elif is_greeting_with_bot or (is_greeting and is_casual_question):
+            # Greetings with bot name or casual greeting questions should go to chat
+            intent = "casual"
+            routing = "chat"
+            should_respond = True  # Should respond to greetings
         elif is_greeting and not has_question_mark:
             intent = "casual"
             routing = "chat"
-            should_respond = False
+            should_respond = True  # Should respond to greetings
         elif is_command:
             intent = "command"
             routing = "tools"
@@ -527,7 +661,7 @@ class GopherAgent:
         elif not has_question_mark and len(message) < 20:
             intent = "casual"
             routing = "chat"
-            should_respond = False
+            should_respond = True  # Should respond to casual messages
         
         latency_ms = (time.time() - start_time) * 1000
         
@@ -594,7 +728,8 @@ class GopherAgent:
             }
         
         # Check for file uploads
-        if context and context.get("has_attachments"):
+        has_attachments = context and (context.get("hasAttachments") or context.get("has_attachments") or False)
+        if has_attachments:
             return {
                 "intent": "upload",
                 "should_respond": True,
@@ -607,13 +742,45 @@ class GopherAgent:
                 "document_references": []
             }
         
-        # Check for simple greetings (don't need LLM)
-        greetings = ["hi", "hello", "hey", "greetings", "good morning", "good afternoon", "good evening"]
-        if message_lower in greetings or any(message_lower.startswith(g + " ") for g in greetings):
+        # Check for simple greetings (don't need LLM) - enhanced patterns
+        greetings = [
+            "hi", "hello", "hey", "greetings", "good morning", "good afternoon", "good evening",
+            "hiya", "howdy", "sup", "yo", "wassup", "waddup", "what's up", "whats up",
+            "gm", "gn", "good night"
+        ]
+        
+        # Check exact match or starts with greeting
+        is_greeting = (
+            message_lower in greetings or
+            any(message_lower.startswith(g + " ") for g in greetings) or
+            any(message_lower.startswith(g + "!") for g in greetings) or
+            any(message_lower.startswith(g + ".") for g in greetings)
+        )
+        
+        # Also check for greetings with bot name (e.g., "hi gophie", "hey gopher", "hello bot")
+        bot_name_patterns = ["gophie", "gopher", "bot", "gopherbot"]
+        has_bot_name = any(name in message_lower for name in bot_name_patterns)
+        is_greeting_with_bot = (
+            has_bot_name and
+            any(g in message_lower for g in ["hi", "hello", "hey", "greetings"])
+        )
+        
+        # Check for very short casual messages (1-3 words, no question marks, no URLs, no numbers)
+        is_short_casual = (
+            len(message.split()) <= 3 and
+            "?" not in message and
+            "http" not in message_lower and
+            "www." not in message_lower and
+            not any(char.isdigit() for char in message) and
+            len(message.strip()) < 50
+        )
+        
+        if is_greeting or is_greeting_with_bot or is_short_casual:
+            logger.debug(f"⚡ Fast path: detected greeting/casual message '{message[:50]}', skipping LLM call")
             return {
                 "intent": "casual",
                 "should_respond": True,
-                "confidence": 0.9,
+                "confidence": 0.95 if (is_greeting or is_greeting_with_bot) else 0.85,
                 "routing": "chat",
                 "needs_rag": False,
                 "needs_tools": False,
@@ -635,8 +802,8 @@ class GopherAgent:
         # Create hash of message + relevant context
         key_data = {
             "message": message_normalized,
-            "has_attachments": context.get("has_attachments", False) if context else False,
-            "is_mentioned": context.get("is_mentioned", False) if context else False,
+            "has_attachments": (context.get("hasAttachments") or context.get("has_attachments") or False) if context else False,
+            "is_mentioned": (context.get("isMentioned") or context.get("is_mentioned") or False) if context else False,
             # Include user_id if available (for user-specific caching)
             "user_id": context.get("userId", "") if context else "",
         }
@@ -668,7 +835,7 @@ class GopherAgent:
 _gopher_agent_instance: Optional[GopherAgent] = None
 
 
-def get_gopher_agent(llm_client: Optional[LMStudioClient] = None, embedding_generator: Optional[EmbeddingGenerator] = None) -> GopherAgent:
+def get_gopher_agent(llm_client = None, embedding_generator: Optional[EmbeddingGenerator] = None) -> GopherAgent:
     """Get or create GopherAgent singleton instance."""
     global _gopher_agent_instance
     if _gopher_agent_instance is None:

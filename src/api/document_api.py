@@ -25,6 +25,7 @@ except ImportError:
 from src.stores.document_store import DocumentStore
 from src.processors.document_processor import DocumentProcessor
 from src.processors.embedding_generator import EmbeddingGenerator
+from src.utils.file_classifier import FileClassifier
 
 # Set UTF-8 encoding for stdout/stderr to handle Unicode characters on Windows
 if sys.platform == 'win32':
@@ -62,9 +63,33 @@ def main():
             if not args.user_id or not args.file_path:
                 raise ValueError("user-id and file-path required for upload action")
             
+            # Analyze and validate file before processing
+            # Use try-except to handle any classification errors gracefully
+            try:
+                is_safe, reason = FileClassifier.is_file_safe_for_upload(args.file_path)
+                if not is_safe:
+                    raise ValueError(f"File validation failed: {reason}")
+                
+                # Get file classification for metadata
+                classification = FileClassifier.classify_file(args.file_path)
+            except Exception as e:
+                # If classification fails, log but don't block upload for known extensions
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"File classification warning: {e}")
+                # Continue with upload - the document processor will handle it
+                classification = {'category': 'unknown', 'subtype': None, 'notes': 'Classification failed'}
+            
             # Process document
             processor = DocumentProcessor(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
             document = processor.process_document(args.file_path)
+            
+            # Add classification info to metadata
+            document['metadata']['file_classification'] = {
+                'category': classification['category'],
+                'subtype': classification['subtype'],
+                'notes': classification['notes']
+            }
             
             # Generate embeddings
             device = USE_GPU if USE_GPU != 'auto' else None

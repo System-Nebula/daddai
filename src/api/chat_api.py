@@ -1,6 +1,6 @@
 """
-Simple chat API for Discord bot - direct LMStudio call without RAG.
-Returns JSON responses for easy integration.
+Simple chat API for Discord bot - supports multiple OpenAI-compatible providers.
+Returns JSON responses for easy integration. Supports streaming.
 """
 import json
 import sys
@@ -12,19 +12,21 @@ project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from src.clients.lmstudio_client import LMStudioClient
+from src.clients.llm_client_factory import get_default_llm_client
+from config import LLM_STREAMING_ENABLED
 
 def main():
     parser = argparse.ArgumentParser(description='Simple Chat API for Discord bot')
     parser.add_argument('--message', type=str, required=True, help='Message to send')
     parser.add_argument('--history', type=str, default=None, help='JSON array of conversation history')
+    parser.add_argument('--stream', action='store_true', help='Enable streaming (outputs chunks as they arrive)')
     
     args = parser.parse_args()
     
     try:
-        # Initialize LMStudio client (model detection happens here, but only once per process)
-        # For faster responses, we could cache this, but subprocess means new process each time
-        client = LMStudioClient()
+        # Initialize LLM client using factory (supports multiple providers)
+        # This will use the provider specified in LLM_PROVIDER config
+        client = get_default_llm_client()
         
         # System prompt for Gophie's personality
         system_prompt = """You are Gophie, a bubbly, risky e-girl waifu AI assistant!
@@ -62,22 +64,68 @@ IMPORTANT - SPEAKING STYLE:
         # Add current message
         messages.append({"role": "user", "content": args.message})
         
-        # Generate response with optimized settings for speed and personality
-        response = client.generate_response(
-            messages=messages,
-            temperature=0.85,  # Higher temperature for more creative, bubbly responses
-            max_tokens=500  # Reduced from 1000 for faster responses
-        )
+        # Check if streaming is enabled
+        use_streaming = args.stream or LLM_STREAMING_ENABLED
         
-        # Return JSON response
-        result = {
-            "answer": response,
-            "message": args.message
-        }
+        if use_streaming and hasattr(client, 'generate_stream'):
+            # Stream response
+            full_response = ""
+            thinking_content = ""
+            
+            for chunk in client.generate_stream(
+                messages=messages,
+                temperature=0.85,
+                max_tokens=500
+            ):
+                if chunk.get('content'):
+                    full_response += chunk['content']
+                    # Output chunk immediately for real-time streaming
+                    chunk_result = {
+                        "chunk": chunk['content'],
+                        "thinking": chunk.get('thinking'),
+                        "finished": chunk.get('finish_reason') is not None
+                    }
+                    print(json.dumps(chunk_result), file=sys.stdout)
+                    sys.stdout.flush()
+                
+                if chunk.get('thinking'):
+                    thinking_content += chunk['thinking']
+            
+            # Final result
+            result = {
+                "answer": full_response,
+                "message": args.message,
+                "streaming": True,
+                "thinking": thinking_content if thinking_content else None
+            }
+        else:
+            # Non-streaming response
+            print(f"[Chat API] Calling LLM with {len(messages)} messages", file=sys.stderr)
+            print(f"[Chat API] Message: {args.message[:100]}...", file=sys.stderr)
+            
+            response = client.generate_response(
+                messages=messages,
+                temperature=0.85,  # Higher temperature for more creative, bubbly responses
+                max_tokens=4000  # Very high for GLM-4.6 thinking model (reasoning can use 1000-2000 tokens, then needs 500-1000 for response)
+            )
+            
+            print(f"[Chat API] Response received: {len(response) if isinstance(response, str) else 'dict'} chars", file=sys.stderr)
+            if isinstance(response, str):
+                print(f"[Chat API] Response preview: {response[:200]}...", file=sys.stderr)
+            elif isinstance(response, dict):
+                print(f"[Chat API] Response keys: {list(response.keys())}", file=sys.stderr)
+                if 'content' in response:
+                    print(f"[Chat API] Content: {response['content'][:200]}...", file=sys.stderr)
+            
+            result = {
+                "answer": response if isinstance(response, str) else response.get('content', str(response)),
+                "message": args.message,
+                "streaming": False
+            }
         
-        # Only output JSON to stdout (no debug info)
+        # Output final JSON response
         print(json.dumps(result), file=sys.stdout)
-        sys.stdout.flush()  # Ensure output is sent immediately
+        sys.stdout.flush()
         
     except Exception as e:
         error_response = {

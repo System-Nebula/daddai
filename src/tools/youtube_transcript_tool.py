@@ -297,15 +297,14 @@ def summarize_youtube(
                     if not chunks:
                         logger.warning("Chunking produced no chunks, skipping summarization")
                     else:
-                        # Get LMStudio client for summarization (lazy import to avoid circular deps)
+                        # Get LLM client for summarization (uses factory to support multiple providers)
                         try:
-                            from src.clients.lmstudio_client import LMStudioClient
-                            from config import LMSTUDIO_BASE_URL
+                            from src.clients.llm_client_factory import get_default_llm_client
                             
                             # Initialize summarizer with retry configuration
-                            lmstudio_client = LMStudioClient(base_url=LMSTUDIO_BASE_URL)
+                            llm_client = get_default_llm_client()
                             summarizer = TranscriptSummarizer(
-                                lmstudio_client=lmstudio_client,
+                                lmstudio_client=llm_client,  # Works with any LLM client
                                 max_retries=3,
                                 retry_delay=1.0
                             )
