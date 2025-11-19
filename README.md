@@ -32,8 +32,9 @@ A production-ready Retrieval-Augmented Generation (RAG) system with agentic capa
 - 📊 **MMR**: Maximal Marginal Relevance for diverse results
 - ⏰ **Temporal Weighting**: Time-decay functions for recent content
 
-### Discord Bot Integration
+### Discord Bot Integration (TypeScript)
 - 💬 **Full Discord Integration**: Slash commands, message handling, rich embeds
+- 📘 **TypeScript**: Modern TypeScript codebase with type safety
 - 🔄 **Persistent Services**: Fast JSON-RPC communication via stdin/stdout
 - 📈 **Observability**: OpenTelemetry integration, metrics, and monitoring
 - 🛡️ **Resilience**: Circuit breakers, retry logic, request queuing
@@ -80,8 +81,9 @@ A production-ready Retrieval-Augmented Generation (RAG) system with agentic capa
    - Default: `http://localhost:9200`
    - Enables faster hybrid semantic+keyword search
 
-5. **Node.js 18+**: Required for Discord bot
+5. **Node.js 18+**: Required for Discord bot (TypeScript)
    - Download from [nodejs.org](https://nodejs.org/)
+   - TypeScript support via `tsx` (included in dependencies)
 
 6. **NVIDIA GPU** (Recommended): RTX 3080 or similar
    - CUDA-compatible GPU with 8GB+ VRAM
@@ -168,11 +170,16 @@ DISCORD_TOKEN=your-discord-bot-token
 3. **Ingest documents**: `python main.py ingest --path documents/`
 4. **Query**: `python main.py query --question "Your question"`
 
-### Discord Bot (Optional)
+### Discord Bot (Optional - TypeScript)
 1. **Install Node.js dependencies**: `cd discord-bot && npm install`
 2. **Configure Discord token**: Add `DISCORD_TOKEN` to `.env`
-3. **Start bot**: `cd discord-bot && npm start`
+3. **Start bot**: 
+   - TypeScript (default): `cd discord-bot && npm start`
+   - Development mode: `cd discord-bot && npm run dev`
+   - JavaScript fallback: `cd discord-bot && npm run start:js`
 4. **Use slash commands**: `/rag`, `/upload`, `/chat`, etc.
+
+**Note**: The bot is written in TypeScript with full type safety. The codebase includes both `.ts` (TypeScript) and `.js` (JavaScript) files for compatibility.
 
 ### HTTP API Servers (Optional)
 1. **Start Memory Server**: `python src/api/memory_server_http.py`
@@ -233,11 +240,13 @@ This will start an interactive session where you can ask multiple questions.
 ├── docs/                  # Documentation
 │   ├── upgrades/         # Upgrade documentation
 │   └── assessments/      # Assessment documentation
-├── discord-bot/           # Discord bot (Node.js)
-│   ├── src/              # Bot source code
+├── discord-bot/           # Discord bot (TypeScript/Node.js)
+│   ├── src/              # Bot source code (TypeScript + JavaScript)
 │   ├── tests/            # Bot test files
 │   ├── docs/             # Bot documentation
-│   └── scripts/          # Bot utility scripts
+│   ├── scripts/          # Bot utility scripts
+│   ├── index.ts          # Main TypeScript entry point
+│   └── tsconfig.json     # TypeScript configuration
 ├── config/                # Config package (legacy)
 ├── logger/                # Logger package
 └── deps/                  # Dependencies
