@@ -6,6 +6,9 @@ from neo4j import GraphDatabase
 from datetime import datetime
 from config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
 
+# Import Unicode sanitization function from memory_store
+from src.stores.memory_store import sanitize_unicode_for_neo4j
+
 
 class DocumentStore:
     """Store shared documents uploaded by users."""
@@ -64,14 +67,19 @@ class DocumentStore:
             # Extract video_id if available (for YouTube documents)
             video_id = document_data['metadata'].get('video_id')
             
+            # CRITICAL: Sanitize Unicode to remove invalid surrogates before storing in Neo4j
+            sanitized_text = sanitize_unicode_for_neo4j(document_data['text'][:10000])
+            sanitized_file_name = sanitize_unicode_for_neo4j(document_data['metadata']['file_name'])
+            sanitized_file_path = sanitize_unicode_for_neo4j(document_data['metadata']['file_path']) if document_data['metadata'].get('file_path') else None
+            
             # Create shared document node
             create_params = {
                 "doc_id": doc_id,
-                "file_name": document_data['metadata']['file_name'],
-                "file_path": document_data['metadata']['file_path'],
+                "file_name": sanitized_file_name,
+                "file_path": sanitized_file_path,
                 "file_type": document_data['metadata']['file_type'],
                 "uploaded_by": uploaded_by,
-                "text": document_data['text'][:10000]
+                "text": sanitized_text
             }
             
             create_query = """
@@ -114,12 +122,13 @@ class DocumentStore:
                 batch = chunks[batch_start:batch_start + batch_size]
                 
                 # Build batch query for better performance
+                # CRITICAL: Sanitize chunk text to remove invalid Unicode surrogates
                 batch_params = {
                     "doc_id": doc_id,
                     "chunks": [
                         {
                             "chunk_id": f"{doc_id}_chunk_{batch_start + i}",
-                            "text": chunk['text'],
+                            "text": sanitize_unicode_for_neo4j(chunk['text']),
                             "chunk_index": chunk['chunk_index'],
                             "embedding": embedding
                         }

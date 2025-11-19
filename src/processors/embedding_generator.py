@@ -11,7 +11,7 @@ from sentence_transformers import SentenceTransformer
 class EmbeddingGenerator:
     """Generate embeddings for text chunks using local models with GPU acceleration."""
     
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2", device: str = None, batch_size: int = None):
+    def __init__(self, model_name: str = "BAAI/bge-base-en-v1.5", device: str = None, batch_size: int = None):
         """
         Initialize the embedding generator.
         
@@ -39,13 +39,15 @@ class EmbeddingGenerator:
         self.model = SentenceTransformer(model_name, device=device)
         self.embedding_dimension = self.model.get_sentence_embedding_dimension()
         
-        # Set optimal batch size based on device
+        # Set optimal batch size based on device and model
+        # BGE models are larger, so use smaller batches
         if batch_size is None:
             if device == 'cuda':
-                # RTX 3080 has 10GB VRAM, use larger batches
-                self.batch_size = 64
+                # Larger models need smaller batches to fit in VRAM
+                # BGE-base is ~420MB, so reduce batch size from 64 to 32
+                self.batch_size = 32
             else:
-                self.batch_size = 16
+                self.batch_size = 8  # Reduced for CPU (was 16)
         else:
             self.batch_size = batch_size
         
@@ -70,11 +72,27 @@ class EmbeddingGenerator:
         if not isinstance(text, str):
             text = str(text) if text is not None else ""
         
+        # Normalize Unicode and remove problematic characters
+        import unicodedata
+        try:
+            # Normalize Unicode to NFC form (canonical composition)
+            text = unicodedata.normalize('NFC', text)
+        except Exception:
+            # If normalization fails, try to encode/decode to fix encoding issues
+            try:
+                text = text.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+            except Exception:
+                pass
+        
         # Remove any null bytes or invalid characters
         text = text.replace('\x00', '').strip()
         
-        # Remove Discord mentions and other special formatting that might confuse tokenizer
+        # Remove control characters except newlines, tabs, and carriage returns
         import re
+        # Keep common whitespace characters but remove other control chars
+        text = ''.join(char for char in text if unicodedata.category(char)[0] != 'C' or char in '\n\t\r')
+        
+        # Remove Discord mentions and other special formatting that might confuse tokenizer
         text = re.sub(r'<@!?\d+>', '', text)  # Remove user mentions
         text = re.sub(r'<@&\d+>', '', text)   # Remove role mentions
         text = re.sub(r'<#\d+>', '', text)    # Remove channel mentions
@@ -89,6 +107,14 @@ class EmbeddingGenerator:
         if not text:
             raise ValueError("Text cannot be empty after cleaning")
         
+        # Final encoding check - ensure text can be properly encoded
+        try:
+            # Test encoding to UTF-8 to catch any remaining issues
+            text.encode('utf-8')
+        except UnicodeEncodeError:
+            # Replace problematic characters
+            text = text.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+        
         # Truncate very long texts (sentence transformers work best with shorter texts)
         # For queries, we want to keep them reasonable (max 2000 chars)
         # For document chunks, we can allow more (up to 10000 chars)
@@ -99,10 +125,31 @@ class EmbeddingGenerator:
             warnings.warn(f"Text truncated to {max_length} characters for embedding")
         
         try:
-            embedding = self.model.encode(text, convert_to_numpy=True, device=self.device)
+            # BGE models require instruction prefix for queries (but not for documents)
+            # For now, encode directly (we'll add query instruction prefix in RAG pipeline)
+            # Ensure text is passed as a string, not bytes
+            if isinstance(text, bytes):
+                text = text.decode('utf-8', errors='replace')
+            
+            embedding = self.model.encode(text, convert_to_numpy=True, device=self.device, normalize_embeddings=True)
             return embedding.tolist()
+        except TypeError as e:
+            # Handle tokenizer type errors - might be due to unexpected input format
+            # Try to further clean the text
+            try:
+                # Convert to string again and remove any remaining problematic characters
+                text_clean = str(text).encode('ascii', errors='ignore').decode('ascii')
+                if not text_clean.strip():
+                    # If ASCII conversion removes everything, use original with aggressive cleaning
+                    text_clean = ''.join(c for c in text if c.isprintable() or c.isspace())
+                if text_clean.strip():
+                    embedding = self.model.encode(text_clean, convert_to_numpy=True, device=self.device, normalize_embeddings=True)
+                    return embedding.tolist()
+            except Exception:
+                pass
+            raise ValueError(f"Error generating embedding: {e}. Text type: {type(text)}, Text length: {len(text) if text else 0}, Text preview: {repr(text)[:200] if text else 'None'}")
         except Exception as e:
-            raise ValueError(f"Error generating embedding: {e}. Text type: {type(text)}, Text length: {len(text) if text else 0}, Text preview: {str(text)[:100] if text else 'None'}")
+            raise ValueError(f"Error generating embedding: {e}. Text type: {type(text)}, Text length: {len(text) if text else 0}, Text preview: {repr(text)[:200] if text else 'None'}")
     
     def generate_embeddings_batch(self, texts: List[str], batch_size: int = None) -> List[List[float]]:
         """
@@ -118,8 +165,11 @@ class EmbeddingGenerator:
         if not texts:
             return []
         
-        # Validate and sanitize inputs
+        # Validate and sanitize inputs using the same logic as generate_embedding
         sanitized_texts = []
+        import unicodedata
+        import re
+        
         for i, text in enumerate(texts):
             if text is None:
                 raise ValueError(f"Text at index {i} cannot be None")
@@ -128,13 +178,40 @@ class EmbeddingGenerator:
             if not isinstance(text, str):
                 text = str(text) if text is not None else ""
             
-            # Remove null bytes and invalid characters
+            # Normalize Unicode and remove problematic characters (same as generate_embedding)
+            try:
+                text = unicodedata.normalize('NFC', text)
+            except Exception:
+                try:
+                    text = text.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+                except Exception:
+                    pass
+            
+            # Remove null bytes
             text = text.replace('\x00', '').strip()
+            
+            # Remove control characters except newlines, tabs, and carriage returns
+            text = ''.join(char for char in text if unicodedata.category(char)[0] != 'C' or char in '\n\t\r')
+            
+            # Remove Discord mentions
+            text = re.sub(r'<@!?\d+>', '', text)
+            text = re.sub(r'<@&\d+>', '', text)
+            text = re.sub(r'<#\d+>', '', text)
+            text = re.sub(r'<:\w+:\d+>', '', text)
+            text = re.sub(r'<a:\w+:\d+>', '', text)
+            text = re.sub(r'https?://[^\s]+', '', text)
+            text = re.sub(r'\s+', ' ', text).strip()
+            
+            # Final encoding check
+            try:
+                text.encode('utf-8')
+            except UnicodeEncodeError:
+                text = text.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
             
             # Skip empty texts but warn
             if not text:
                 import warnings
-                warnings.warn(f"Empty text at index {i}, skipping")
+                warnings.warn(f"Empty text at index {i} after cleaning, using placeholder")
                 sanitized_texts.append(" ")  # Use space as placeholder
             else:
                 # Truncate if too long
@@ -148,13 +225,14 @@ class EmbeddingGenerator:
         bs = batch_size if batch_size else self.batch_size
         
         try:
+            # BGE models work well with normalized embeddings
             embeddings = self.model.encode(
                 sanitized_texts, 
                 convert_to_numpy=True, 
                 show_progress_bar=True,
                 batch_size=bs,
                 device=self.device,
-                normalize_embeddings=True  # Normalize for better cosine similarity
+                normalize_embeddings=True  # Normalize for better cosine similarity (required for BGE)
             )
             return embeddings.tolist()
         except Exception as e:

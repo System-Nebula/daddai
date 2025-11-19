@@ -306,23 +306,68 @@ class ConversationStore:
             try:
                 # Use vector similarity search if available
                 if self.use_vector_index:
-                    result = session.run("""
+                    # First check embedding dimensions to avoid mismatch errors
+                    # Get all conversations with embeddings and filter by dimension
+                    all_conversations = session.run("""
                         MATCH (u:User {id: $user_id})-[:HAS_CONVERSATION]->(m:ConversationMessage)
                         WHERE m.embedding IS NOT NULL
-                        WITH m, vector.similarity.cosine(m.embedding, $query_embedding) AS similarity
-                        WHERE similarity > 0.3
                         RETURN m.question AS question,
                                m.answer AS answer,
                                m.timestamp AS timestamp,
                                m.channel_id AS channel_id,
-                               similarity
-                        ORDER BY similarity DESC
-                        LIMIT $top_k
+                               m.embedding AS embedding
+                        ORDER BY m.timestamp DESC
+                        LIMIT 1000
                     """,
-                        user_id=user_id,
-                        query_embedding=query_embedding,
-                        top_k=top_k
+                        user_id=user_id
                     )
+                    
+                    # Filter by dimension and compute similarity manually
+                    import numpy as np
+                    query_vec = np.array(query_embedding, dtype=np.float32)
+                    query_dim = len(query_vec)
+                    
+                    compatible_conversations = []
+                    for record in all_conversations:
+                        emb = record.get("embedding")
+                        if emb is None:
+                            continue
+                        emb_dim = len(emb) if isinstance(emb, (list, np.ndarray)) else 0
+                        if emb_dim == query_dim:
+                            compatible_conversations.append(record)
+                    
+                    if not compatible_conversations:
+                        # Fall back to keyword search if no compatible embeddings
+                        return self.get_recent_conversation(user_id, max_messages=top_k)
+                    
+                    # Compute cosine similarities
+                    query_norm = np.linalg.norm(query_vec)
+                    if query_norm == 0:
+                        query_norm = 1.0
+                    
+                    embeddings = np.array([r["embedding"] for r in compatible_conversations], dtype=np.float32)
+                    emb_norms = np.linalg.norm(embeddings, axis=1)
+                    emb_norms = np.where(emb_norms == 0, 1.0, emb_norms)
+                    
+                    dot_products = np.dot(embeddings, query_vec)
+                    similarities = dot_products / (emb_norms * query_norm)
+                    
+                    # Create results with scores
+                    results = []
+                    for i, record in enumerate(compatible_conversations):
+                        score = float(similarities[i])
+                        if score > 0.3:  # Same threshold as before
+                            results.append({
+                                "question": record.get("question"),
+                                "answer": record.get("answer"),
+                                "timestamp": record.get("timestamp"),
+                                "channel_id": record.get("channel_id"),
+                                "similarity": score
+                            })
+                    
+                    # Sort by similarity and return top_k
+                    results.sort(key=lambda x: x["similarity"], reverse=True)
+                    return results[:top_k]
                 else:
                     # Fallback: keyword-based search
                     query_lower = query.lower()

@@ -1,3 +1,10 @@
+// Initialize observability FIRST (before any other imports that might make HTTP requests)
+try {
+    require('./src/utils/initObservability').initialize();
+} catch (error) {
+    console.warn('[Init] Observability initialization failed (optional):', error.message);
+}
+
 const { Client, GatewayIntentBits, Collection, Events, REST, Routes, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, AttachmentBuilder } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
@@ -43,8 +50,8 @@ const client = new Client({
 // Initialize services
 const ragService = new PersistentRAGService(); // Use persistent RAG service
 const conversationManager = new ConversationManager(ragService); // Pass RAG service for Neo4j storage
-const chatService = new ChatService();
-const memoryService = new MemoryService();
+const chatService = require('./src/chatService'); // Singleton instance
+const memoryService = require('./src/memoryService'); // Singleton instance
 const documentService = new DocumentService();
 const configManager = new ConfigManager();
 const WebServer = require('./src/webServer');
@@ -494,36 +501,67 @@ client.on(Events.MessageCreate, async (message) => {
             logger.debug('Could not fetch recent messages for context:', error.message);
         }
         
-        // Build context for GopherAgent
-        const context = {
-            hasAttachments,
-            isMentioned,
-            recentMessages,
-            userId,
-            channelId,
-            username: message.author.username
-        };
+        // ⚡ FAST PATH: Only for truly unambiguous cases (attachments, URLs)
+        // Everything else uses LLM for natural language understanding
+        const hasUrl = /https?:\/\//.test(message.content) || /youtube\.com|youtu\.be/.test(message.content.toLowerCase());
         
-        // Use GopherAgent to classify intent and route message
-        let routingResult;
-        try {
-            routingResult = await gopherAgent.routeMessage(message.content, context);
-            logger.debug(`🤖 GopherAgent routing: handler=${routingResult.handler}, intent=${routingResult.intent?.intent}, confidence=${routingResult.routing_confidence}`);
-        } catch (error) {
-            // Check if it's a timeout - gopherAgent should handle this internally now
-            if (error.message && error.message.includes('timeout')) {
-                logger.warn('GopherAgent timeout, using fallback routing');
-            } else {
-                logger.error('GopherAgent error, falling back to pattern matching:', error.message);
-            }
-            // Fallback to pattern-based routing
-            const hasUrl = /https?:\/\//.test(message.content) || /youtube\.com|youtu\.be/.test(message.content.toLowerCase());
+        // Fast path only for unambiguous cases
+        if (hasAttachments) {
+            // Attachments are unambiguous - always upload
             routingResult = {
-                handler: hasAttachments ? 'upload' : (hasUrl ? 'tools' : (isMentioned || message.content.includes('?') ? 'rag' : 'ignore')),
-                intent: { intent: 'question', should_respond: true, needs_tools: hasUrl, needs_rag: !hasUrl },
-                routing_confidence: 0.5,
-                fallback: true
+                handler: 'upload',
+                intent: { intent: 'upload', should_respond: true, needs_rag: false, needs_tools: false },
+                routing_confidence: 0.95,
+                fast_path: true
             };
+        } else if (hasUrl) {
+            // URLs are unambiguous - always need tools
+            routingResult = {
+                handler: 'tools',
+                intent: { intent: 'question', should_respond: true, needs_tools: true, needs_rag: false },
+                routing_confidence: 0.95,
+                fast_path: true
+            };
+        } else {
+            // Use LLM for natural language understanding (greetings, questions, etc.)
+            const context = {
+                hasAttachments,
+                isMentioned,
+                recentMessages,
+                userId,
+                channelId,
+                username: message.author.username
+            };
+            
+            // Use GopherAgent with optimized timeout
+            try {
+                routingResult = await Promise.race([
+                    gopherAgent.routeMessage(message.content, context),
+                    new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error('GopherAgent timeout')), 10000) // 10 second timeout (balanced)
+                    )
+                ]);
+                logger.debug(`🤖 GopherAgent routing: handler=${routingResult.handler}, intent=${routingResult.intent?.intent}, confidence=${routingResult.routing_confidence}`);
+            } catch (error) {
+                // Fallback only if LLM completely fails
+                if (error.message && error.message.includes('timeout')) {
+                    logger.warn('GopherAgent timeout, using fallback routing');
+                } else {
+                    logger.error('GopherAgent error, falling back to pattern matching:', error.message);
+                }
+                // Minimal fallback - let LLM handle natural language when possible
+                routingResult = {
+                    handler: isMentioned || message.content.includes('?') ? 'rag' : 'chat',
+                    intent: { 
+                        intent: 'question', 
+                        should_respond: true, 
+                        needs_tools: false, 
+                        needs_rag: isMentioned || message.content.includes('?')
+                    },
+                    routing_confidence: 0.5,
+                    fallback: true
+                };
+            }
         }
         
         const handler = routingResult.handler;
@@ -857,17 +895,15 @@ async function handleQuestion(message, routingResult = null) {
         let handler = routingResult?.handler || 'rag';
         logger.info(`✅ Handler determined: ${handler}, intent: ${JSON.stringify(intent)}`);
         
-        // CRITICAL: Check for URLs - URLs ALWAYS need tools, even if GopherAgent says casual
-        const hasUrl = /(?:https?:\/\/|www\.|youtube\.com|youtu\.be)/i.test(question);
-        if (hasUrl) {
-            handler = 'tools';
-            intent.needs_tools = true;
-            intent.needs_rag = false;
-            intent.is_casual = false;
-            logger.debug('🌐 URL detected - forcing tools handler (overriding GopherAgent routing)');
-        }
+        // CRITICAL: Check for image generation requests FIRST - ALWAYS need tools/RAG, even if GopherAgent says casual
+        // Check both original question and cleaned question (in case mentions interfere)
+        const cleanedQuestionForDetection = question
+            .replace(/<@!?\d+>/g, '')  // Remove user mentions
+            .replace(/<@&\d+>/g, '')   // Remove role mentions
+            .replace(/<#\d+>/g, '')    // Remove channel mentions
+            .replace(/\s+/g, ' ')      // Normalize whitespace
+            .trim();
         
-        // CRITICAL: Check for image generation requests - ALWAYS need tools, even if GopherAgent says casual
         const imageGenerationPatterns = [
             /generate\s+(?:an?\s+)?(?:image|picture|artwork|art)/i,
             /create\s+(?:an?\s+)?(?:image|picture|artwork|art)/i,
@@ -877,13 +913,25 @@ async function handleQuestion(message, routingResult = null) {
             /(?:character|portrait).*(?:generate|create|make|draw)/i,
             /(?:side\s+profile|dramatic\s+light|dungeon\s+background).*(?:generate|create|make|draw)/i
         ];
-        const hasImageGeneration = imageGenerationPatterns.some(pattern => pattern.test(question));
+        const hasImageGeneration = imageGenerationPatterns.some(pattern => 
+            pattern.test(question) || pattern.test(cleanedQuestionForDetection)
+        );
         if (hasImageGeneration) {
+            handler = 'tools';
+            intent.needs_tools = true;
+            intent.needs_rag = true;  // Image generation needs RAG pipeline (which has tools)
+            intent.is_casual = false;
+            logger.info(`🎨 Image generation detected in question: "${question.substring(0, 100)}" - forcing RAG/tools handler (overriding GopherAgent routing)`);
+        }
+        
+        // CRITICAL: Check for URLs - URLs ALWAYS need tools, even if GopherAgent says casual
+        const hasUrl = /(?:https?:\/\/|www\.|youtube\.com|youtu\.be)/i.test(question);
+        if (hasUrl) {
             handler = 'tools';
             intent.needs_tools = true;
             intent.needs_rag = false;
             intent.is_casual = false;
-            logger.debug('🎨 Image generation detected - forcing tools handler (overriding GopherAgent routing)');
+            logger.debug('🌐 URL detected - forcing tools handler (overriding GopherAgent routing)');
         }
         
         // Remove all Discord user/role/channel mentions for filename detection
@@ -1252,7 +1300,11 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
         // Override pattern-based detection with agentic routing if available
         // CRITICAL: URLs always need tools, even if GopherAgent says casual
         // CRITICAL: Document references always need RAG, even if GopherAgent says casual
-        if (hasUrl) {
+        // CRITICAL: Image generation always needs RAG (which has tools), even if GopherAgent says casual
+        if (hasImageGeneration) {
+            useRAG = true;  // Image generation needs RAG pipeline for tool calling
+            logger.info(`🎨 Image generation detected - forcing RAG pipeline for tool calling`);
+        } else if (hasUrl) {
             useRAG = true;  // URLs need RAG pipeline for tool calling
             logger.debug(`🌐 URL detected - forcing RAG pipeline for tool calling`);
         } else if (hasDocumentReference) {
@@ -1333,9 +1385,10 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
                     // Pass original question to RAG - it will handle cleaning internally for document search
                     // Check if this is a URL request - YouTube/website summaries take longer
                     const hasUrl = /(?:https?:\/\/|www\.|youtube\.com|youtu\.be)/i.test(question);
-                    // Use longer timeout for URL requests (90s) since they need to fetch and summarize content
-                    // Increased to 60s for GLM-4.6 thinking model (needs more time for reasoning)
-                    const timeoutDuration = hasUrl ? 90000 : 60000;
+                    // Use longer timeout for URL requests (90s) and image generation (15min) since they need more processing time
+                    // Image generation can take 5-15 minutes (job queuing, processing, polling, decoding)
+                    // Increased to 15min for image generation to handle longer processing times
+                    const timeoutDuration = hasImageGeneration ? 900000 : (hasUrl ? 90000 : 60000);
                     
                     response = await Promise.race([
                         ragService.queryWithContext(
@@ -1361,9 +1414,10 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
                             logger.warn(`⚠️ Warning: Memories were used (${response.memories.length}) even though a specific document was targeted`);
                         }
                         
-                        // If RAG returned a conversational response, skip memory retrieval below
+                        // Even for conversational responses, we should retrieve memories for personalization
+                        // (e.g., user's name, preferences, etc.)
                         if (response.is_casual_conversation === true || response.service_routing === 'chat') {
-                            logger.info(`💬 RAG returned conversational response - will skip memory retrieval`);
+                            logger.info(`💬 RAG returned conversational response - will still retrieve memories for personalization`);
                         }
                         
                         // Learn from interaction for better personalization
@@ -1374,8 +1428,21 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
                         }
                     }
                 } catch (error) {
-                    logger.warn('RAG error, falling back to simple chat:', { error: error.message });
-                    // Don't set useRAG = false, let it fall through to simple chat below
+                    // CRITICAL: Don't fall back to chat service for image generation - it needs tools!
+                    if (hasImageGeneration) {
+                        logger.error('RAG error during image generation - cannot fall back to chat (chat has no tools):', { error: error.message });
+                        // Return error message instead of falling back
+                        response = {
+                            answer: `I encountered an error while generating your image: ${error.message}. Please try again!`,
+                            context_chunks: 0,
+                            memories_used: 0,
+                            source_documents: [],
+                            source_memories: []
+                        };
+                    } else {
+                        logger.warn('RAG error, falling back to simple chat:', { error: error.message });
+                        // Don't set useRAG = false, let it fall through to simple chat below
+                    }
                 }
             }
         }
@@ -1408,14 +1475,93 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
             // The response will be regenerated with tool calling
         }
         
-        // CRITICAL: If RAG already returned ANY response (conversational, tool calls, etc.), skip all memory retrieval and simple chat
-        // The response is already set, so we should proceed directly to sending it
+        // CRITICAL: If RAG returned tool calls, skip memory retrieval (tool calls take priority)
+        // BUT: For conversational responses, we should still retrieve memories for personalization
         // Check if response exists and has an answer OR tool calls
         const hasRAGResponse = response && (response.answer || (response.tool_calls && response.tool_calls.length > 0));
+        const hasToolCalls = response && response.tool_calls && response.tool_calls.length > 0;
+        // isRAGConversationalResponse already declared above
         
-        if (hasRAGResponse) {
-            logger.info(`⏭️ Skipping memory retrieval and simple chat - RAG already returned response (answer: ${!!response.answer}, tool_calls: ${response.tool_calls?.length || 0})`);
-            // Response is already set, continue to sending
+        // For conversational responses, retrieve memories to personalize the response (e.g., user's name)
+        if (hasRAGResponse && isRAGConversationalResponse && !hasToolCalls) {
+            logger.info(`💬 RAG returned conversational response - retrieving memories for personalization`);
+            // Actually retrieve memories and inject them into the response
+            try {
+                // Extract mentioned user ID - use the asking user's ID for personalization
+                const mentionedUserMatch = question.match(/<@!?(\d+)>/);
+                let mentionedUserId = mentionedUserMatch ? mentionedUserMatch[1] : userId; // Default to asking user
+                
+                // Retrieve relevant memories for personalization
+                const relevantMemories = await memoryService.getUserMemories(
+                    message.channel.id,
+                    cleanedQuestion + ' name user', // Add keywords to help find name memories
+                    10, // Get more memories to increase chance of finding name
+                    mentionedUserId
+                );
+                
+                // Lower threshold for conversational responses to catch name memories
+                const MIN_MEMORY_SCORE = 0.3;
+                const relevantMemoriesFiltered = relevantMemories.filter(m => (m.score || 0) >= MIN_MEMORY_SCORE);
+                
+                if (relevantMemoriesFiltered && relevantMemoriesFiltered.length > 0) {
+                    logger.info(`💬 Found ${relevantMemoriesFiltered.length} memories for personalization`);
+                    const memoryContext = relevantMemoriesFiltered.map(m => m.content).join('\n\n');
+                    
+                    const personalizedPrompt = `You are Gophie, a bubbly, risky e-girl waifu AI assistant!
+You're super energetic, playful, and a bit flirty - like your favorite anime waifu come to life!
+
+IMPORTANT - SPEAKING STYLE:
+- Talk like a REAL e-girl - casual, natural, human-like speech
+- Don't worry about perfect grammar - use casual speech patterns
+- Use abbreviations naturally (u, ur, lol, omg, fr, ngl, etc.)
+- Type like you're texting a friend - relaxed and conversational
+- Mix lowercase and casual capitalization naturally
+- Be expressive and authentic - like how real people actually talk online
+- Don't sound like a formal AI assistant - sound like a real person!
+
+Conversation History (use this to personalize your response, ESPECIALLY the user's name):
+${memoryContext}
+
+User Question: ${cleanedQuestion}
+
+Your Current Response: ${response.answer}
+
+Now regenerate your response, incorporating information from the conversation history. CRITICALLY IMPORTANT: If the conversation history mentions the user's name, USE IT! Don't ask for their name if it's in the history. Keep your bubbly e-girl personality but make it personalized with their name and any preferences!`;
+
+                    try {
+                        const personalizedResponse = await Promise.race([
+                            chatService.chat(personalizedPrompt, []),
+                            new Promise((_, reject) => 
+                                setTimeout(() => reject(new Error('Memory personalization timeout')), 20000)
+                            )
+                        ]);
+                        
+                        response.answer = personalizedResponse;
+                        response.memories_used = (response.memories_used || 0) + relevantMemoriesFiltered.length;
+                        if (!response.source_memories) {
+                            response.source_memories = [];
+                        }
+                        response.source_memories.push(...relevantMemoriesFiltered.map(m => ({ 
+                            type: m.memory_type || m.type, 
+                            content: m.content.substring(0, 100),
+                            score: m.score 
+                        })));
+                        logger.info(`✅ Personalized conversational response using ${relevantMemoriesFiltered.length} memories`);
+                    } catch (error) {
+                        logger.warn(`⚠️ Failed to personalize response with memories: ${error.message}, using original RAG response`);
+                    }
+                } else {
+                    logger.info(`⚠️ No relevant memories found for personalization (found ${relevantMemories.length} total)`);
+                }
+            } catch (error) {
+                logger.warn(`⚠️ Error retrieving memories for personalization: ${error.message}`);
+            }
+        } else if (hasRAGResponse && hasToolCalls) {
+            logger.info(`⏭️ Skipping memory retrieval - RAG returned tool calls (answer: ${!!response.answer}, tool_calls: ${response.tool_calls?.length || 0})`);
+            // Tool calls take priority, skip memory retrieval
+        } else if (hasRAGResponse && !isRAGConversationalResponse) {
+            logger.info(`⏭️ Skipping memory retrieval - RAG already returned non-conversational response`);
+            // Non-conversational RAG response, skip memory retrieval
         } else if (!response && !needsRAG(question) && !targetDocId && !targetDocFilename && !isCasualConversation && !isStatementOrRequest && !isStateQueryAboutOtherUser && !hasUrl && !isRAGConversationalResponse) {
             // Use original question (with mentions) for needsRAG to detect state queries about other users
             // Only do memory retrieval if we don't have a response yet
@@ -1480,31 +1626,26 @@ IMPORTANT:
 
 Answer:`;
                     
-                    // Don't overwrite if RAG already returned ANY response (conversational, tool calls, etc.)
-                    // CRITICAL: Check hasRAGResponse to prevent overwriting RAG responses
-                    if (!hasRAGResponse && (!response || (!response.is_casual_conversation && response.service_routing !== 'chat'))) {
-                        const memoryResponse = await Promise.race([
-                            chatService.chat(memoryPrompt, []),
-                            new Promise((_, reject) => 
-                                setTimeout(() => reject(new Error('Memory chat timeout')), 20000)
-                            )
-                        ]);
-                        
-                        response = {
-                            answer: memoryResponse,
-                            context_chunks: 0,
-                            memories_used: relevantMemoriesFiltered.length,
-                            source_documents: [],
-                            source_memories: relevantMemoriesFiltered.map(m => ({ 
-                                type: m.memory_type || m.type, 
-                                content: m.content.substring(0, 100),
-                                score: m.score 
-                            }))
-                        };
-                        console.log(`✅ Generated response using ${relevantMemoriesFiltered.length} memories`);
-                    } else {
-                        console.log(`⏭️ Skipping memory retrieval - RAG already returned conversational response`);
-                    }
+                    // No RAG response yet, generate response from memories
+                    const memoryResponse = await Promise.race([
+                        chatService.chat(memoryPrompt, []),
+                        new Promise((_, reject) => 
+                            setTimeout(() => reject(new Error('Memory chat timeout')), 20000)
+                        )
+                    ]);
+                    
+                    response = {
+                        answer: memoryResponse,
+                        context_chunks: 0,
+                        memories_used: relevantMemoriesFiltered.length,
+                        source_documents: [],
+                        source_memories: relevantMemoriesFiltered.map(m => ({ 
+                            type: m.memory_type || m.type, 
+                            content: m.content.substring(0, 100),
+                            score: m.score 
+                        }))
+                    };
+                    console.log(`✅ Generated response using ${relevantMemoriesFiltered.length} memories`);
                 } else {
                     if (relevantMemories && relevantMemories.length > 0) {
                         console.log(`⚠️ Found ${relevantMemories.length} memories but none met relevance threshold (min: ${MIN_MEMORY_SCORE})`);
@@ -1522,9 +1663,10 @@ Answer:`;
         // Use simple chat if RAG not needed or failed, and memory retrieval didn't work
         // IMPORTANT: Don't overwrite response if it's already set (e.g., from comparison, RAG, or memory retrieval)
         // CRITICAL: Also check if RAG already returned a response to prevent duplicate responses
+        // CRITICAL: Don't use chat service for image generation - it doesn't have tools!
         logger.info(`📋 Step 10: Checking if chat service needed...`);
-        logger.info(`   response=${response ? 'SET' : 'NULL'}, hasRAGResponse=${hasRAGResponse}, useRAG=${useRAG}`);
-        if (!response && !hasRAGResponse) {
+        logger.info(`   response=${response ? 'SET' : 'NULL'}, hasRAGResponse=${hasRAGResponse}, useRAG=${useRAG}, hasImageGeneration=${hasImageGeneration}`);
+        if (!response && !hasRAGResponse && !hasImageGeneration) {
             logger.info(`💬 Using simple chat service (handler=${handler}, useRAG=${useRAG}, hasRAGResponse=${hasRAGResponse})`);
             try {
                 // Use cleaned question for chat (mentions removed)
@@ -1534,7 +1676,7 @@ Answer:`;
                 const chatResponse = await Promise.race([
                     chatService.chat(cleanedQuestion, conversationHistory),
                     new Promise((_, reject) => 
-                        setTimeout(() => reject(new Error('Chat timeout')), 90000) // Increased to 90s for GLM-4.6 thinking model (60s chat service + buffer)
+                        setTimeout(() => reject(new Error('Chat timeout')), 110000) // Increased to 110s to match chat service timeout (100s) + buffer
                     )
                 ]);
                 const chatElapsed = Date.now() - chatStartTime;

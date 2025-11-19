@@ -520,6 +520,65 @@ class LLMToolParser:
                 "arguments": arguments
             })
         
+        # Try Chutes format: <|tool_calls_begin|><|tool_call_begin|>function<|tool_sep|>tool_name\n```json\n{...}\n```<|tool_call_end|><|tool_calls_end|>
+        # Note: Chutes uses full-width vertical bars (｜) instead of regular pipes (|)
+        # We need to match both: | (U+007C) and ｜ (U+FF5C)
+        # Also handle the lower one-eighth block used in some formats: ▁ (U+2581)
+        # Format can be: tool_call_begin OR tool▁call▁begin (with ▁ characters)
+        
+        # Pattern that matches both regular | and full-width ｜
+        pipe_chars = r'[|\uff5c]'  # Match both | and ｜
+        # Handle both underscore and ▁ separator: tool_call OR tool▁call
+        # The separator can be: _ (underscore), ▁ (U+2581 lower one-eighth block), or nothing
+        separator_chars = r'[_\u2581]?'  # Optional: match _ or ▁ or nothing
+        
+        # Pattern for tool_calls_begin (with optional separators)
+        # Matches: tool_calls_begin, tool▁calls▁begin, toolcallbegin, etc.
+        chutes_pattern = rf'<{pipe_chars}tool{separator_chars}calls{separator_chars}begin{pipe_chars}>(.*?)<{pipe_chars}tool{separator_chars}calls{separator_chars}end{pipe_chars}>'
+        chutes_matches = list(re.finditer(chutes_pattern, text, re.DOTALL))
+        if chutes_matches:
+            logger.debug(f"Found {len(chutes_matches)} Chutes tool_calls blocks")
+        for calls_match in chutes_matches:
+            calls_content = calls_match.group(1)
+            # Extract individual tool calls
+            # Match: <|tool_call_begin|>function<|tool_sep|>tool_name ... <|tool_call_end|>
+            # Handle formats: tool_call_begin, tool▁call▁begin, toolcallbegin, etc.
+            tool_call_pattern = rf'<{pipe_chars}tool{separator_chars}call{separator_chars}begin{pipe_chars}>\s*function\s*<{pipe_chars}tool{separator_chars}sep{pipe_chars}>\s*(\w+)\s*(.*?)<{pipe_chars}tool{separator_chars}call{separator_chars}end{pipe_chars}>'
+            tool_call_matches = list(re.finditer(tool_call_pattern, calls_content, re.DOTALL))
+            if tool_call_matches:
+                logger.debug(f"Found {len(tool_call_matches)} tool calls in Chutes block")
+            for tc_match in tool_call_matches:
+                tool_name = tc_match.group(1)
+                args_content = tc_match.group(2).strip()
+                
+                # Try to extract JSON from the arguments content
+                # Look for ```json ... ``` blocks first
+                json_block_pattern = r'```json\s*(.*?)\s*```'
+                json_block_match = re.search(json_block_pattern, args_content, re.DOTALL)
+                if json_block_match:
+                    args_str = json_block_match.group(1).strip()
+                else:
+                    # Try to find JSON object directly
+                    json_obj_pattern = r'(\{.*\})'
+                    json_obj_match = re.search(json_obj_pattern, args_content, re.DOTALL)
+                    if json_obj_match:
+                        args_str = json_obj_match.group(1).strip()
+                    else:
+                        args_str = args_content
+                
+                try:
+                    arguments = json.loads(args_str)
+                    tool_calls.append({
+                        "name": tool_name,
+                        "arguments": arguments
+                    })
+                    logger.debug(f"Successfully parsed Chutes tool call: {tool_name} with {len(arguments)} arguments")
+                except Exception as e:
+                    # If JSON parsing fails, try to extract key-value pairs
+                    logger.debug(f"Failed to parse Chutes tool call JSON for {tool_name}: {e}")
+                    logger.debug(f"Args content: {args_content[:200]}")
+                    pass
+        
         return tool_calls
     
     @staticmethod
@@ -681,6 +740,7 @@ class LLMToolParser:
 def create_rag_tools(pipeline) -> LLMToolRegistry:
     """
     Create and register all RAG-related tools.
+    Includes code interpreter, memory tools, and RAG tools.
     
     Args:
         pipeline: EnhancedRAGPipeline instance
@@ -689,6 +749,115 @@ def create_rag_tools(pipeline) -> LLMToolRegistry:
         Tool registry with all tools registered
     """
     registry = LLMToolRegistry()
+    
+    # Add Code Interpreter tool
+    from src.tools.code_interpreter import CodeInterpreter
+    code_interpreter = CodeInterpreter()
+    
+    def run_python(code: str) -> str:
+        """Execute Python code to solve math, logic, or data problems. Code must be safe (no file I/O, no network)."""
+        return code_interpreter.run_python(code)
+    
+    registry.register_tool(LLMTool(
+        name="run_python",
+        description="Execute Python code to solve math, logic, or data problems. Use this for calculations, data analysis, or any computational tasks. Code must be safe (no file I/O, no network access). Returns the result or error message.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "The Python code to execute. Should return the result (e.g., use 'return' statement or print)."
+                }
+            },
+            "required": ["code"]
+        },
+        function=run_python
+    ))
+    
+    # Add Vision Tool
+    from src.tools.vision_tool import VisionTool
+    vision_tool = VisionTool()
+    
+    def analyze_image(image_url: str, question: str = None) -> Dict[str, Any]:
+        """Analyze an image using vision capabilities."""
+        return vision_tool.process_image(image_url, question)
+    
+    registry.register_tool(LLMTool(
+        name="analyze_image",
+        description="Analyze an image using vision capabilities. Use this when users send images or ask questions about images. Can perform OCR, object detection, scene description, and answer questions about image content.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "image_url": {
+                    "type": "string",
+                    "description": "URL or path to the image to analyze"
+                },
+                "question": {
+                    "type": "string",
+                    "description": "Question about the image (e.g., 'What is in this image?', 'Describe this image', 'What text is visible?', 'What objects do you see?')"
+                }
+            },
+            "required": ["image_url"]
+        },
+        function=analyze_image
+    ))
+    
+    # Add Memory Tools
+    from src.tools.memory_tools import MemoryTools
+    memory_tools = MemoryTools()
+    
+    def save_core_memory(content: str, channel_id: str) -> str:
+        """Save an important fact, user preference, or long-term memory."""
+        return memory_tools.save_core_memory(content, channel_id)
+    
+    registry.register_tool(LLMTool(
+        name="save_core_memory",
+        description="Save an important fact, user preference, or long-term memory to core memory. Use this to remember important information about users or preferences.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "The content to save (e.g., 'User prefers dark mode', 'User's favorite color is blue')."
+                },
+                "channel_id": {
+                    "type": "string",
+                    "description": "The channel or user ID context."
+                }
+            },
+            "required": ["content", "channel_id"]
+        },
+        function=save_core_memory
+    ))
+    
+    def get_core_memory(channel_id: str, query: str = None, top_k: int = 5) -> list:
+        """Retrieve core memories for a channel/user."""
+        return memory_tools.get_core_memory(channel_id, query, top_k)
+    
+    registry.register_tool(LLMTool(
+        name="get_core_memory",
+        description="Retrieve core memories for a channel/user. Use this to recall important facts or preferences.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "channel_id": {
+                    "type": "string",
+                    "description": "The channel or user ID."
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Optional query to search memories (e.g., 'user preferences', 'favorite color')."
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "Number of memories to retrieve (default: 5).",
+                    "default": 5
+                }
+            },
+            "required": ["channel_id"]
+        },
+        function=get_core_memory
+    ))
     
     # Tool: Get user state (gold, inventory, etc.)
     def get_user_state(user_id: str, key: str = None) -> Dict[str, Any]:
@@ -1509,7 +1678,7 @@ def create_rag_tools(pipeline) -> LLMToolRegistry:
                 },
                 "steps": {
                     "type": "integer",
-                    "description": "Number of sampling steps (default: 10, higher = better quality but slower)",
+                    "description": "Number of sampling steps (default: 10)",
                     "default": 10
                 },
                 "cfg": {

@@ -171,6 +171,10 @@ class ElasticsearchStore:
                             }
                         }
                     },
+                    "semantic_text": {
+                        "type": "text",
+                        "analyzer": "standard"
+                    },
                     "chunk_index": {"type": "integer"},
                     "embedding": {
                         "type": "dense_vector",
@@ -187,9 +191,9 @@ class ElasticsearchStore:
                 "number_of_replicas": 0,
                 "refresh_interval": "5s",  # OPTIMIZED: Reduce refresh for better write performance
                 "index": {
-                    "max_result_window": 50000,  # OPTIMIZED: Allow larger result sets
-                    "knn": True,  # OPTIMIZED: Enable kNN search
-                    "knn.algo_param.ef_search": 100  # OPTIMIZED: kNN search accuracy/speed tradeoff
+                    "max_result_window": 50000  # OPTIMIZED: Allow larger result sets
+                    # Note: kNN is automatically enabled when dense_vector field has index: True
+                    # knn settings are version-specific and may not be supported in all Elasticsearch versions
                 }
             }
         }
@@ -318,6 +322,7 @@ class ElasticsearchStore:
             
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
                 chunk_id = f"{doc_id}_chunk_{chunk.get('chunk_index', i)}"
+                chunk_text = chunk.get("text", "")
                 
                 action = {
                     "_index": self.chunk_index_name,
@@ -326,7 +331,8 @@ class ElasticsearchStore:
                         "chunk_id": chunk_id,
                         "doc_id": doc_id,
                         "file_name": file_name,
-                        "text": chunk.get("text", ""),
+                        "text": chunk_text,
+                        "semantic_text": chunk_text,  # For ELSER semantic search
                         "chunk_index": chunk.get("chunk_index", i),
                         "embedding": embedding,
                         "uploaded_by": uploaded_by,
@@ -480,6 +486,104 @@ class ElasticsearchStore:
         except Exception as e:
             logger.error(f"Error in full-text search: {e}")
             return []
+    
+    def hybrid_search_with_elser(self,
+                                 query: str,
+                                 top_k: int = 10,
+                                 doc_id: Optional[str] = None,
+                                 doc_filename: Optional[str] = None,
+                                 elser_model_id: str = ".elser_model_2") -> List[Dict[str, Any]]:
+        """
+        Perform hybrid search using ELSER (Elastic Learned Sparse Encoder) for semantic search.
+        ELSER is Elasticsearch's native semantic model that provides better semantic understanding.
+        
+        Args:
+            query: Search query text
+            top_k: Number of results to return
+            doc_id: Optional document ID filter
+            doc_filename: Optional filename filter
+            elser_model_id: ELSER model ID (default: .elser_model_2)
+            
+        Returns:
+            List of matching chunks with combined scores
+        """
+        try:
+            # Build filter
+            filter_clause = None
+            if doc_id:
+                filter_clause = {"term": {"doc_id": doc_id}}
+            elif doc_filename:
+                filter_clause = {"term": {"file_name.keyword": doc_filename}}
+            
+            # Build query with ELSER semantic search
+            # ELSER uses text_expansion query type
+            query_clauses = []
+            
+            # Try ELSER semantic search first
+            try:
+                elser_query = {
+                    "text_expansion": {
+                        "semantic_text": {
+                            "model_id": elser_model_id,
+                            "model_text": query
+                        }
+                    }
+                }
+                query_clauses.append(elser_query)
+            except Exception as elser_error:
+                logger.warning(f"ELSER not available, falling back to standard hybrid search: {elser_error}")
+                # Fallback to standard hybrid search
+                return self.hybrid_search(query, [], top_k, doc_id, doc_filename)
+            
+            # Add keyword search (BM25)
+            keyword_query = {
+                "multi_match": {
+                    "query": query,
+                    "fields": ["text^2", "text.english^1.5", "file_name^3"],
+                    "type": "best_fields",
+                    "fuzziness": "AUTO"
+                }
+            }
+            query_clauses.append(keyword_query)
+            
+            # Combine queries with bool should (OR logic)
+            bool_query = {
+                "bool": {
+                    "should": query_clauses,
+                    "minimum_should_match": 1
+                }
+            }
+            
+            if filter_clause:
+                bool_query["bool"]["filter"] = [filter_clause]
+            
+            # Execute search
+            response = self.client.search(
+                index=self.chunk_index_name,
+                query=bool_query,
+                size=top_k,
+                source=["chunk_id", "doc_id", "file_name", "text", "chunk_index", "uploaded_by"]
+            )
+            
+            # Process results
+            results = []
+            for hit in response["hits"]["hits"]:
+                source = hit["_source"]
+                results.append({
+                    "chunk_id": source.get("chunk_id"),
+                    "doc_id": source.get("doc_id"),
+                    "file_name": source.get("file_name"),
+                    "text": source.get("text"),
+                    "chunk_index": source.get("chunk_index", 0),
+                    "uploaded_by": source.get("uploaded_by"),
+                    "score": float(hit["_score"])
+                })
+            
+            return results
+        except Exception as e:
+            logger.error(f"Error in hybrid_search_with_elser: {e}", exc_info=True)
+            # Fallback to standard hybrid search
+            return self.hybrid_search(query, [], top_k, doc_id, doc_filename)
     
     def hybrid_search(self,
                      query: str,

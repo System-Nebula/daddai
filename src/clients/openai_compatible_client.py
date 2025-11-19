@@ -2,11 +2,27 @@
 Generic OpenAI-compatible client for any provider that supports OpenAI API format.
 Supports streaming, thinking models, and custom base URLs.
 """
-import requests
+import httpx
 import json
 from typing import List, Dict, Any, Optional, Iterator, Callable, Union
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_exception
 from logger_config import logger
+
+
+class RateLimitError(Exception):
+    """Exception raised when API returns 429 rate limit error."""
+    def __init__(self, message: str, retry_after: int = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def is_rate_limit_error(exception: Exception) -> bool:
+    """Check if exception is a rate limit error (429)."""
+    if isinstance(exception, RateLimitError):
+        return True
+    if isinstance(exception, Exception) and "429" in str(exception):
+        return True
+    return False
 
 
 class OpenAICompatibleClient:
@@ -50,9 +66,9 @@ class OpenAICompatibleClient:
         return headers
     
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((requests.exceptions.RequestException, requests.exceptions.Timeout)),
+        stop=stop_after_attempt(5),  # More retries for rate limits
+        wait=wait_exponential(multiplier=2, min=5, max=60),  # Longer backoff for rate limits
+        retry=retry_if_exception(is_rate_limit_error) | retry_if_exception_type((httpx.RequestError, httpx.TimeoutException)),
         reraise=True
     )
     def generate_response(
@@ -204,16 +220,17 @@ class OpenAICompatibleClient:
             request_start = time.time()
             
             try:
-                response = requests.post(
-                    self.chat_endpoint,
-                    json=payload,
-                    headers=self._get_headers(),
-                    timeout=self.timeout
-                )
+                # Use sync client for non-async method
+                with httpx.Client(timeout=self.timeout) as client:
+                    response = client.post(
+                        self.chat_endpoint,
+                        json=payload,
+                        headers=self._get_headers()
+                    )
                 
                 request_elapsed = time.time() - request_start
                 logger.info(f"📥 API Response received in {request_elapsed:.2f}s (status: {response.status_code})")
-            except requests.exceptions.Timeout:
+            except httpx.TimeoutException:
                 request_elapsed = time.time() - request_start
                 logger.error(f"⏱️  API Request TIMEOUT after {request_elapsed:.2f}s (timeout was {self.timeout}s)")
                 logger.error(f"   This indicates the API is hanging or taking too long to respond")
@@ -224,12 +241,26 @@ class OpenAICompatibleClient:
                 error_detail = response.text
                 logger.error(f"API error ({response.status_code}): {error_detail}")
                 logger.error(f"Request details: endpoint={self.chat_endpoint}, model={model_name}, payload_keys={list(payload.keys())}")
+                
+                # Handle 429 rate limit errors with retry support
+                if response.status_code == 429:
+                    retry_after = None
+                    # Try to extract retry-after header
+                    if 'retry-after' in response.headers:
+                        try:
+                            retry_after = int(response.headers['retry-after'])
+                        except (ValueError, TypeError):
+                            pass
+                    logger.warning(f"⚠️ Rate limit hit (429) - will retry with backoff. Retry-After: {retry_after}s" if retry_after else "⚠️ Rate limit hit (429) - will retry with exponential backoff")
+                    raise RateLimitError(f"API rate limit (429): {error_detail}", retry_after=retry_after)
+                
                 # For 404 errors, provide more helpful message
                 if response.status_code == 404:
                     logger.error(f"Model '{model_name}' may not be available on Chutes. Check:")
                     logger.error(f"  1. Model name is correct: {model_name}")
                     logger.error(f"  2. Model is configured in your Chutes account")
                     logger.error(f"  3. API key has access to this model")
+                
                 raise Exception(f"API error ({response.status_code}): {error_detail}")
             
             response.raise_for_status()
@@ -354,10 +385,10 @@ class OpenAICompatibleClient:
             
             logger.debug(f"Generated response: {len(content) if content else 0} characters")
             return content
-        except requests.exceptions.Timeout:
+        except httpx.TimeoutException:
             logger.error(f"API timeout after {self.timeout}s")
             raise Exception(f"API timeout after {self.timeout}s")
-        except requests.exceptions.RequestException as e:
+        except httpx.RequestError as e:
             logger.error(f"Error calling API: {e}")
             raise Exception(f"Error calling API: {e}")
     
@@ -419,120 +450,134 @@ class OpenAICompatibleClient:
             logger.debug(f"Starting streaming request to {self.base_url} with {len(messages)} messages, model={model_name}")
             logger.debug(f"Payload keys: {list(payload.keys())}, use_input_args_wrapper={self.use_input_args_wrapper}")
             
-            response = requests.post(
-                self.chat_endpoint,
-                json=payload,
-                headers=self._get_headers(),
-                timeout=self.timeout,
-                stream=True
-            )
-            
-            if response.status_code != 200:
-                error_detail = response.text
-                logger.error(f"API error ({response.status_code}): {error_detail}")
-                logger.error(f"Request details: endpoint={self.chat_endpoint}, model={model_name}, payload_keys={list(payload.keys())}")
-                # For 404 errors, provide more helpful message
-                if response.status_code == 404:
-                    logger.error(f"Model '{model_name}' may not be available on Chutes. Check:")
-                    logger.error(f"  1. Model name is correct: {model_name}")
-                    logger.error(f"  2. Model is configured in your Chutes account")
-                    logger.error(f"  3. API key has access to this model")
-                raise Exception(f"API error ({response.status_code}): {error_detail}")
-            
-            response.raise_for_status()
-            
-            # Process Server-Sent Events (SSE) stream
-            buffer = ""
-            for line in response.iter_lines(decode_unicode=True):
-                if not line:
-                    continue
-                
-                # SSE format: "data: {...}"
-                if line.startswith("data: "):
-                    data_str = line[6:]  # Remove "data: " prefix
+            # Use sync client for streaming
+            with httpx.Client(timeout=self.timeout) as client:
+                with client.stream(
+                    'POST',
+                    self.chat_endpoint,
+                    json=payload,
+                    headers=self._get_headers()
+                ) as response:
+                    if response.status_code != 200:
+                        error_detail = response.text
+                        logger.error(f"API error ({response.status_code}): {error_detail}")
+                        logger.error(f"Request details: endpoint={self.chat_endpoint}, model={model_name}, payload_keys={list(payload.keys())}")
+                        
+                        # Handle 429 rate limit errors with retry support
+                        if response.status_code == 429:
+                            retry_after = None
+                            # Try to extract retry-after header
+                            if 'retry-after' in response.headers:
+                                try:
+                                    retry_after = int(response.headers['retry-after'])
+                                except (ValueError, TypeError):
+                                    pass
+                            logger.warning(f"⚠️ Rate limit hit (429) - will retry with backoff. Retry-After: {retry_after}s" if retry_after else "⚠️ Rate limit hit (429) - will retry with exponential backoff")
+                            raise RateLimitError(f"API rate limit (429): {error_detail}", retry_after=retry_after)
+                        
+                        # For 404 errors, provide more helpful message
+                        if response.status_code == 404:
+                            logger.error(f"Model '{model_name}' may not be available on Chutes. Check:")
+                            logger.error(f"  1. Model name is correct: {model_name}")
+                            logger.error(f"  2. Model is configured in your Chutes account")
+                            logger.error(f"  3. API key has access to this model")
+                        raise Exception(f"API error ({response.status_code}): {error_detail}")
                     
-                    # Handle [DONE] marker
-                    if data_str.strip() == "[DONE]":
-                        break
+                    response.raise_for_status()
                     
-                    try:
-                        chunk_data = json.loads(data_str)
+                    # Process Server-Sent Events (SSE) stream
+                    buffer = ""
+                    for line in response.iter_lines():
+                        if not line:
+                            continue
                         
-                        # Extract content from chunk
-                        chunk = {
-                            "content": "",
-                            "delta": {},
-                            "finish_reason": None,
-                            "thinking": None
-                        }
-                        
-                        if 'choices' in chunk_data and len(chunk_data['choices']) > 0:
-                            choice = chunk_data['choices'][0]
+                        # SSE format: "data: {...}"
+                        if line.startswith("data: "):
+                            data_str = line[6:]  # Remove "data: " prefix
                             
-                            # Extract delta (content increment)
-                            if 'delta' in choice:
-                                delta = choice['delta']
-                                chunk['delta'] = delta
+                            # Handle [DONE] marker
+                            if data_str.strip() == "[DONE]":
+                                break
+                            
+                            try:
+                                chunk_data = json.loads(data_str)
                                 
-                                # Get content from delta
-                                if 'content' in delta and delta['content']:
-                                    chunk['content'] = delta['content']
+                                # Extract content from chunk
+                                chunk = {
+                                    "content": "",
+                                    "delta": {},
+                                    "finish_reason": None,
+                                    "thinking": None
+                                }
                                 
-                                # Chutes thinking models use 'reasoning_content' in delta
-                                # This is the thinking process, NOT the actual response
-                                # We should NOT use it as content - the actual response comes later in the stream
-                                if 'reasoning_content' in delta and delta['reasoning_content']:
-                                    chunk['reasoning_content'] = delta['reasoning_content']
-                                    # Do NOT use reasoning_content as content - it's thinking, not response
-                                    logger.debug("Received reasoning_content in stream (thinking process, not response)")
+                                if 'choices' in chunk_data and len(chunk_data['choices']) > 0:
+                                    choice = chunk_data['choices'][0]
+                                    delta = {}
+                                    
+                                    # Extract delta (content increment)
+                                    if 'delta' in choice:
+                                        delta = choice['delta']
+                                        chunk['delta'] = delta
+                                        
+                                        # Get content from delta
+                                        if 'content' in delta and delta['content']:
+                                            chunk['content'] = delta['content']
+                                        
+                                        # Chutes thinking models use 'reasoning_content' in delta
+                                        # This is the thinking process, NOT the actual response
+                                        # We should NOT use it as content - the actual response comes later in the stream
+                                        if 'reasoning_content' in delta and delta['reasoning_content']:
+                                            chunk['reasoning_content'] = delta['reasoning_content']
+                                            # Do NOT use reasoning_content as content - it's thinking, not response
+                                            logger.debug("Received reasoning_content in stream (thinking process, not response)")
+                                        
+                                        # Check for thinking content (for thinking models)
+                                        # This is also thinking, not the actual response
+                                        if 'thinking' in delta and delta['thinking']:
+                                            chunk['thinking'] = delta['thinking']
+                                            # Do NOT use thinking as content - it's the thinking process
+                                            logger.debug("Received thinking in stream (thinking process, not response)")
+                                    
+                                    # Check for tool calls in delta (function calling)
+                                    # Tool calls can be in delta or at choice level
+                                    if delta and 'tool_calls' in delta:
+                                        chunk['tool_calls'] = delta['tool_calls']
+                                    elif 'tool_calls' in choice:
+                                        chunk['tool_calls'] = choice['tool_calls']
+                                    
+                                    # Get finish reason (Chutes uses both finish_reason and stop_reason)
+                                    if 'finish_reason' in choice:
+                                        chunk['finish_reason'] = choice['finish_reason']
+                                    elif 'stop_reason' in choice:
+                                        # Chutes API may use stop_reason instead
+                                        chunk['finish_reason'] = choice['stop_reason']
+                                    
+                                    # Also capture stop_reason if present (for Chutes compatibility)
+                                    if 'stop_reason' in choice:
+                                        chunk['stop_reason'] = choice['stop_reason']
                                 
-                                # Check for thinking content (for thinking models)
-                                # This is also thinking, not the actual response
-                                if 'thinking' in delta and delta['thinking']:
-                                    chunk['thinking'] = delta['thinking']
-                                    # Do NOT use thinking as content - it's the thinking process
-                                    logger.debug("Received thinking in stream (thinking process, not response)")
-                            
-                            # Check for tool calls in delta (function calling)
-                            # Tool calls can be in delta or at choice level
-                            if 'tool_calls' in delta:
-                                chunk['tool_calls'] = delta['tool_calls']
-                            elif 'tool_calls' in choice:
-                                chunk['tool_calls'] = choice['tool_calls']
-                            
-                            # Get finish reason (Chutes uses both finish_reason and stop_reason)
-                            if 'finish_reason' in choice:
-                                chunk['finish_reason'] = choice['finish_reason']
-                            elif 'stop_reason' in choice:
-                                # Chutes API may use stop_reason instead
-                                chunk['finish_reason'] = choice['stop_reason']
-                            
-                            # Also capture stop_reason if present (for Chutes compatibility)
-                            if 'stop_reason' in choice:
-                                chunk['stop_reason'] = choice['stop_reason']
-                        
-                        # Call callback if provided
-                        if on_chunk:
-                            on_chunk(chunk)
-                        
-                        yield chunk
-                        
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Failed to parse chunk: {data_str[:100]}... Error: {e}")
-                        continue
-                elif line.startswith(":"):
-                    # SSE comment line, ignore
-                    continue
-                else:
-                    # Accumulate in buffer for multi-line chunks
-                    buffer += line + "\n"
+                                # Call callback if provided
+                                if on_chunk:
+                                    on_chunk(chunk)
+                                
+                                yield chunk
+                                
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"Failed to parse chunk: {data_str[:100]}... Error: {e}")
+                                continue
+                        elif line.startswith(":"):
+                            # SSE comment line, ignore
+                            continue
+                        else:
+                            # Accumulate in buffer for multi-line chunks
+                            buffer += line + "\n"
             
             logger.debug("Streaming completed")
             
-        except requests.exceptions.Timeout:
+        except httpx.TimeoutException:
             logger.error(f"API timeout after {self.timeout}s")
             raise Exception(f"API timeout after {self.timeout}s")
-        except requests.exceptions.RequestException as e:
+        except httpx.RequestError as e:
             logger.error(f"Error calling API: {e}")
             raise Exception(f"Error calling API: {e}")
     
@@ -541,8 +586,9 @@ class OpenAICompatibleClient:
         try:
             # Try a simple request to models endpoint if available
             models_url = f"{self.base_url}/models"
-            response = requests.get(models_url, headers=self._get_headers(), timeout=5)
-            return response.status_code == 200
+            with httpx.Client(timeout=5) as client:
+                response = client.get(models_url, headers=self._get_headers())
+                return response.status_code == 200
         except:
             # If models endpoint doesn't exist, try a minimal chat request
             try:
@@ -551,14 +597,14 @@ class OpenAICompatibleClient:
                     "messages": [{"role": "user", "content": "test"}],
                     "max_tokens": 1
                 }
-                response = requests.post(
-                    self.chat_endpoint,
-                    json=test_payload,
-                    headers=self._get_headers(),
-                    timeout=5
-                )
-                # Accept 200 (success) or 400 (bad request but API is reachable)
-                return response.status_code in [200, 400]
+                with httpx.Client(timeout=5) as client:
+                    response = client.post(
+                        self.chat_endpoint,
+                        json=test_payload,
+                        headers=self._get_headers()
+                    )
+                    # Accept 200 (success) or 400 (bad request but API is reachable)
+                    return response.status_code in [200, 400]
             except:
                 return False
     
@@ -566,10 +612,11 @@ class OpenAICompatibleClient:
         """Get list of available models from the API."""
         try:
             models_url = f"{self.base_url}/models"
-            response = requests.get(models_url, headers=self._get_headers(), timeout=5)
-            response.raise_for_status()
-            models = response.json()
-            return [model['id'] for model in models.get('data', [])]
+            with httpx.Client(timeout=5) as client:
+                response = client.get(models_url, headers=self._get_headers())
+                response.raise_for_status()
+                models = response.json()
+                return [model['id'] for model in models.get('data', [])]
         except:
             return []
 

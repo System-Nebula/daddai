@@ -15,6 +15,7 @@ from config import (
     CHUTES_API_KEY,
     CHUTES_BASE_URL,
     CHUTES_MODEL,
+    CHUTES_TIMEOUT,
     CHUTES_USE_INPUT_ARGS_WRAPPER,
     CUSTOM_LLM_BASE_URL,
     CUSTOM_LLM_API_KEY,
@@ -79,10 +80,10 @@ def get_llm_client(
             base_url=base_url or CHUTES_BASE_URL,
             api_key=api_key or CHUTES_API_KEY,
             model=model or CHUTES_MODEL,
-            timeout=LMSTUDIO_TIMEOUT,
+            timeout=CHUTES_TIMEOUT,
             use_input_args_wrapper=CHUTES_USE_INPUT_ARGS_WRAPPER
         )
-        logger.info(f"Initialized Chutes AI client: {client.base_url} (input_args_wrapper={CHUTES_USE_INPUT_ARGS_WRAPPER})")
+        logger.info(f"Initialized Chutes AI client: {client.base_url} (timeout: {CHUTES_TIMEOUT}s, input_args_wrapper={CHUTES_USE_INPUT_ARGS_WRAPPER})")
         return client
     
     elif provider == "custom":

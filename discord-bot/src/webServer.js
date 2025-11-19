@@ -2,6 +2,7 @@ const express = require('express');
 const path = require('path');
 const MemoryService = require('./memoryService');
 const DocumentService = require('./documentService');
+const metricsCollector = require('./metrics');
 
 /**
  * Professional Web Server for GopherBot Dashboard
@@ -37,6 +38,15 @@ class WebServer {
      * Setup middleware for request processing
      */
     setupMiddleware() {
+        // Add observability middleware FIRST (if available)
+        try {
+            const { observabilityMiddleware } = require('./middleware/observabilityMiddleware');
+            this.app.use(observabilityMiddleware);
+        } catch (error) {
+            // Observability middleware not available, continue without it
+            console.warn('[WebServer] Observability middleware not available:', error.message);
+        }
+        
         // Add compression middleware for faster responses
         const compression = require('compression');
         this.app.use(compression({ level: 6, threshold: 1024 }));
@@ -44,7 +54,7 @@ class WebServer {
         // JSON body parser
         this.app.use(express.json());
         
-        // Request logging middleware
+        // Request logging middleware (fallback if observability not available)
         this.app.use((req, res, next) => {
             const start = Date.now();
             const timestamp = new Date().toISOString();
@@ -138,13 +148,37 @@ class WebServer {
      * Setup API routes
      */
     setupRoutes() {
-        // Health check endpoint
-        this.app.get('/api/health', (req, res) => {
-            res.json({ 
-                status: 'ok', 
-                timestamp: new Date().toISOString(),
-                uptime: process.uptime()
-            });
+        // Health check endpoint (enhanced with performance metrics)
+        this.app.get('/api/health', async (req, res) => {
+            try {
+                const { getHealthCheckData } = require('./utils/performanceMonitor');
+                const healthData = await getHealthCheckData();
+                res.json(healthData);
+            } catch (error) {
+                // Fallback to basic health check
+                res.json({ 
+                    status: 'ok', 
+                    timestamp: new Date().toISOString(),
+                    uptime: process.uptime()
+                });
+            }
+        });
+        
+        // OpenTelemetry metrics endpoint (OTLP format)
+        // Note: For Prometheus format, use /api/metrics endpoint which uses existing metrics.js
+        this.app.get('/api/metrics/otel', async (req, res) => {
+            try {
+                const { getMeter } = require('./utils/observability');
+                const meter = getMeter();
+                // Return basic info - full metrics available via OTLP endpoint
+                res.json({ 
+                    message: 'OpenTelemetry metrics available via OTLP endpoint',
+                    info: 'Set OTEL_EXPORTER_OTLP_METRICS_ENDPOINT to export metrics',
+                    prometheus: 'Use /api/metrics for Prometheus format'
+                });
+            } catch (error) {
+                res.status(503).json({ error: 'Metrics endpoint error', message: error.message });
+            }
         });
         
         // System status endpoint (Elasticsearch + Neo4j) - Enhanced with caching
@@ -611,23 +645,25 @@ class WebServer {
             }
         });
 
-        // Metrics endpoint - Performance metrics from gopher agent (if available)
+        // Metrics endpoint - Combined metrics from metricsCollector and gopher agent (if available)
         this.app.get('/api/metrics', async (req, res) => {
             try {
-                // Try to fetch metrics from gopher agent API
-                // This is optional - if gopher agent is not available, return empty metrics
+                // Get metrics from metricsCollector (always available)
+                const botMetrics = metricsCollector.getMetricsJSON();
+                
+                // Try to fetch additional metrics from gopher agent API (optional)
                 const http = require('http');
                 const https = require('https');
                 const { URL } = require('url');
                 
-                // Check if gopher agent server is running (default port 8001)
+                let gopherMetrics = null;
                 const metricsUrl = process.env.GOPHER_AGENT_URL || 'http://localhost:8001/get_metrics';
                 
                 try {
                     const urlObj = new URL(metricsUrl);
                     const client = urlObj.protocol === 'https:' ? https : http;
                     
-                    const metrics = await new Promise((resolve, reject) => {
+                    gopherMetrics = await new Promise((resolve, reject) => {
                         const req = client.get(metricsUrl, (res) => {
                             let data = '';
                             res.on('data', chunk => data += chunk);
@@ -651,28 +687,25 @@ class WebServer {
                             reject(err);
                         });
                     });
-                    
-                    return res.json({
-                        ...metrics,
-                        available: true,
-                        timestamp: new Date().toISOString()
-                    });
                 } catch (error) {
-                    // Gopher agent not available - return empty metrics
-                    console.log('[Metrics] Gopher agent not available, returning empty metrics');
+                    // Gopher agent not available - that's okay, we'll use bot metrics only
+                    console.log('[Metrics] Gopher agent not available, using bot metrics only');
                 }
                 
-                // Return empty metrics structure
+                // Combine bot metrics with gopher agent metrics (if available)
                 res.json({
-                    available: false,
-                    intent_classifications: 0,
-                    cache_hits: 0,
-                    cache_misses: 0,
-                    avg_latency_ms: 0,
-                    gpu_inference_count: 0,
-                    cache_hit_rate: 0,
-                    gpu_enabled: false,
-                    cache_size: 0,
+                    bot: botMetrics,
+                    gopher_agent: gopherMetrics || {
+                        available: false,
+                        intent_classifications: 0,
+                        cache_hits: 0,
+                        cache_misses: 0,
+                        avg_latency_ms: 0,
+                        gpu_inference_count: 0,
+                        cache_hit_rate: 0,
+                        gpu_enabled: false,
+                        cache_size: 0
+                    },
                     timestamp: new Date().toISOString()
                 });
             } catch (error) {
@@ -892,6 +925,38 @@ class WebServer {
             }
         });
 
+        // Metrics endpoint - Prometheus format
+        this.app.get('/api/metrics/prometheus', (req, res) => {
+            try {
+                res.set('Content-Type', 'text/plain; version=0.0.4');
+                res.send(metricsCollector.getPrometheusMetrics());
+            } catch (error) {
+                console.error('[API] Error fetching Prometheus metrics:', error);
+                res.status(500).json({ 
+                    error: 'Failed to fetch metrics',
+                    details: error.message,
+                    timestamp: new Date().toISOString()
+                });
+            }
+        });
+        
+        // Metrics endpoint - JSON format
+        this.app.get('/api/metrics/json', (req, res) => {
+            try {
+                res.json({
+                    ...metricsCollector.getMetricsJSON(),
+                    timestamp: new Date().toISOString()
+                });
+            } catch (error) {
+                console.error('[API] Error fetching JSON metrics:', error);
+                res.status(500).json({ 
+                    error: 'Failed to fetch metrics',
+                    details: error.message,
+                    timestamp: new Date().toISOString()
+                });
+            }
+        });
+        
         // Test endpoint
         this.app.get('/api/test', (req, res) => {
             res.json({ 

@@ -158,14 +158,15 @@ class PersistentRAGService extends EventEmitter {
             // Store pending request
             this.pendingRequests.set(requestId, { resolve, reject });
             
-            // Set timeout (10 seconds for conversation requests - Neo4j queries can take time)
+            // Set timeout (90 seconds for conversation requests - Neo4j queries can take time, especially under load or with deadlocks)
+            // Increased from 20s to 90s to handle slow Neo4j operations and retry logic for deadlocks
             const timeout = setTimeout(() => {
                 if (this.pendingRequests.has(requestId)) {
                     this.pendingRequests.delete(requestId);
                     logger.warn('[RAG] Conversation request timeout', { requestId, method: request.method });
                     reject(new Error('Conversation request timeout'));
                 }
-            }, 10000);
+            }, 90000);
             
             // Override resolve/reject to clear timeout
             const originalResolve = resolve;
@@ -250,10 +251,36 @@ class PersistentRAGService extends EventEmitter {
                 question.includes('www.')
             );
             
-            // Set timeout - longer for URL requests (90s) since they need to fetch transcript, chunk it, and summarize multiple chunks
-            // YouTube summarization can take 30-60 seconds for chunk processing alone
-            // Increased to 60s for GLM-4.6 thinking model (needs more time for reasoning)
-            const timeoutDuration = isPing ? 5000 : (hasUrl ? 90000 : 60000);
+            // Check if this is an image generation request - these take longer (RunPod API can take 30-120s)
+            // Clean question first to remove Discord mentions that might interfere with pattern matching
+            const cleanedQuestionForTimeout = question ? question
+                .replace(/<@!?\d+>/g, '')  // Remove user mentions
+                .replace(/<@&\d+>/g, '')   // Remove role mentions
+                .replace(/<#\d+>/g, '')    // Remove channel mentions
+                .replace(/\s+/g, ' ')      // Normalize whitespace
+                .trim() : '';
+            
+            const hasImageGeneration = question && (
+                /generate\s+(?:an?\s+)?(?:image|picture|artwork|art)/i.test(question) ||
+                /create\s+(?:an?\s+)?(?:image|picture|artwork|art)/i.test(question) ||
+                /make\s+(?:an?\s+)?(?:image|picture|artwork|art)/i.test(question) ||
+                /draw\s+(?:an?\s+)?(?:image|picture|artwork|art)/i.test(question) ||
+                /generate\s+(?:an?\s+)?(?:image|picture|artwork|art)/i.test(cleanedQuestionForTimeout) ||
+                /create\s+(?:an?\s+)?(?:image|picture|artwork|art)/i.test(cleanedQuestionForTimeout) ||
+                /make\s+(?:an?\s+)?(?:image|picture|artwork|art)/i.test(cleanedQuestionForTimeout) ||
+                /draw\s+(?:an?\s+)?(?:image|picture|artwork|art)/i.test(cleanedQuestionForTimeout)
+            );
+            
+            if (hasImageGeneration) {
+                logger.info(`[RAG] Image generation detected - using 15min timeout for question: "${question.substring(0, 100)}"`);
+            }
+            
+            // Set timeout - longer for URL requests (150s) and image generation (15min) since they need more processing time
+            // YouTube summarization can take 60-90 seconds for chunk processing + API calls
+            // Final response generation can take 15-30 seconds
+            // Total can be 90s + 30s = 120s+, so 150s provides buffer
+            // Image generation can take 5-15 minutes (job queuing, processing, polling, decoding) - use 15min timeout
+            const timeoutDuration = isPing ? 5000 : (hasImageGeneration ? 900000 : (hasUrl ? 150000 : 60000));
             const timeout = setTimeout(() => {
                 if (this.pendingRequests.has(requestId)) {
                     this.pendingRequests.delete(requestId);

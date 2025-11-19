@@ -22,10 +22,13 @@ from src.stores.document_store import DocumentStore
 from src.search.hybrid_search import HybridSearch
 from src.search.query_expander import QueryExpander
 from src.search.query_analyzer import QueryAnalyzer
+from src.search.query_rewriter import QueryRewriter
+from src.utils.cross_encoder_reranker import CrossEncoderReranker
 from config import (
     USE_GPU, EMBEDDING_BATCH_SIZE, CACHE_ENABLED, CACHE_MAX_SIZE, CACHE_TTL_SECONDS,
     RAG_TOP_K, RAG_TEMPERATURE, RAG_MAX_TOKENS, RAG_MAX_CONTEXT_TOKENS,
-    QUERY_EXPANSION_ENABLED, TEMPORAL_WEIGHTING_ENABLED, MMR_ENABLED, MMR_LAMBDA
+    QUERY_EXPANSION_ENABLED, TEMPORAL_WEIGHTING_ENABLED, MMR_ENABLED, MMR_LAMBDA,
+    QUERY_REWRITING_ENABLED
 )
 from logger_config import logger
 
@@ -83,6 +86,8 @@ class RAGPipeline:
         self.hybrid_search = HybridSearch(semantic_weight=0.7, keyword_weight=0.3)
         self.query_expander = QueryExpander()
         self.query_analyzer = QueryAnalyzer()
+        self.query_rewriter = QueryRewriter(llm_client=self.lmstudio_client)
+        self.cross_encoder = CrossEncoderReranker()
         
         # Smart caching with TTL
         if CACHE_ENABLED:
@@ -104,6 +109,7 @@ class RAGPipeline:
               use_shared_docs: bool = True,
               use_hybrid_search: bool = True,
               use_query_expansion: bool = True,
+              use_query_rewriting: bool = True,
               use_temporal_weighting: bool = True,
               doc_id: Optional[str] = None,  # Filter to specific document by ID
               doc_filename: Optional[str] = None,  # Filter to specific document by filename
@@ -147,15 +153,28 @@ class RAGPipeline:
         if temperature == 0.7:  # Default value
             temperature = query_analysis['suggested_temperature']
         
-        # Expand query for better recall
-        expanded_query = self.query_expander.expand(question) if (use_query_expansion and QUERY_EXPANSION_ENABLED) else question
+        # Rewrite query for better retrieval (if enabled)
+        # This happens before expansion to ensure we expand the best version of the query
+        rewritten_query = question
+        if use_query_rewriting and QUERY_REWRITING_ENABLED:
+            try:
+                # Only rewrite if query is complex or vague (handled inside rewriter)
+                rewritten_query = self.query_rewriter.rewrite_query(question)
+                if rewritten_query != question:
+                    logger.info(f"Query rewritten: '{question}' -> '{rewritten_query}'")
+            except Exception as e:
+                logger.warning(f"Query rewriting failed: {e}")
+                rewritten_query = question
+        
+        # Expand query for better recall (use rewritten query as base)
+        expanded_query = self.query_expander.expand(rewritten_query) if (use_query_expansion and QUERY_EXPANSION_ENABLED) else rewritten_query
         
         # Ensure expanded_query is a string
         if not isinstance(expanded_query, str):
-            expanded_query = str(expanded_query) if expanded_query is not None else question
+            expanded_query = str(expanded_query) if expanded_query is not None else rewritten_query
         
         if not expanded_query or not expanded_query.strip():
-            expanded_query = question
+            expanded_query = rewritten_query
         
         # Enhance query with entity context
         try:
@@ -239,6 +258,16 @@ class RAGPipeline:
                 query_embedding,
                 semantic_scores,
                 top_k=top_k * 2
+            )
+        
+        # Apply Cross-Encoder Re-ranking (High Precision)
+        # Rerank the top results from hybrid search for better accuracy
+        if retrieved_chunks and self.cross_encoder.is_available():
+            # Rerank top 2*k results to get best k
+            retrieved_chunks = self.cross_encoder.rerank(
+                question,
+                retrieved_chunks,
+                top_k=top_k * 2  # Keep more candidates for temporal/MMR steps
             )
         
         # Apply temporal weighting if enabled
@@ -414,8 +443,14 @@ class RAGPipeline:
         
         return result
     
-    def _get_cached_embedding(self, query: str) -> List[float]:
-        """Get embedding with caching."""
+    def _get_cached_embedding(self, query: str, is_query: bool = True) -> List[float]:
+        """
+        Get embedding with caching.
+        
+        Args:
+            query: Query or document text
+            is_query: If True, add BGE instruction prefix for better query embeddings
+        """
         # Ensure query is a valid string
         if query is None:
             raise ValueError("Query cannot be None for embedding generation")
@@ -432,20 +467,36 @@ class RAGPipeline:
         if not query:
             raise ValueError("Query cannot be empty for embedding generation")
         
+        # Add BGE instruction prefix for queries (improves retrieval accuracy)
+        # BGE models work better with instruction prefix for queries
+        if is_query and hasattr(self.embedding_generator, 'model'):
+            model_name = getattr(self.embedding_generator.model, 'model_name', '') if hasattr(self.embedding_generator.model, 'model_name') else ''
+            if 'bge' in str(model_name).lower() or 'bge' in str(type(self.embedding_generator.model)).lower():
+                # BGE models benefit from instruction prefix
+                query_with_prefix = f"Represent this sentence for searching relevant passages: {query}"
+                cache_key = query  # Use original query for cache key
+            else:
+                query_with_prefix = query
+                cache_key = query
+        else:
+            query_with_prefix = query
+            cache_key = query
+        
         # Check cache (TTLCache handles expiration automatically)
-        if query in self._query_embedding_cache:
-            logger.debug(f"Cache hit for query embedding: {query[:50]}...")
-            return self._query_embedding_cache[query]
+        if cache_key in self._query_embedding_cache:
+            logger.debug(f"Cache hit for query embedding: {cache_key[:50]}...")
+            return self._query_embedding_cache[cache_key]
         
         try:
-            embedding = self.embedding_generator.generate_embedding(query)
+            # Generate embedding with prefix if needed
+            embedding = self.embedding_generator.generate_embedding(query_with_prefix)
         except Exception as e:
             logger.error(f"Error generating embedding for query: {query[:100]}... Error: {e}")
             raise ValueError(f"Failed to generate embedding: {e}")
         
         # Store in cache (TTLCache handles size management)
-        self._query_embedding_cache[query] = embedding
-        logger.debug(f"Cached query embedding: {query[:50]}...")
+        self._query_embedding_cache[cache_key] = embedding
+        logger.debug(f"Cached query embedding: {cache_key[:50]}...")
         return embedding
     
     def _apply_temporal_weighting(self, chunks: List[Dict[str, Any]], decay_days: int = 30) -> List[Dict[str, Any]]:
@@ -628,10 +679,15 @@ Your first sentence should be the answer or first fact, NOT a greeting!"""
 
 Question: {safe_question}{entity_context}
 
-CRITICAL INSTRUCTIONS:
+CRITICAL INSTRUCTIONS - ACCURACY FIRST:
+- Answer based ONLY on the information provided in the context above
 - READ THROUGH ALL THE CONTEXT CHUNKS CAREFULLY - don't skip any!
 - If the question asks about specific mentions (books, names, concepts), search through ALL chunks for those mentions
 - Extract specific information like book titles, author names, quotes, or other entities mentioned
+- If information is NOT in the context, say "I don't see that mentioned" or "That's not in the documents"
+- DO NOT make up, infer, or guess information that isn't explicitly stated in the context
+- When listing items (like "what other books"), ONLY list what is ACTUALLY mentioned in the context
+- DO NOT add similar items that aren't explicitly stated - if only one book is mentioned, say only that one
 - If you find the information, provide it directly - don't say "I'm not sure" if the information is in the context
 - START WITH THE ANSWER, NOT A GREETING - Your first sentence should be the answer or first fact found!
 
@@ -648,10 +704,15 @@ Your first sentence should be the answer or first insight, NOT a greeting!"""
 
 Question: {safe_question}{entity_context}
 
-CRITICAL INSTRUCTIONS:
+CRITICAL INSTRUCTIONS - ACCURACY FIRST:
+- Answer based ONLY on the information provided in the context above
 - READ THROUGH ALL THE CONTEXT CHUNKS CAREFULLY - don't skip any!
 - If the question asks about specific mentions (books, names, concepts), search through ALL chunks for those mentions
 - Extract specific information like book titles, author names, quotes, or other entities mentioned
+- If information is NOT in the context, say "I don't see that mentioned" or "That's not in the documents"
+- DO NOT make up, infer, or guess information that isn't explicitly stated in the context
+- When listing items (like "what other books"), ONLY list what is ACTUALLY mentioned in the context
+- DO NOT add similar items that aren't explicitly stated - if only one book is mentioned, say only that one
 - If you find the information, provide it directly - don't say "I'm not sure" if the information is in the context
 - START WITH THE ANSWER, NOT A GREETING - Your first sentence should be the answer or first insight found!
 

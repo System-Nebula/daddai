@@ -14,6 +14,7 @@ import torch
 
 from src.clients.llm_client_factory import get_default_llm_client
 from src.processors.embedding_generator import EmbeddingGenerator
+from src.agents.react_agent import ReActAgent
 from config import (
     USE_GPU, EMBEDDING_BATCH_SIZE,
     CACHE_ENABLED, CACHE_MAX_SIZE, CACHE_TTL_SECONDS
@@ -74,6 +75,14 @@ class GopherAgent:
         # Pattern cache for common intents (faster than LLM)
         self.pattern_cache = {}
         
+        # Initialize ReAct Agent for complex tasks
+        try:
+            self.react_agent = ReActAgent()
+            logger.info("✅ ReAct Agent initialized")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to initialize ReAct Agent: {e}")
+            self.react_agent = None
+        
         # GPU status
         self.use_gpu = self.embedding_generator.device == 'cuda' and torch.cuda.is_available()
         if self.use_gpu:
@@ -118,8 +127,14 @@ class GopherAgent:
         """
         start_time = time.time()
         
-        # Skip quick pattern check - always use LLM for classification
-        # (User wants LLM to always respond, even for simple greetings)
+        # ⚡ FAST PATH: Only for truly unambiguous cases (URLs, attachments, image generation)
+        # Let LLM handle natural language (greetings, questions, etc.)
+        quick_result = self._quick_pattern_check_unambiguous(message, context)
+        if quick_result:
+            quick_result["latency_ms"] = (time.time() - start_time) * 1000
+            quick_result["fast_path"] = True
+            logger.debug(f"⚡ Fast path: {quick_result.get('routing')} for message: {message[:50]}...")
+            return quick_result
         
         # Check cache first
         cache_key = None
@@ -150,6 +165,8 @@ class GopherAgent:
         
         # Normalize attachment detection (handle both camelCase and snake_case)
         has_attachments = context and (context.get("hasAttachments") or context.get("has_attachments") or False)
+        has_images = context and (context.get("imageUrls") or context.get("image_urls") or [])
+        has_images = len(has_images) > 0 if isinstance(has_images, list) else False
         
         # Build context string
         context_str = ""
@@ -159,33 +176,45 @@ class GopherAgent:
                 context_str += f"\nRecent messages: {json.dumps(recent, ensure_ascii=False)}"
             if has_attachments:
                 context_str += "\nMessage has file attachments."
+            if has_images:
+                image_count = len(context.get("imageUrls") or context.get("image_urls") or [])
+                context_str += f"\nMessage has {image_count} image attachment(s)."
             if context.get("is_mentioned") or context.get("isMentioned"):
                 context_str += "\nBot was mentioned in message."
         
-        # OPTIMIZED: Fast LLM classification prompt (shorter for speed)
+        # OPTIMIZED: Concise LLM prompt for natural language understanding
         # Truncate message if too long to reduce token usage
-        message_truncated = message[:300] if len(message) > 300 else message  # Reduced from 500
+        message_truncated = message[:400] if len(message) > 400 else message  # Slightly longer for better context
         
-        # Shorter context
-        short_context_str = ""
-        if context:
-            if has_attachments:
-                short_context_str += "\nHas attachments."
-            if context.get("is_mentioned") or context.get("isMentioned"):
-                short_context_str += "\nMentioned."
+        # Build minimal context
+        context_parts = []
+        if has_attachments:
+            context_parts.append("Has attachments")
+        if has_images:
+            image_count = len(context.get("imageUrls") or context.get("image_urls") or []) if context else 0
+            context_parts.append(f"Has {image_count} image(s)")
+        if context and (context.get("is_mentioned") or context.get("isMentioned")):
+            context_parts.append("Bot mentioned")
+        if context and context.get("recent_messages"):
+            context_parts.append(f"{len(context['recent_messages'])} recent messages")
         
-        # More concise prompt with explicit guidance for greetings and document detection
-        prompt = f"""Classify intent. JSON only.
+        context_str = ". ".join(context_parts) if context_parts else ""
+        context_line = f"\nContext: {context_str}." if context_str else ""
+        
+        # Natural language prompt - let LLM understand intent naturally
+        prompt = f"""Classify the intent of this message naturally. Respond with JSON only.
 
-Rules:
-- Greetings (hi, hello, hey, how are you, etc.) → routing:"chat", needs_rag:false, is_casual:true
-- Questions about documents/files → routing:"rag", needs_rag:true
-- If message mentions topics/subjects that might be from documents (proper nouns, technical terms, specific people/companies/products), check if it's asking about information → routing:"rag", needs_rag:true
-- Examples of document references: mentioning specific people/companies (e.g., "kagi", "vlad", "prelovac"), asking "what did you think about X" where X might be from a document, asking "what's your favorite thing about X" where X was recently discussed
-- If user asks about something that was recently summarized or discussed in documents → routing:"rag", needs_rag:true
-- Only use RAG if explicitly asking about documents or information retrieval is needed
+Message: "{message_truncated}"{context_line}
 
-"{message_truncated}"{short_context_str}
+Classify as:
+- intent: "question" (asking something), "command" (telling bot to do something), "casual" (greeting/conversation), "action" (state change), "upload" (file), "ignore" (not for bot)
+- should_respond: true/false
+- confidence: 0.0-1.0
+- routing: "rag" (needs document search), "chat" (casual conversation), "tools" (needs tool execution), "memory" (needs memory), "action" (state change)
+- needs_rag: true if needs document search
+- needs_tools: true if needs tool execution
+- needs_memory: true if needs memory retrieval
+- is_casual: true if casual conversation/greeting
 
 {{"intent":"question|command|casual|action|upload|ignore","should_respond":true|false,"confidence":0.0-1.0,"routing":"rag|chat|tools|memory|action","needs_rag":true|false,"needs_tools":true|false,"needs_memory":true|false,"is_casual":true|false}}"""
         
@@ -354,6 +383,48 @@ Respond now with JSON only:"""
         
         # Normalize attachment detection (handle both camelCase and snake_case)
         has_attachments = context and (context.get("hasAttachments") or context.get("has_attachments") or False)
+        has_images = context and (context.get("imageUrls") or context.get("image_urls") or [])
+        has_images = len(has_images) > 0 if isinstance(has_images, list) else False
+        
+        # Check for image attachments - these need vision/tools
+        if has_images:
+            return {
+                "handler": "tools",
+                "intent": {
+                    "intent": "question",
+                    "should_respond": True,
+                    "needs_tools": True,
+                    "needs_rag": False,
+                    "is_casual": False
+                },
+                "routing_confidence": 0.95,
+                "latency_ms": (time.time() - start_time) * 1000,
+                "reasoning": "image attachment detected - requires vision processing"
+            }
+        
+        # ⚡ FAST PATH: Only for truly unambiguous cases (URLs, attachments, image generation)
+        # Everything else uses LLM for natural language understanding
+        quick_result = self._quick_pattern_check_unambiguous(message, context)
+        if quick_result:
+            # Fast path result - convert to routing format
+            routing = quick_result.get("routing", "chat")
+            handler_map = {
+                "tools": "tools",
+                "upload": "upload",
+                "chat": "chat",
+                "rag": "rag"
+            }
+            handler = handler_map.get(routing, "chat")
+            
+            latency_ms = (time.time() - start_time) * 1000
+            return {
+                "handler": handler,
+                "intent": quick_result,
+                "routing_confidence": quick_result.get("confidence", 0.95),
+                "latency_ms": latency_ms,
+                "reasoning": f"fast_path: {routing}",
+                "fast_path": True
+            }
         
         # Get intent if not provided
         if intent_result is None:
@@ -679,15 +750,122 @@ Respond now with JSON only:"""
             "cached": False,
             "fallback": True
         }
-    
-    def _quick_pattern_check(self, message: str, context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+
+    def run_agentic_task(self, message: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Quick pattern-based check for common intents (faster than LLM).
-        Returns result if pattern match found, None otherwise.
+        Run a complex task using the ReAct agent (Tools, Reasoning, etc.).
+        Implements Thought -> Action -> Observation loop.
+        
+        Args:
+            message: The user message/task.
+            context: Context dictionary.
+            
+        Returns:
+            Dict with 'result', 'status', 'error', 'steps', 'tool_calls'.
+        """
+        if not self.react_agent:
+            return {
+                "status": "error",
+                "error": "ReAct Agent not initialized",
+                "result": None
+            }
+            
+        try:
+            logger.info(f"🤖 Running Agentic Task (ReAct): {message[:50]}...")
+            start_time = time.time()
+            
+            # Run the ReAct agent
+            response = self.react_agent.run(message, context)
+            
+            duration = time.time() - start_time
+            logger.info(f"✅ Agentic Task Complete ({duration:.2f}s)")
+            
+            # Extract tool calls and steps from the agent if available
+            tool_calls = []
+            steps = []
+            if hasattr(self.react_agent, 'last_execution'):
+                execution = self.react_agent.last_execution
+                tool_calls = execution.get('tool_calls', [])
+                steps = execution.get('steps', [])
+            
+            return {
+                "status": "success",
+                "result": response,
+                "duration_ms": duration * 1000,
+                "tool_calls": tool_calls,
+                "steps": steps
+            }
+        except Exception as e:
+            logger.error(f"❌ Agentic Task Failed: {e}", exc_info=True)
+            return {
+                "status": "error",
+                "error": str(e),
+                "result": None
+            }
+    
+    def should_use_agentic_mode(self, message: str, intent_result: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Determine if a message should use agentic (ReAct) mode.
+        
+        Agentic mode is used for:
+        - Complex multi-step tasks
+        - Tasks requiring tool chaining
+        - Math/logic problems
+        - Tasks requiring planning
+        
+        Args:
+            message: User message
+            intent_result: Optional pre-computed intent
+            
+        Returns:
+            True if agentic mode should be used
+        """
+        if not self.react_agent:
+            return False
+        
+        # Check for complex task indicators
+        message_lower = message.lower()
+        
+        # Math/logic problems
+        math_indicators = ["calculate", "solve", "compute", "what is", "how many", "how much"]
+        if any(indicator in message_lower for indicator in math_indicators):
+            # Check if it's a simple question (not complex)
+            if "?" in message and len(message.split()) < 10:
+                return False  # Simple question, use regular mode
+            return True
+        
+        # Multi-step tasks
+        multi_step_indicators = ["then", "after that", "next", "first", "second", "finally"]
+        if any(indicator in message_lower for indicator in multi_step_indicators):
+            return True
+        
+        # Planning tasks
+        planning_indicators = ["plan", "strategy", "approach", "how to", "steps"]
+        if any(indicator in message_lower for indicator in planning_indicators):
+            return True
+        
+        # Code execution requests
+        code_indicators = ["code", "python", "script", "program", "function"]
+        if any(indicator in message_lower for indicator in code_indicators):
+            return True
+        
+        # Check intent result
+        if intent_result:
+            needs_tools = intent_result.get("needs_tools", False)
+            if needs_tools and len(message.split()) > 15:  # Complex tool-using task
+                return True
+        
+        return False
+    
+    def _quick_pattern_check_unambiguous(self, message: str, context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """
+        Quick pattern check ONLY for truly unambiguous cases (URLs, attachments, image generation).
+        Everything else (greetings, questions, casual) goes to LLM for natural language understanding.
+        Returns result if unambiguous pattern found, None otherwise.
         """
         message_lower = message.lower().strip()
         
-        # Check for URLs (always need tools)
+        # Check for URLs (unambiguous - always need tools)
         if any(x in message for x in ["http://", "https://", "www.", "youtube.com", "youtu.be"]):
             return {
                 "intent": "question",
@@ -701,7 +879,7 @@ Respond now with JSON only:"""
                 "document_references": []
             }
         
-        # Check for image generation requests (always need tools)
+        # Check for image generation requests (unambiguous - always need tools)
         image_generation_keywords = [
             "generate an image", "generate image", "generate a image",
             "create an image", "create image", "create a image",
@@ -727,7 +905,7 @@ Respond now with JSON only:"""
                 "document_references": []
             }
         
-        # Check for file uploads
+        # Check for file uploads (unambiguous)
         has_attachments = context and (context.get("hasAttachments") or context.get("has_attachments") or False)
         if has_attachments:
             return {
@@ -742,54 +920,15 @@ Respond now with JSON only:"""
                 "document_references": []
             }
         
-        # Check for simple greetings (don't need LLM) - enhanced patterns
-        greetings = [
-            "hi", "hello", "hey", "greetings", "good morning", "good afternoon", "good evening",
-            "hiya", "howdy", "sup", "yo", "wassup", "waddup", "what's up", "whats up",
-            "gm", "gn", "good night"
-        ]
-        
-        # Check exact match or starts with greeting
-        is_greeting = (
-            message_lower in greetings or
-            any(message_lower.startswith(g + " ") for g in greetings) or
-            any(message_lower.startswith(g + "!") for g in greetings) or
-            any(message_lower.startswith(g + ".") for g in greetings)
-        )
-        
-        # Also check for greetings with bot name (e.g., "hi gophie", "hey gopher", "hello bot")
-        bot_name_patterns = ["gophie", "gopher", "bot", "gopherbot"]
-        has_bot_name = any(name in message_lower for name in bot_name_patterns)
-        is_greeting_with_bot = (
-            has_bot_name and
-            any(g in message_lower for g in ["hi", "hello", "hey", "greetings"])
-        )
-        
-        # Check for very short casual messages (1-3 words, no question marks, no URLs, no numbers)
-        is_short_casual = (
-            len(message.split()) <= 3 and
-            "?" not in message and
-            "http" not in message_lower and
-            "www." not in message_lower and
-            not any(char.isdigit() for char in message) and
-            len(message.strip()) < 50
-        )
-        
-        if is_greeting or is_greeting_with_bot or is_short_casual:
-            logger.debug(f"⚡ Fast path: detected greeting/casual message '{message[:50]}', skipping LLM call")
-            return {
-                "intent": "casual",
-                "should_respond": True,
-                "confidence": 0.95 if (is_greeting or is_greeting_with_bot) else 0.85,
-                "routing": "chat",
-                "needs_rag": False,
-                "needs_tools": False,
-                "needs_memory": False,
-                "is_casual": True,
-                "document_references": []
-            }
-        
+        # Everything else (greetings, questions, casual conversation) goes to LLM
+        # This allows natural language understanding without fixed patterns
         return None
+    
+    def _quick_pattern_check(self, message: str, context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """
+        Legacy method - kept for compatibility. Now delegates to unambiguous check.
+        """
+        return self._quick_pattern_check_unambiguous(message, context)
     
     def _get_cache_key(self, message: str, context: Optional[Dict[str, Any]]) -> str:
         """

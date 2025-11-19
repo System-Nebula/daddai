@@ -151,16 +151,24 @@ This will start an interactive session where you can ask multiple questions.
 ├── scripts/               # Utility scripts
 ├── tests/                 # Test files
 ├── docs/                  # Documentation
+│   ├── upgrades/         # Upgrade documentation
+│   └── assessments/      # Assessment documentation
 ├── discord-bot/           # Discord bot (Node.js)
+│   ├── src/              # Bot source code
+│   ├── tests/            # Bot test files
+│   ├── docs/             # Bot documentation
+│   └── scripts/          # Bot utility scripts
 ├── config/                # Config package (legacy)
 ├── logger/                # Logger package
 └── deps/                  # Dependencies
 ```
 
 See the `docs/` directory for detailed documentation:
-- `QUICK_START.md` - Quick start guide
+- `docs/QUICK_START.md` - Quick start guide
 - `docs/COMMANDS_REFERENCE.md` - Complete commands reference
 - `docs/GOPHER_AGENT.md` - Gopher agent documentation
+- `docs/upgrades/` - Upgrade and modernization documentation
+- `docs/assessments/` - Codebase assessments and analysis
 
 ## How It Works
 

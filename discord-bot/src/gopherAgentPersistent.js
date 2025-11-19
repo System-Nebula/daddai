@@ -1,3 +1,4 @@
+
 /**
  * Persistent GopherAgent Service that keeps Python server alive.
  * Much faster than spawning new processes for each request.
@@ -159,14 +160,14 @@ class PersistentGopherAgentService extends EventEmitter {
             // Store pending request
             this.pendingRequests.set(requestId, { resolve, reject });
             
-            // Set timeout (15 seconds)
+            // Set timeout (10 seconds - balanced for LLM classification)
             const timeout = setTimeout(() => {
                 if (this.pendingRequests.has(requestId)) {
                     this.pendingRequests.delete(requestId);
                     logger.warn('[GopherAgent] Request timeout', { requestId, method: 'route_message' });
                     reject(new Error('GopherAgent request timeout'));
                 }
-            }, 15000);
+            }, 10000);
             
             // Override resolve/reject to clear timeout
             const originalResolve = resolve;

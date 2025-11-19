@@ -5,8 +5,11 @@ Memories are now organized by Discord channel instead of user.
 """
 from typing import List, Dict, Any, Optional
 from neo4j import GraphDatabase
+from neo4j.exceptions import TransientError
 import numpy as np
 import json
+import time
+import unicodedata
 from datetime import datetime
 from config import (
     NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, EMBEDDING_DIMENSION,
@@ -14,6 +17,50 @@ from config import (
     NEO4J_CONNECTION_ACQUISITION_TIMEOUT, CACHE_ENABLED, CACHE_TTL_SECONDS
 )
 from logger_config import logger
+
+
+def sanitize_unicode_for_neo4j(text: str) -> str:
+    """
+    Sanitize Unicode text by removing invalid surrogate characters.
+    These can't be encoded in UTF-8 and cause errors when saving to Neo4j.
+    
+    Args:
+        text: Input text that may contain invalid Unicode
+        
+    Returns:
+        Sanitized text safe for UTF-8 encoding and Neo4j storage
+    """
+    if not text:
+        return text
+    
+    # Remove invalid surrogate characters (U+D800 to U+DFFF)
+    # These are invalid in UTF-8 and cause encoding errors
+    result = []
+    for char in text:
+        code = ord(char)
+        # Check if it's a surrogate (invalid UTF-8)
+        # Surrogates are in range U+D800 to U+DFFF
+        if 0xD800 <= code <= 0xDFFF:
+            # Replace with replacement character or skip
+            result.append('\ufffd')  # Unicode replacement character
+        else:
+            try:
+                # Verify the character can be encoded in UTF-8
+                char.encode('utf-8')
+                result.append(char)
+            except UnicodeEncodeError:
+                # If encoding fails, replace with replacement character
+                result.append('\ufffd')
+    
+    sanitized = ''.join(result)
+    
+    # Final check: ensure the entire string can be encoded
+    try:
+        sanitized.encode('utf-8')
+        return sanitized
+    except UnicodeEncodeError:
+        # Last resort: encode with errors='replace' to remove any remaining issues
+        return sanitized.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
 
 
 class MemoryStore:
@@ -114,6 +161,13 @@ class MemoryStore:
         """
         import uuid
         
+        # CRITICAL: Sanitize Unicode to remove invalid surrogates before storing in Neo4j
+        content = sanitize_unicode_for_neo4j(content)
+        if channel_name:
+            channel_name = sanitize_unicode_for_neo4j(channel_name)
+        if username:
+            username = sanitize_unicode_for_neo4j(username)
+        
         # OPTIMIZED: Check for duplicate memories before storing
         if self._is_duplicate_memory(channel_id, content, embedding):
             logger.debug(f"⚠️ Duplicate memory detected, skipping storage: {content[:50]}...")
@@ -125,72 +179,84 @@ class MemoryStore:
         # Use timestamp + UUID suffix to ensure uniqueness even for concurrent operations
         memory_id = f"memory_{channel_id}_{datetime.now().timestamp()}_{uuid.uuid4().hex[:8]}"
         
-        with self.driver.session() as session:
-            # OPTIMIZED: Single transaction for channel and memory
-            metadata_json = json.dumps(metadata) if metadata else "{}"
-            
+        # OPTIMIZED: Single transaction for channel and memory
+        metadata_json = json.dumps(metadata) if metadata else "{}"
+        
+        # Retry logic for deadlock handling (max 3 retries with exponential backoff)
+        max_retries = 3
+        retry_delay = 0.1  # Start with 100ms
+        
+        for attempt in range(max_retries):
             try:
-                session.run("""
-                    MERGE (c:Channel {id: $channel_id})
-                    SET c.last_active = datetime(),
-                        c.name = COALESCE($channel_name, c.name)
-                    WITH c
-                    MERGE (m:Memory {id: $memory_id})
-                    SET m.channel_id = $channel_id,
-                        m.content = $content,
-                        m.memory_type = $memory_type,
-                        m.embedding = $embedding,
-                        m.created_at = datetime(),
-                        m.metadata = $metadata_json,
-                        m.user_id = COALESCE($user_id, null),
-                        m.username = COALESCE($username, null),
-                        m.mentioned_user_id = COALESCE($mentioned_user_id, null)
-                    MERGE (c)-[:HAS_MEMORY]->(m)
-                """,
-                    memory_id=memory_id,
-                    channel_id=channel_id,
-                    content=content,
-                    memory_type=memory_type,
-                    embedding=embedding,
-                    metadata_json=metadata_json,
-                    user_id=user_id,
-                    username=username,
-                    mentioned_user_id=mentioned_user_id,
-                    channel_name=channel_name
-                )
+                with self.driver.session() as session:
+                    session.run("""
+                        MERGE (c:Channel {id: $channel_id})
+                        SET c.last_active = datetime(),
+                            c.name = COALESCE($channel_name, c.name)
+                        WITH c
+                        MERGE (m:Memory {id: $memory_id})
+                        SET m.channel_id = $channel_id,
+                            m.content = $content,
+                            m.memory_type = $memory_type,
+                            m.embedding = $embedding,
+                            m.created_at = datetime(),
+                            m.metadata = $metadata_json,
+                            m.user_id = COALESCE($user_id, null),
+                            m.username = COALESCE($username, null),
+                            m.mentioned_user_id = COALESCE($mentioned_user_id, null)
+                        MERGE (c)-[:HAS_MEMORY]->(m)
+                    """,
+                        memory_id=memory_id,
+                        channel_id=channel_id,
+                        content=content,
+                        memory_type=memory_type,
+                        embedding=embedding,
+                        metadata_json=metadata_json,
+                        user_id=user_id,
+                        username=username,
+                        mentioned_user_id=mentioned_user_id,
+                        channel_name=channel_name
+                    )
+                # Success - break out of retry loop
+                return memory_id
+                
+            except TransientError as e:
+                # Check if it's a deadlock error
+                error_code = getattr(e, 'code', '')
+                error_message = str(e).lower()
+                is_deadlock = 'deadlock' in error_message or 'DeadlockDetected' in str(e)
+                
+                if is_deadlock and attempt < max_retries - 1:
+                    # Generate new memory ID for retry to avoid conflicts
+                    memory_id = f"memory_{channel_id}_{datetime.now().timestamp()}_{uuid.uuid4().hex[:8]}"
+                    wait_time = retry_delay * (2 ** attempt)  # Exponential backoff: 0.1s, 0.2s, 0.4s
+                    logger.warning(f"Neo4j deadlock detected (attempt {attempt + 1}/{max_retries}), retrying in {wait_time:.2f}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Not a deadlock or max retries reached
+                    logger.error(f"Neo4j transient error (not retrying): {e}")
+                    raise
+                    
             except Exception as e:
                 # If MERGE still fails (shouldn't happen with UUID), log and retry with new ID
-                logger.debug(f"Memory ID collision detected, generating new ID: {e}")
-                memory_id = f"memory_{channel_id}_{datetime.now().timestamp()}_{uuid.uuid4().hex[:8]}"
-                session.run("""
-                    MERGE (c:Channel {id: $channel_id})
-                    SET c.last_active = datetime(),
-                        c.name = COALESCE($channel_name, c.name)
-                    WITH c
-                    MERGE (m:Memory {id: $memory_id})
-                    SET m.channel_id = $channel_id,
-                        m.content = $content,
-                        m.memory_type = $memory_type,
-                        m.embedding = $embedding,
-                        m.created_at = datetime(),
-                        m.metadata = $metadata_json,
-                        m.user_id = COALESCE($user_id, null),
-                        m.username = COALESCE($username, null),
-                        m.mentioned_user_id = COALESCE($mentioned_user_id, null)
-                    MERGE (c)-[:HAS_MEMORY]->(m)
-                """,
-                    memory_id=memory_id,
-                    channel_id=channel_id,
-                    content=content,
-                    memory_type=memory_type,
-                    embedding=embedding,
-                    metadata_json=metadata_json,
-                    user_id=user_id,
-                    username=username,
-                    mentioned_user_id=mentioned_user_id,
-                    channel_name=channel_name
-                )
+                error_message = str(e).lower()
+                if 'deadlock' in error_message and attempt < max_retries - 1:
+                    # Handle deadlock even if not TransientError
+                    memory_id = f"memory_{channel_id}_{datetime.now().timestamp()}_{uuid.uuid4().hex[:8]}"
+                    wait_time = retry_delay * (2 ** attempt)
+                    logger.warning(f"Neo4j deadlock detected (attempt {attempt + 1}/{max_retries}), retrying in {wait_time:.2f}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.debug(f"Memory storage error: {e}")
+                    # Generate new ID and try one more time if not deadlock
+                    if attempt < max_retries - 1:
+                        memory_id = f"memory_{channel_id}_{datetime.now().timestamp()}_{uuid.uuid4().hex[:8]}"
+                        continue
+                    raise
         
+        # Should not reach here, but return memory_id if we do
         return memory_id
     
     def retrieve_relevant_memories(self,
@@ -315,7 +381,29 @@ class MemoryStore:
             
             # Vectorized cosine similarity calculation
             query_vec = np.array(query_embedding, dtype=np.float32)
-            memory_embeddings = np.array([record["embedding"] for record in records], dtype=np.float32)
+            query_dim = len(query_vec)
+            
+            # Filter records by embedding dimension to avoid dimension mismatch errors
+            # This handles the case where old memories (384 dims) exist alongside new ones (768 dims)
+            compatible_records = []
+            skipped_count = 0
+            for record in records:
+                emb = record.get("embedding")
+                if emb is None:
+                    continue
+                emb_dim = len(emb) if isinstance(emb, (list, np.ndarray)) else 0
+                if emb_dim == query_dim:
+                    compatible_records.append(record)
+                else:
+                    skipped_count += 1
+            
+            if skipped_count > 0:
+                logger.warning(f"Skipped {skipped_count} memories with incompatible embedding dimensions (expected {query_dim}, found different)")
+            
+            if not compatible_records:
+                return []
+            
+            memory_embeddings = np.array([record["embedding"] for record in compatible_records], dtype=np.float32)
             
             # Normalize query vector once
             query_norm = np.linalg.norm(query_vec)
@@ -334,7 +422,7 @@ class MemoryStore:
             
             # Create results with scores
             similarities = []
-            for i, record in enumerate(records):
+            for i, record in enumerate(compatible_records):
                 metadata_str = record.get("metadata", "{}")
                 try:
                     metadata = json.loads(metadata_str) if isinstance(metadata_str, str) else (metadata_str or {})
@@ -393,7 +481,29 @@ class MemoryStore:
             
             # Vectorized similarity check
             query_vec = np.array(embedding, dtype=np.float32)
-            memory_embeddings = np.array([record["embedding"] for record in records], dtype=np.float32)
+            query_dim = len(query_vec)
+            
+            # Filter records by embedding dimension to avoid dimension mismatch errors
+            # This handles the case where old memories (384 dims) exist alongside new ones (768 dims)
+            compatible_records = []
+            for record in records:
+                emb = record.get("embedding")
+                if emb is None:
+                    continue
+                emb_dim = len(emb) if isinstance(emb, (list, np.ndarray)) else 0
+                if emb_dim == query_dim:
+                    compatible_records.append(record)
+            
+            if not compatible_records:
+                # No compatible memories found, fall back to content-based duplicate check
+                content_normalized = content.strip().lower()
+                for record in records:
+                    existing_content = record.get("content", "").strip().lower()
+                    if existing_content == content_normalized:
+                        return True
+                return False
+            
+            memory_embeddings = np.array([record["embedding"] for record in compatible_records], dtype=np.float32)
             
             # Compute cosine similarities
             query_norm = np.linalg.norm(query_vec)
@@ -411,8 +521,8 @@ class MemoryStore:
             if max_similarity >= similarity_threshold:
                 # Also check content similarity (exact match or very close)
                 content_normalized = content.strip().lower()
-                for record in records:
-                    existing_content = record["content"].strip().lower()
+                for record in compatible_records:
+                    existing_content = record.get("content", "").strip().lower()
                     if existing_content == content_normalized or max_similarity >= 0.98:
                         return True
             
@@ -443,7 +553,8 @@ class MemoryStore:
                 # OPTIMIZED: Direct lookup by channel ID with index
                 result = session.run("""
                     MATCH (c:Channel {id: $channel_id})-[:HAS_MEMORY]->(m:Memory)
-                    RETURN m.content AS content,
+                    RETURN m.id AS id,
+                           m.content AS content,
                            m.memory_type AS memory_type,
                            toString(m.created_at) AS created_at,
                            COALESCE(m.metadata, "{}") AS metadata
@@ -454,7 +565,8 @@ class MemoryStore:
                 # OPTIMIZED: Lookup by channel name with index
                 result = session.run("""
                     MATCH (c:Channel {name: $channel_name})-[:HAS_MEMORY]->(m:Memory)
-                    RETURN m.content AS content,
+                    RETURN m.id AS id,
+                           m.content AS content,
                            m.memory_type AS memory_type,
                            toString(m.created_at) AS created_at,
                            COALESCE(m.metadata, "{}") AS metadata
@@ -472,6 +584,7 @@ class MemoryStore:
                 except:
                     metadata = {}
                 memory = {
+                    'id': record.get('id', ''),
                     'content': record.get('content', ''),
                     'memory_type': record.get('memory_type', 'conversation'),
                     'created_at': record.get('created_at', ''),

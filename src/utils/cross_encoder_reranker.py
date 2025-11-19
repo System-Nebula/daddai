@@ -20,16 +20,16 @@ class CrossEncoderReranker:
     Cross-encoders are significantly more accurate than bi-encoders for re-ranking.
     """
     
-    def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2", lazy_load: bool = True):
+    def __init__(self, model_name: str = "BAAI/bge-reranker-base", lazy_load: bool = True):
         """
         Initialize cross-encoder reranker.
-        Uses faster model by default for better performance.
+        Upgraded to BGE reranker for better accuracy.
         
         Args:
             model_name: Cross-encoder model name
-                - "cross-encoder/ms-marco-MiniLM-L-6-v2" (default, fastest)
-                - "BAAI/bge-reranker-base" (better accuracy, slower)
-                - "BAAI/bge-reranker-large" (best accuracy, slowest)
+                - "BAAI/bge-reranker-base" (default, best balance of accuracy and speed)
+                - "BAAI/bge-reranker-large" (best accuracy, slower)
+                - "cross-encoder/ms-marco-MiniLM-L-6-v2" (faster, lower accuracy)
             lazy_load: If True, load model on first use (faster startup). If False, load immediately.
         """
         self.model_name = model_name

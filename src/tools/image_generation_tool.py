@@ -2,7 +2,7 @@
 Image Generation Tool - Generates images using RunPod API with FLUX GGUF models.
 This tool allows the bot to generate images based on text prompts.
 """
-import requests
+import httpx
 import base64
 import json
 import time
@@ -108,27 +108,28 @@ def query_comfyui_models(comfyui_base_url: Optional[str] = None) -> Dict[str, An
             
             # Try health check first
             try:
-                health_response = requests.get(endpoint_config["health"], headers=headers, timeout=10)
-                if health_response.status_code == 200:
-                    logger.info(f"✅ Health check passed for {endpoint_config['name']}")
-                    health_data = health_response.json()
-                    logger.debug(f"Health data: {json.dumps(health_data, indent=2)}")
+                with httpx.Client(timeout=10) as client:
+                    health_response = client.get(endpoint_config["health"], headers=headers)
+                    if health_response.status_code == 200:
+                        logger.info(f"✅ Health check passed for {endpoint_config['name']}")
+                        health_data = health_response.json()
+                        logger.debug(f"Health data: {json.dumps(health_data, indent=2)}")
             except Exception as e:
                 logger.debug(f"Health check failed for {endpoint_config['name']}: {e}")
             
             # Try object_info endpoint - RunPod might need POST with empty body
             try:
-                # Try GET first
-                response = requests.get(endpoint_config["object_info"], headers=headers, timeout=10)
-                
-                # If GET fails, try POST (some RunPod endpoints require POST)
-                if response.status_code != 200:
-                    response = requests.post(
-                        endpoint_config["object_info"],
-                        headers=headers,
-                        json={},
-                        timeout=10
-                    )
+                with httpx.Client(timeout=10) as client:
+                    # Try GET first
+                    response = client.get(endpoint_config["object_info"], headers=headers)
+                    
+                    # If GET fails, try POST (some RunPod endpoints require POST)
+                    if response.status_code != 200:
+                        response = client.post(
+                            endpoint_config["object_info"],
+                            headers=headers,
+                            json={}
+                        )
                 
                 if response.status_code == 200:
                     object_info = response.json()
@@ -256,11 +257,10 @@ def generate_image(
         if seed is None:
             seed = random.randint(0, 2**32 - 1)
         
-        # Build the workflow payload using FLUX GGUF workflow
+        # Build the workflow payload - EXACT match to original working script
         workflow = {
             "input": {
                 "workflow": {
-                    # DualCLIPLoader - loads both CLIP models
                     "40": {
                         "inputs": {
                             "clip_name1": clip_model_1,
@@ -269,21 +269,18 @@ def generate_image(
                         },
                         "class_type": "DualCLIPLoader"
                     },
-                    # UnetLoaderGGUF - loads the UNET model
                     "47": {
                         "inputs": {
                             "unet_name": unet_model
                         },
                         "class_type": "UnetLoaderGGUF"
                     },
-                    # VAE Loader - loads the VAE
                     "vae_loader": {
                         "inputs": {
                             "vae_name": vae_model
                         },
                         "class_type": "VAELoader"
                     },
-                    # Positive prompt encoding
                     "6": {
                         "inputs": {
                             "text": prompt,
@@ -291,7 +288,6 @@ def generate_image(
                         },
                         "class_type": "CLIPTextEncode"
                     },
-                    # FluxGuidance - required for FLUX models
                     "35": {
                         "inputs": {
                             "guidance": guidance,
@@ -299,7 +295,6 @@ def generate_image(
                         },
                         "class_type": "FluxGuidance"
                     },
-                    # Negative prompt encoding
                     "33": {
                         "inputs": {
                             "text": negative_prompt,
@@ -307,7 +302,6 @@ def generate_image(
                         },
                         "class_type": "CLIPTextEncode"
                     },
-                    # Empty latent image
                     "27": {
                         "inputs": {
                             "width": width,
@@ -316,23 +310,21 @@ def generate_image(
                         },
                         "class_type": "EmptySD3LatentImage"
                     },
-                    # KSampler - generates the image
                     "31": {
                         "inputs": {
                             "seed": seed,
                             "steps": steps,
-                            "cfg": cfg,
+                            "cfg": int(cfg) if cfg == 1.0 else cfg,  # Ensure cfg=1 is sent as integer to match original script
                             "sampler_name": sampler_name,
                             "scheduler": "simple",
                             "denoise": 1,
                             "model": ["47", 0],
-                            "positive": ["35", 0],  # Use FluxGuidance output
+                            "positive": ["35", 0],
                             "negative": ["33", 0],
                             "latent_image": ["27", 0]
                         },
                         "class_type": "KSampler"
                     },
-                    # VAE Decode - converts latent to image
                     "8": {
                         "inputs": {
                             "samples": ["31", 0],
@@ -340,7 +332,6 @@ def generate_image(
                         },
                         "class_type": "VAEDecode"
                     },
-                    # Save Image
                     "9": {
                         "inputs": {
                             "filename_prefix": "ComfyUI",
@@ -362,40 +353,46 @@ def generate_image(
         logger.debug(f"Using UNET model: {unet_model}, CLIP models: {clip_model_1}, {clip_model_2}, VAE: {vae_model}")
         logger.debug(f"Settings: steps={steps}, cfg={cfg}, guidance={guidance}, size={width}x{height}, seed={seed}")
         
-        response = requests.post(runsync_url, headers=headers, json=workflow, timeout=600)
+        # Log workflow structure for debugging (first 2000 chars)
+        workflow_json = json.dumps(workflow, indent=2)
+        logger.debug(f"Workflow JSON (first 2000 chars):\n{workflow_json[:2000]}")
         
-        if response.status_code != 200:
-            error_msg = f"API request failed with status {response.status_code}: {response.text}"
-            logger.error(error_msg)
-            logger.error(f"Workflow being sent uses UNET: {unet_model}, CLIP: {clip_model_1}, {clip_model_2}")
-            return {
-                "success": False,
-                "error": error_msg
-            }
-        
-        result = response.json()
-        job_id = result.get("id", "N/A")
-        
-        logger.info(f"✅ Job ID: {job_id}")
-        
-        # Check if job is still in queue/progress (runsync might return immediately)
-        if result.get("status") in ["IN_QUEUE", "IN_PROGRESS"]:
-            logger.info("Job is queued/running, polling for completion...")
-            status_url = f"https://api.runpod.ai/v2/{endpoint_id}/status/{job_id}"
-            max_polls = 120
-            poll_count = 0
+        with httpx.Client(timeout=600) as client:
+            response = client.post(runsync_url, headers=headers, json=workflow)
             
-            while poll_count < max_polls:
-                time.sleep(5)
-                status_response = requests.get(status_url, headers=headers, timeout=60)
-                if status_response.status_code == 200:
-                    result = status_response.json()
-                    status = result.get('status', 'UNKNOWN')
-                    if poll_count % 10 == 0:
-                        logger.debug(f"Polling status: {status} (attempt {poll_count + 1})")
-                    if status not in ["IN_QUEUE", "IN_PROGRESS"]:
-                        break
-                poll_count += 1
+            if response.status_code != 200:
+                error_msg = f"API request failed with status {response.status_code}: {response.text}"
+                logger.error(error_msg)
+                logger.error(f"Workflow being sent uses UNET: {unet_model}, CLIP: {clip_model_1}, {clip_model_2}")
+                return {
+                    "success": False,
+                    "error": error_msg
+                }
+            
+            result = response.json()
+            job_id = result.get("id", "N/A")
+            
+            logger.info(f"✅ Job ID: {job_id}")
+            
+            # Check if job is still in queue/progress (runsync might return immediately)
+            if result.get("status") in ["IN_QUEUE", "IN_PROGRESS"]:
+                logger.info("Job is queued/running, polling for completion...")
+                status_url = f"https://api.runpod.ai/v2/{endpoint_id}/status/{job_id}"
+                max_polls = 120
+                poll_count = 0
+                
+                with httpx.Client(timeout=60) as status_client:
+                    while poll_count < max_polls:
+                        time.sleep(5)
+                        status_response = status_client.get(status_url, headers=headers)
+                        if status_response.status_code == 200:
+                            result = status_response.json()
+                            status = result.get('status', 'UNKNOWN')
+                            if poll_count % 10 == 0:
+                                logger.debug(f"Polling status: {status} (attempt {poll_count + 1})")
+                            if status not in ["IN_QUEUE", "IN_PROGRESS"]:
+                                break
+                        poll_count += 1
         
         # Check for errors
         if "error" in result:
@@ -517,14 +514,14 @@ def generate_image(
                 "job_id": job_id
             }
         
-    except requests.exceptions.Timeout:
+    except httpx.TimeoutException:
         error_msg = "Request timed out. The API may be slow or unavailable."
         logger.error(error_msg)
         return {
             "success": False,
             "error": error_msg
         }
-    except requests.exceptions.RequestException as e:
+    except httpx.RequestError as e:
         error_msg = f"Network error: {str(e)}"
         logger.error(error_msg, exc_info=True)
         return {

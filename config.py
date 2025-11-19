@@ -34,6 +34,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 CHUTES_API_KEY = os.getenv("CHUTES_API_KEY", None)
 CHUTES_BASE_URL = os.getenv("CHUTES_BASE_URL", "https://llm.chutes.ai/v1")
 CHUTES_MODEL = os.getenv("CHUTES_MODEL", "deepseek-ai/DeepSeek-V3-0324")
+CHUTES_TIMEOUT = int(os.getenv("CHUTES_TIMEOUT", "90"))  # Increased to 90s for thinking models, YouTube processing, and slower responses
 # Default to false - existing chutes work without input_args wrapper
 # Set to true only if your Chutes configuration specifically requires it
 CHUTES_USE_INPUT_ARGS_WRAPPER = os.getenv("CHUTES_USE_INPUT_ARGS_WRAPPER", "false").lower() == "true"
@@ -47,9 +48,11 @@ CUSTOM_LLM_MODEL = os.getenv("CUSTOM_LLM_MODEL", None)
 LLM_STREAMING_ENABLED = os.getenv("LLM_STREAMING_ENABLED", "false").lower() == "true"
 
 # Embedding Configuration
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")  # Local sentence transformer model
-EMBEDDING_DIMENSION = 384  # Dimension for all-MiniLM-L6-v2
-EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))  # Batch size for GPU processing
+# Upgraded to BAAI/bge-base-en-v1.5 for better accuracy (768 dimensions, 2-3x better retrieval)
+# Alternatives: "BAAI/bge-small-en-v1.5" (384 dims, faster) or "BAAI/bge-large-en-v1.5" (1024 dims, best accuracy)
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")  # State-of-the-art embedding model
+EMBEDDING_DIMENSION = 768  # Dimension for BAAI/bge-base-en-v1.5 (was 384 for all-MiniLM-L6-v2)
+EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))  # Reduced batch size for larger model (was 64)
 USE_GPU = os.getenv("USE_GPU", "auto").lower()  # 'auto', 'cuda', or 'cpu'
 
 # Document Processing Configuration
@@ -71,6 +74,21 @@ HYBRID_KEYWORD_WEIGHT = float(os.getenv("HYBRID_KEYWORD_WEIGHT", "0.3"))
 # Query Expansion Configuration
 QUERY_EXPANSION_ENABLED = os.getenv("QUERY_EXPANSION_ENABLED", "true").lower() == "true"
 QUERY_EXPANSION_MAX_TERMS = int(os.getenv("QUERY_EXPANSION_MAX_TERMS", "3"))
+
+# HyDE (Hypothetical Document Embeddings) Configuration
+HYDE_ENABLED = os.getenv("HYDE_ENABLED", "true").lower() == "true"
+HYDE_USE_ORIGINAL_QUERY = os.getenv("HYDE_USE_ORIGINAL_QUERY", "true").lower() == "true"  # Combine HyDE + original query
+
+# Parent-Child Chunking Configuration
+PARENT_CHILD_CHUNKING_ENABLED = os.getenv("PARENT_CHILD_CHUNKING_ENABLED", "true").lower() == "true"
+CHILD_CHUNK_SIZE = int(os.getenv("CHILD_CHUNK_SIZE", "300"))  # Small chunks for retrieval
+PARENT_CHUNK_SIZE = int(os.getenv("PARENT_CHUNK_SIZE", "1000"))  # Large chunks for context
+
+# Semantic Chunking Configuration
+SEMANTIC_CHUNKING_ENABLED = os.getenv("SEMANTIC_CHUNKING_ENABLED", "true").lower() == "true"
+
+# Query Rewriting Configuration
+QUERY_REWRITING_ENABLED = os.getenv("QUERY_REWRITING_ENABLED", "true").lower() == "true"
 
 # Temporal Weighting Configuration
 TEMPORAL_WEIGHTING_ENABLED = os.getenv("TEMPORAL_WEIGHTING_ENABLED", "true").lower() == "true"

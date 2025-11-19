@@ -67,6 +67,20 @@ class GopherAgentServer:
                 self.agent.clear_cache()
                 return {"id": request_id, "result": {"status": "cache_cleared"}, "error": None}
             
+            elif method == 'run_agentic_task':
+                message = params.get('message', '')
+                context = params.get('context', {})
+                
+                result = self.agent.run_agentic_task(message, context)
+                return {"id": request_id, "result": result, "error": None}
+            
+            elif method == 'should_use_agentic_mode':
+                message = params.get('message', '')
+                intent_result = params.get('intent_result')
+                
+                result = self.agent.should_use_agentic_mode(message, intent_result)
+                return {"id": request_id, "result": result, "error": None}
+            
             else:
                 return {"id": request_id, "result": None, "error": f"Unknown method: {method}"}
         

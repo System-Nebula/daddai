@@ -2,7 +2,7 @@
 LMStudio client for querying local LLM models with retry logic.
 Now also supports streaming via OpenAICompatibleClient.
 """
-import requests
+import httpx
 from typing import List, Dict, Any, Optional, Iterator
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from config import (
@@ -46,7 +46,7 @@ class LMStudioClient:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((requests.exceptions.RequestException, requests.exceptions.Timeout)),
+        retry=retry_if_exception_type((httpx.RequestError, httpx.TimeoutException)),
         reraise=True
     )
     def generate_response(self, 
@@ -84,11 +84,11 @@ class LMStudioClient:
         
         try:
             logger.debug(f"Calling LMStudio API with {len(messages)} messages")
-            response = requests.post(
-                self.chat_endpoint,
-                json=payload,
-                timeout=LMSTUDIO_TIMEOUT
-            )
+            with httpx.Client(timeout=LMSTUDIO_TIMEOUT) as client:
+                response = client.post(
+                    self.chat_endpoint,
+                    json=payload
+                )
             
             if response.status_code != 200:
                 error_detail = response.text
@@ -105,10 +105,10 @@ class LMStudioClient:
             content = result['choices'][0]['message']['content']
             logger.debug(f"Generated response: {len(content)} characters")
             return content
-        except requests.exceptions.Timeout:
+        except httpx.TimeoutException:
             logger.error(f"LMStudio API timeout after {LMSTUDIO_TIMEOUT}s")
             raise Exception(f"LMStudio API timeout after {LMSTUDIO_TIMEOUT}s")
-        except requests.exceptions.RequestException as e:
+        except httpx.RequestError as e:
             logger.error(f"Error calling LMStudio API: {e}")
             raise Exception(f"Error calling LMStudio API: {e}")
     
@@ -139,101 +139,98 @@ class LMStudioClient:
         
         try:
             logger.debug(f"Starting streaming request to LMStudio with {len(messages)} messages")
-            response = requests.post(
-                self.chat_endpoint,
-                json=payload,
-                timeout=LMSTUDIO_TIMEOUT,
-                stream=True
-            )
-            
-            if response.status_code != 200:
-                error_detail = response.text
-                logger.error(f"LMStudio API error ({response.status_code}): {error_detail}")
-                raise Exception(f"LMStudio API error ({response.status_code}): {error_detail}")
-            
-            response.raise_for_status()
-            
-            # Process Server-Sent Events (SSE) stream
-            import json
-            buffer = ""
-            for line in response.iter_lines(decode_unicode=True):
-                if not line:
-                    continue
-                
-                # SSE format: "data: {...}"
-                if line.startswith("data: "):
-                    data_str = line[6:]  # Remove "data: " prefix
+            with httpx.Client(timeout=LMSTUDIO_TIMEOUT) as client:
+                with client.stream('POST', self.chat_endpoint, json=payload) as response:
+                    if response.status_code != 200:
+                        error_detail = response.text
+                        logger.error(f"LMStudio API error ({response.status_code}): {error_detail}")
+                        raise Exception(f"LMStudio API error ({response.status_code}): {error_detail}")
                     
-                    # Handle [DONE] marker
-                    if data_str.strip() == "[DONE]":
-                        break
+                    response.raise_for_status()
                     
-                    try:
-                        chunk_data = json.loads(data_str)
+                    # Process Server-Sent Events (SSE) stream
+                    import json
+                    buffer = ""
+                    for line in response.iter_lines():
+                        if not line:
+                            continue
                         
-                        # Extract content from chunk
-                        chunk = {
-                            "content": "",
-                            "delta": {},
-                            "finish_reason": None,
-                            "thinking": None
-                        }
-                        
-                        if 'choices' in chunk_data and len(chunk_data['choices']) > 0:
-                            choice = chunk_data['choices'][0]
+                        # SSE format: "data: {...}"
+                        if line.startswith("data: "):
+                            data_str = line[6:]  # Remove "data: " prefix
                             
-                            # Extract delta (content increment)
-                            if 'delta' in choice:
-                                delta = choice['delta']
-                                chunk['delta'] = delta
-                                
-                                # Get content from delta
-                                if 'content' in delta:
-                                    chunk['content'] = delta['content']
-                                
-                                # Check for thinking content (for thinking models)
-                                if 'thinking' in delta:
-                                    chunk['thinking'] = delta['thinking']
+                            # Handle [DONE] marker
+                            if data_str.strip() == "[DONE]":
+                                break
                             
-                            # Get finish reason
-                            if 'finish_reason' in choice:
-                                chunk['finish_reason'] = choice['finish_reason']
-                        
-                        yield chunk
-                        
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Failed to parse chunk: {data_str[:100]}... Error: {e}")
-                        continue
-                elif line.startswith(":"):
-                    # SSE comment line, ignore
-                    continue
-                else:
-                    # Accumulate in buffer for multi-line chunks
-                    buffer += line + "\n"
+                            try:
+                                chunk_data = json.loads(data_str)
+                                
+                                # Extract content from chunk
+                                chunk = {
+                                    "content": "",
+                                    "delta": {},
+                                    "finish_reason": None,
+                                    "thinking": None
+                                }
+                                
+                                if 'choices' in chunk_data and len(chunk_data['choices']) > 0:
+                                    choice = chunk_data['choices'][0]
+                                    
+                                    # Extract delta (content increment)
+                                    if 'delta' in choice:
+                                        delta = choice['delta']
+                                        chunk['delta'] = delta
+                                        
+                                        # Get content from delta
+                                        if 'content' in delta:
+                                            chunk['content'] = delta['content']
+                                        
+                                        # Check for thinking content (for thinking models)
+                                        if 'thinking' in delta:
+                                            chunk['thinking'] = delta['thinking']
+                                    
+                                    # Get finish reason
+                                    if 'finish_reason' in choice:
+                                        chunk['finish_reason'] = choice['finish_reason']
+                                
+                                yield chunk
+                                
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"Failed to parse chunk: {data_str[:100]}... Error: {e}")
+                                continue
+                        elif line.startswith(":"):
+                            # SSE comment line, ignore
+                            continue
+                        else:
+                            # Accumulate in buffer for multi-line chunks
+                            buffer += line + "\n"
             
             logger.debug("Streaming completed")
             
-        except requests.exceptions.Timeout:
+        except httpx.TimeoutException:
             logger.error(f"LMStudio API timeout after {LMSTUDIO_TIMEOUT}s")
             raise Exception(f"LMStudio API timeout after {LMSTUDIO_TIMEOUT}s")
-        except requests.exceptions.RequestException as e:
+        except httpx.RequestError as e:
             logger.error(f"Error calling LMStudio API: {e}")
             raise Exception(f"Error calling LMStudio API: {e}")
     
     def check_connection(self) -> bool:
         """Check if LMStudio is accessible."""
         try:
-            response = requests.get(f"{self.base_url}/models", timeout=5)
-            return response.status_code == 200
+            with httpx.Client(timeout=5) as client:
+                response = client.get(f"{self.base_url}/models")
+                return response.status_code == 200
         except:
             return False
     
     def get_available_models(self) -> List[str]:
         """Get list of available models from LMStudio."""
         try:
-            response = requests.get(f"{self.base_url}/models", timeout=5)
-            response.raise_for_status()
-            models = response.json()
-            return [model['id'] for model in models.get('data', [])]
+            with httpx.Client(timeout=5) as client:
+                response = client.get(f"{self.base_url}/models")
+                response.raise_for_status()
+                models = response.json()
+                return [model['id'] for model in models.get('data', [])]
         except:
             return []

@@ -2,11 +2,22 @@
   "name": "discord-rag-bot",
   "version": "1.0.0",
   "description": "Discord bot with RAG capabilities and conversation memory",
-  "main": "index.js",
+  "main": "index.ts",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
-    "start": "node index.js",
-    "dev": "node index.js",
-    "deploy": "node src/commands/deploy.js"
+    "start": "tsx index.ts",
+    "start:js": "node run-js.cjs",
+    "dev": "tsx watch index.ts",
+    "dev:ts": "tsx watch index.ts",
+    "build": "tsc && node dist/index.js",
+    "deploy": "node src/commands/deploy.js",
+    "test": "node --test --loader tsx/esm src/**/*.test.ts",
+    "test:watch": "node --test --watch --loader tsx/esm src/**/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . --ext .ts,.js"
   },
   "keywords": [
     "discord",
@@ -17,11 +28,36 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "axios": "^1.13.2",
+    "@opentelemetry/api": "^1.7.0",
+    "@opentelemetry/auto-instrumentations-node": "^0.48.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.48.0",
+    "@opentelemetry/instrumentation": "^0.48.0",
+    "@opentelemetry/instrumentation-express": "^0.40.0",
+    "@opentelemetry/instrumentation-http": "^0.48.0",
+    "@opentelemetry/resources": "^1.21.0",
+    "@opentelemetry/sdk-metrics": "^1.21.0",
+    "@opentelemetry/sdk-node": "^0.48.0",
+    "@opentelemetry/sdk-trace-base": "^1.21.0",
+    "@opentelemetry/sdk-trace-node": "^1.21.0",
+    "@opentelemetry/semantic-conventions": "^1.21.0",
     "compression": "^1.8.1",
     "discord.js": "^14.24.2",
     "dotenv": "^16.6.1",
     "express": "^4.21.2",
+    "socket.io": "^4.7.2",
     "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "@types/compression": "^1.8.1",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.0",
+    "@types/winston": "^2.4.4",
+    "@types/socket.io": "^3.0.2",
+    "@typescript-eslint/eslint-plugin": "^8.47.0",
+    "@typescript-eslint/parser": "^8.47.0",
+    "eslint": "^9.39.1",
+    "prettier": "^3.6.2",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
   }
 }

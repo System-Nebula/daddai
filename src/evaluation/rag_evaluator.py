@@ -17,6 +17,22 @@ try:
 except ImportError:
     EMBEDDING_AVAILABLE = False
 
+try:
+    from ragas import evaluate
+    from ragas.metrics import (
+        faithfulness,
+        answer_relevancy,
+        context_precision,
+        context_recall
+    )
+    from datasets import Dataset
+    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    RAGAS_AVAILABLE = True
+except ImportError:
+    RAGAS_AVAILABLE = False
+    logger.warning("RAGAS not available. Install with: pip install ragas datasets langchain-openai")
+
 
 class RAGEvaluator:
     """
@@ -278,6 +294,112 @@ class RAGEvaluator:
             
             return {}
     
+    def evaluate_with_ragas(self, 
+                           samples: List[Dict[str, Any]],
+                           metrics: Optional[List[Any]] = None) -> Dict[str, float]:
+        """
+        Evaluate using RAGAS framework.
+        
+        Args:
+            samples: List of dicts with keys: question, answer, contexts (list[str]), ground_truth (optional)
+            metrics: List of RAGAS metrics to use
+            
+        Returns:
+            Dict of average scores
+        """
+        if not RAGAS_AVAILABLE:
+            logger.warning("RAGAS not available. Skipping evaluation.")
+            return {}
+        
+        if not samples:
+            return {}
+        
+        # Default metrics
+        if metrics is None:
+            metrics = [
+                faithfulness,
+                answer_relevancy,
+                context_precision,
+                context_recall
+            ]
+        
+        # Prepare dataset
+        data = {
+            "question": [s.get("question", "") for s in samples],
+            "answer": [s.get("answer", "") for s in samples],
+            "contexts": [s.get("contexts", []) for s in samples],
+            "ground_truth": [s.get("ground_truth", "") for s in samples]
+        }
+        
+        # Remove ground_truth if not present in all samples
+        if not any(data["ground_truth"]):
+            del data["ground_truth"]
+            # Remove metrics that require ground truth
+            metrics = [m for m in metrics if m.name not in ["context_recall", "context_precision"]]
+        
+        dataset = Dataset.from_dict(data)
+        
+        # Configure LLM and Embeddings
+        llm = self._get_langchain_llm()
+        embeddings = self._get_langchain_embeddings()
+        
+        try:
+            results = evaluate(
+                dataset=dataset,
+                metrics=metrics,
+                llm=llm,
+                embeddings=embeddings
+            )
+            
+            return results
+        except Exception as e:
+            logger.error(f"RAGAS evaluation failed: {e}")
+            return {}
+
+    def _get_langchain_llm(self):
+        """Get LangChain LLM for RAGAS."""
+        from config import (
+            LLM_PROVIDER, LMSTUDIO_BASE_URL, LMSTUDIO_MODEL,
+            CHUTES_BASE_URL, CHUTES_MODEL, OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+        )
+        
+        # Determine provider
+        if LLM_PROVIDER == "lmstudio":
+            base_url = LMSTUDIO_BASE_URL
+            model = LMSTUDIO_MODEL
+            api_key = "lm-studio"
+        elif LLM_PROVIDER == "chutes":
+            base_url = CHUTES_BASE_URL
+            model = CHUTES_MODEL
+            api_key = os.getenv("CHUTES_API_KEY", "dummy")
+        else: # openai or default
+            base_url = OPENAI_BASE_URL
+            model = OPENAI_MODEL
+            api_key = OPENAI_API_KEY or "dummy"
+            
+        return ChatOpenAI(
+            base_url=base_url,
+            model=model,
+            api_key=api_key,
+            temperature=0
+        )
+
+    def _get_langchain_embeddings(self):
+        """Get LangChain Embeddings for RAGAS."""
+        from config import EMBEDDING_MODEL, USE_GPU
+        
+        device = "cuda" if USE_GPU == "cuda" or (USE_GPU == "auto" and self._is_gpu_available()) else "cpu"
+        
+        return HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL,
+            model_kwargs={"device": device},
+            encode_kwargs={"normalize_embeddings": True}
+        )
+
+    def _is_gpu_available(self):
+        import torch
+        return torch.cuda.is_available()
+
     def close(self):
         """Close connection."""
         self.driver.close()

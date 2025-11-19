@@ -2,7 +2,8 @@ docling>=1.0.0
 neo4j>=5.0.0
 sentence-transformers>=2.2.0
 torch>=2.0.0
-requests>=2.31.0
+httpx>=0.25.0
+# requests>=2.31.0  # Deprecated - using httpx instead
 beautifulsoup4>=4.12.0  # Optional but recommended for better website content extraction
 youtube-transcript-api>=0.6.0  # For fetching YouTube video transcripts
 # Note: youtube-transcript-api may show a warning about defusedxml>=0.8.0rc2,
@@ -25,3 +26,15 @@ pytest-asyncio>=0.21.0
 # Elasticsearch (optional - for hybrid search)
 # Must match your Elasticsearch server version (8.x client for 8.x server)
 elasticsearch>=8.0.0,<9.0.0
+
+# LangGraph for multi-agent orchestration
+langgraph>=0.2.0
+langchain-core>=0.3.0
+
+# LangChain for semantic chunking (optional - for better chunking)
+langchain>=0.3.0
+langchain-community>=0.3.0
+
+# RAG Evaluation
+ragas>=0.1.0
+datasets>=2.14.0

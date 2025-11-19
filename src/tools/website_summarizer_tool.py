@@ -2,7 +2,7 @@
 Website Summarization Tool - Fetches and extracts structured content from websites.
 This tool intelligently parses article content and returns structured data for LLM queries.
 """
-import requests
+import httpx
 from html.parser import HTMLParser
 from typing import Dict, Any, List, Optional
 import re
@@ -307,21 +307,23 @@ def summarize_website(url: str, max_length: int = 50000, save_to_documents: bool
         }
         
         logger.info(f"🌐 Fetching website: {url}")
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
+        with httpx.Client(timeout=15) as client:
+            response = client.get(url, headers=headers)
+            response.raise_for_status()
+            html_content = response.text
         
         # Use BeautifulSoup if available, otherwise use basic parser
         if HAS_BS4:
             logger.info("Using BeautifulSoup for enhanced parsing")
-            content_data = _extract_with_bs4(response.text, max_length)
+            content_data = _extract_with_bs4(html_content, max_length)
         else:
             logger.info("Using basic HTML parser")
             parser = StructuredExtractor()
-            parser.feed(response.text)
+            parser.feed(html_content)
             content_data = parser.get_structured_content(max_length)
             
             # Extract title with basic parser
-            title_match = re.search(r'<title[^>]*>(.*?)</title>', response.text, re.IGNORECASE | re.DOTALL)
+            title_match = re.search(r'<title[^>]*>(.*?)</title>', html_content, re.IGNORECASE | re.DOTALL)
             title = title_match.group(1).strip() if title_match else None
             if title:
                 title = re.sub(r'&[a-z]+;', '', title)
@@ -474,13 +476,13 @@ def summarize_website(url: str, max_length: int = 50000, save_to_documents: bool
         
         return result
         
-    except requests.exceptions.Timeout:
+    except httpx.TimeoutException:
         return {
             "success": False,
             "error": "Request timed out. The website may be slow or unavailable.",
             "url": url
         }
-    except requests.exceptions.RequestException as e:
+    except httpx.RequestError as e:
         return {
             "success": False,
             "error": f"Failed to fetch website: {str(e)}",

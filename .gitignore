@@ -74,3 +74,12 @@ discord-bot/.env.local
 temp/
 tmp/
 *.tmp
+
+# Test outputs
+tests/**/*.log
+tests/**/__pycache__/
+discord-bot/tests/**/*.log
+
+# Script outputs
+scripts/**/*.log
+scripts/**/__pycache__/

@@ -30,6 +30,7 @@ from src.tools.meta_tools import create_meta_tools
 from src.agents.gopher_agent import get_gopher_agent
 from src.utils.cross_encoder_reranker import CrossEncoderReranker, FallbackReranker
 from src.search.multi_query_retrieval import MultiQueryRetrieval
+from src.search.hyde_retrieval import HyDERetrieval
 from src.evaluation.rag_evaluator import RAGEvaluator
 from src.evaluation.performance_monitor import PerformanceMonitor
 from src.evaluation.ab_testing import ABTesting
@@ -37,7 +38,7 @@ from src.evaluation.performance_optimizations import PerformanceOptimizer
 from config import (
     USE_GPU, EMBEDDING_BATCH_SIZE, CACHE_ENABLED, CACHE_MAX_SIZE, CACHE_TTL_SECONDS,
     RAG_TOP_K, RAG_TEMPERATURE, RAG_MAX_TOKENS, RAG_MAX_CONTEXT_TOKENS, MMR_LAMBDA,
-    ELASTICSEARCH_ENABLED
+    ELASTICSEARCH_ENABLED, HYDE_ENABLED, HYDE_USE_ORIGINAL_QUERY
 )
 from logger_config import logger
 
@@ -86,6 +87,7 @@ class EnhancedRAGPipeline(RAGPipeline):
         self.cross_encoder_reranker = CrossEncoderReranker(lazy_load=True)  # Cross-encoder reranking (lazy load)
         self.fallback_reranker = FallbackReranker()  # Fallback if cross-encoder unavailable
         self.multi_query = MultiQueryRetrieval(llm_client=self.lmstudio_client)  # Multi-query retrieval
+        self.hyde_retrieval = HyDERetrieval(llm_client=self.lmstudio_client, embedding_generator=self.embedding_generator)  # HyDE retrieval
         
         # Evaluation and monitoring (lazy load for faster startup)
         self.evaluator = RAGEvaluator(lazy_load=True)  # Evaluation framework (lazy load)
@@ -998,7 +1000,15 @@ class EnhancedRAGPipeline(RAGPipeline):
                     )
             
             # Intelligent memory retrieval (only if needed)
-            if use_memory and needs_memory and channel_id and not doc_id and not doc_filename:
+            # CRITICAL: Skip memory retrieval when URL is detected - URL tool will fetch fresh content
+            # Old memories might contain information about different videos/content and should not be used
+            has_url = any([
+                "http://" in question or "https://" in question,
+                "www." in question and ("." in question.split("www.")[1][:50] if "www." in question else False),
+                "youtube.com" in question.lower() or "youtu.be" in question.lower(),
+            ])
+            
+            if use_memory and needs_memory and channel_id and not doc_id and not doc_filename and not has_url:
                 futures['memories'] = executor.submit(
                     self.intelligent_memory.retrieve_with_context,
                     channel_id,
@@ -1006,6 +1016,8 @@ class EnhancedRAGPipeline(RAGPipeline):
                     top_k=5,
                     min_importance=0.3
                 )
+            elif has_url:
+                logger.info(f"🌐 URL detected - skipping memory retrieval (URL tool will fetch fresh content)")
             
             # OPTIMIZED: Collect results with early termination for high-confidence results
             for key, future in futures.items():
@@ -1642,6 +1654,13 @@ You have access to user context and conversation history.
 You must base your answer entirely on the provided document content and context.
 Be precise, cite specific parts of the document when possible, and use user context to personalize your response.{summarize_note}
 
+CRITICAL - ACCURACY RULES:
+- ONLY use information that is explicitly stated in the provided document content
+- If information isn't in the document, say "I don't see that in the document" rather than guessing
+- When listing items (books, authors, concepts), ONLY list what is actually mentioned in the document
+- DO NOT add similar items or make inferences beyond what's explicitly stated
+- If asked "what other X" and only one X is mentioned, say only that one - don't add others
+
 IMPORTANT - SPEAKING STYLE:
 - Talk like a real e-girl - casual, natural, and human-like
 - Don't worry about perfect grammar - use casual speech patterns
@@ -1659,6 +1678,13 @@ You have access to documents, memories, and user context.
 You can see previous conversation history and user relationships.
 Use this context to provide personalized, context-aware answers.
 Question type: {question_type} (complexity: {complexity}).
+
+CRITICAL - ACCURACY RULES:
+- ONLY use information that is explicitly stated in the provided context
+- If information isn't in the context, acknowledge it rather than guessing or making it up
+- When listing items (books, authors, concepts), ONLY list what is actually mentioned in the context
+- DO NOT add similar items or make inferences beyond what's explicitly stated
+- If asked "what other X" and only one X is mentioned, say only that one - don't add others
 
 IMPORTANT - SPEAKING STYLE:
 - Talk like a real e-girl - casual, natural, and human-like
@@ -1735,6 +1761,15 @@ Stay true to your bubbly, risky e-girl waifu personality! Be playful, and don't 
 {context}{user_context_str}{conv_context_str}
 
 Question: {question}{tool_instruction}{url_instruction}{summarize_instruction}
+
+CRITICAL INSTRUCTIONS - ACCURACY FIRST:
+- Answer based ONLY on the information provided in the context above
+- If information is NOT in the context, say "I don't see that mentioned in the documents" or "That's not in what I found"
+- DO NOT make up, infer, or guess information that isn't explicitly stated in the context
+- DO NOT mention books, authors, concepts, or details unless they are explicitly mentioned in the context
+- If asked about specific items (like "what other books"), only mention what is ACTUALLY in the context
+- When listing items, only list what is explicitly mentioned - don't add similar items that aren't there
+- If the context doesn't contain enough information, acknowledge that rather than guessing
 
 Instructions:
 - Question Type: {question_type}
@@ -2361,24 +2396,52 @@ Examples:
             
             # Handle dict responses (tool calls from native function calling)
             native_tool_calls = None
+            original_response_dict = None
             if isinstance(response, dict):
+                original_response_dict = response  # Save original dict for later checking
                 content = response.get('content', '')
                 native_tool_calls = response.get('tool_calls')
                 if native_tool_calls:
+                    logger.debug(f"🔧 Found {len(native_tool_calls)} tool_calls in API response")
+                    logger.debug(f"🔧 First tool_call structure: {json.dumps(native_tool_calls[0] if native_tool_calls else {}, indent=2)[:500]}")
                     # Convert OpenAI tool_calls format to our format
                     parsed_tool_calls = []
-                    for tc in native_tool_calls:
+                    for idx, tc in enumerate(native_tool_calls):
                         try:
-                            args = tc['function']['arguments']
-                            if isinstance(args, str):
-                                args = json.loads(args)
-                            parsed_tool_calls.append({
-                                "name": tc['function']['name'],
-                                "arguments": args
-                            })
+                            # Handle different tool_call formats
+                            if isinstance(tc, dict):
+                                # Standard OpenAI format: {"function": {"name": "...", "arguments": "..."}}
+                                if 'function' in tc:
+                                    func = tc['function']
+                                    tool_name = func.get('name', '')
+                                    args = func.get('arguments', '{}')
+                                    if isinstance(args, str):
+                                        args = json.loads(args)
+                                    parsed_tool_calls.append({
+                                        "name": tool_name,
+                                        "arguments": args
+                                    })
+                                # Alternative format: {"name": "...", "arguments": {...}}
+                                elif 'name' in tc:
+                                    args = tc.get('arguments', {})
+                                    if isinstance(args, str):
+                                        args = json.loads(args)
+                                    parsed_tool_calls.append({
+                                        "name": tc['name'],
+                                        "arguments": args
+                                    })
+                                else:
+                                    logger.warning(f"🔧 Unknown tool_call format at index {idx}: {list(tc.keys())}")
+                            else:
+                                logger.warning(f"🔧 Tool call at index {idx} is not a dict: {type(tc)}")
                         except Exception as e:
-                            logger.warning(f"Failed to parse tool call: {e}")
-                    native_tool_calls = parsed_tool_calls
+                            logger.warning(f"🔧 Failed to parse tool call at index {idx}: {e}")
+                            logger.debug(f"🔧 Tool call data: {json.dumps(tc, indent=2)[:500] if isinstance(tc, dict) else str(tc)[:200]}")
+                    native_tool_calls = parsed_tool_calls if parsed_tool_calls else None
+                    if native_tool_calls:
+                        logger.info(f"🔧 Successfully parsed {len(native_tool_calls)} native tool calls")
+                    else:
+                        logger.warning(f"🔧 No tool calls successfully parsed from {len(response.get('tool_calls', []))} tool_calls in response")
                 response = content  # Use content for text parsing
             
             logger.info(f"🔧 [Tool Call Iteration {iteration + 1}] LLM response length: {len(response) if response else 0}")
@@ -2392,6 +2455,26 @@ Examples:
                 # Fallback to text-based parsing
                 tool_calls = self.tool_parser.parse_tool_calls(response)
                 logger.info(f"🔧 [Tool Call Iteration {iteration + 1}] Parsed {len(tool_calls)} tool calls from text")
+            
+            # Also check content for Chutes format markers even if we got native tool_calls
+            # (Chutes sometimes puts tool calls in content with special markers)
+            # Note: Chutes uses full-width vertical bars (｜) instead of regular pipes (|)
+            if original_response_dict:
+                content = original_response_dict.get('content', '')
+                # Check for both regular | and full-width ｜ characters
+                if content and (('<|tool_calls_begin|>' in content or '<｜tool_calls_begin｜>' in content or 
+                                '<|tool_call_begin|>' in content or '<｜tool_call_begin｜>' in content)):
+                    logger.debug(f"🔧 Found Chutes tool call markers in content, parsing...")
+                    content_tool_calls = self.tool_parser.parse_tool_calls(content)
+                    if content_tool_calls:
+                        logger.info(f"🔧 Found {len(content_tool_calls)} tool calls in content (Chutes format)")
+                        # Merge with existing tool_calls, avoiding duplicates
+                        existing_names = {tc.get('name') for tc in tool_calls}
+                        for tc in content_tool_calls:
+                            if tc.get('name') not in existing_names:
+                                tool_calls.append(tc)
+                                existing_names.add(tc.get('name'))
+                        logger.info(f"🔧 Total tool calls after merging: {len(tool_calls)}")
             
             if not tool_calls:
                 # No tool calls detected
@@ -3094,10 +3177,32 @@ Examples:
                         # Keep message as-is
                         cleaned_messages.append(msg)
                 
-                current_messages = cleaned_messages
-                logger.info(f"🧹 Cleaned messages: {len(cleaned_messages)} messages after removing tool instructions")
+                # CRITICAL: Remove any memory-related messages when URL content is fetched
+                # We only want the tool result (transcript), not old memories that might confuse the LLM
+                final_cleaned_messages = []
+                for msg in cleaned_messages:
+                    content = msg.get("content", "")
+                    role = msg.get("role", "")
+                    
+                    # Skip memory-related messages - they contain old information that shouldn't be used
+                    # when we have fresh URL content from the tool
+                    is_memory_message = (
+                        "[Memory:" in content or
+                        "[Important Memory]" in content or
+                        "[Previous Bot Response]" in content or
+                        "memory" in content.lower() and ("conversation" in content.lower() or "fact" in content.lower() or "preference" in content.lower())
+                    )
+                    
+                    if is_memory_message:
+                        logger.info(f"🧹 Removing memory message from final response context (length: {len(content)})")
+                        continue
+                    
+                    final_cleaned_messages.append(msg)
+                
+                current_messages = final_cleaned_messages
+                logger.info(f"🧹 Cleaned messages: {len(final_cleaned_messages)} messages after removing tool instructions and memories")
                 # Log message roles for debugging
-                roles = [msg.get("role", "unknown") for msg in cleaned_messages]
+                roles = [msg.get("role", "unknown") for msg in final_cleaned_messages]
                 logger.debug(f"   Message roles: {roles}")
                 
                 # CRITICAL: Verify transcript content is in messages before generating response
@@ -3906,6 +4011,116 @@ Examples:
             }
         
         return None
+    
+    def query_with_reflection(self,
+                             question: str,
+                             top_k: int = 15,
+                             max_iterations: int = 3,
+                             quality_threshold: float = 0.8,
+                             use_memory: bool = True,
+                             doc_id: Optional[str] = None,
+                             doc_filename: Optional[str] = None,
+                             user_id: Optional[str] = None,
+                             channel_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Query using multi-agent reflection pattern workflow.
+        Uses SearchAgent, AnalyserAgent, and ReflectionAgent with LangGraph orchestration.
+        
+        Args:
+            question: User query
+            top_k: Number of search results to retrieve
+            max_iterations: Maximum reflection iterations
+            quality_threshold: Minimum quality score to accept (0.0-1.0)
+            use_memory: Whether to use past successful analyses
+            doc_id: Optional document ID filter
+            doc_filename: Optional filename filter
+            user_id: Optional user ID for context
+            channel_id: Optional channel ID for context
+            
+        Returns:
+            {
+                "answer": str,
+                "quality_score": float,
+                "iteration": int,
+                "sources_used": List[str],
+                "search_results_count": int,
+                "metadata": Dict[str, Any]
+            }
+        """
+        if not ELASTICSEARCH_ENABLED:
+            logger.warning("Elasticsearch not enabled, falling back to standard query")
+            return self.query(question, top_k=top_k, user_id=user_id, channel_id=channel_id)
+        
+        try:
+            from src.agents.multi_agent_workflow import MultiAgentWorkflow
+            from src.memory.agent_memory_store import AgentMemoryStore
+            
+            # Initialize multi-agent workflow
+            workflow = MultiAgentWorkflow(
+                max_iterations=max_iterations,
+                quality_threshold=quality_threshold
+            )
+            
+            # Retrieve past memories if enabled
+            past_memories = []
+            if use_memory:
+                try:
+                    memory_store = AgentMemoryStore()
+                    past_memories = memory_store.retrieve_similar_memories(
+                        query=question,
+                        top_k=3,
+                        min_quality=quality_threshold
+                    )
+                    memory_store.close()
+                except Exception as e:
+                    logger.warning(f"Could not retrieve past memories: {e}")
+            
+            # Run workflow
+            result = workflow.run(
+                query=question,
+                past_memories=past_memories,
+                max_iterations=max_iterations,
+                quality_threshold=quality_threshold
+            )
+            
+            # Store successful analysis in memory if quality is good
+            if result.get("quality_score", 0.0) >= quality_threshold:
+                try:
+                    memory_store = AgentMemoryStore()
+                    memory_store.store_successful_analysis(
+                        query=question,
+                        analysis=result.get("final_analysis", ""),
+                        quality_score=result.get("quality_score", 0.0),
+                        sources_used=result.get("sources_used", []),
+                        iteration=result.get("iteration", 1),
+                        metadata=result.get("metadata", {})
+                    )
+                    memory_store.close()
+                except Exception as e:
+                    logger.warning(f"Could not store analysis in memory: {e}")
+            
+            workflow.close()
+            
+            # Format result to match standard query format
+            return {
+                "answer": result.get("final_analysis", ""),
+                "quality_score": result.get("quality_score", 0.0),
+                "iteration": result.get("iteration", 1),
+                "sources_used": result.get("sources_used", []),
+                "search_results_count": result.get("search_results_count", 0),
+                "metadata": result.get("metadata", {}),
+                "context_chunks": [],  # For compatibility
+                "source_documents": result.get("sources_used", []),
+                "source_memories": past_memories,
+                "used_reflection": True
+            }
+        except ImportError as e:
+            logger.warning(f"Multi-agent workflow not available: {e}. Falling back to standard query.")
+            return self.query(question, top_k=top_k, user_id=user_id, channel_id=channel_id)
+        except Exception as e:
+            logger.error(f"Error in query_with_reflection: {e}", exc_info=True)
+            # Fallback to standard query
+            return self.query(question, top_k=top_k, user_id=user_id, channel_id=channel_id)
     
     def close(self):
         """Close all connections."""
