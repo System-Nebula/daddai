@@ -1,0 +1,43 @@
+{
+  "name": "discord-bot-refactored",
+  "version": "2.0.0",
+  "description": "Discord bot using refactored agent architecture with A2A communication",
+  "main": "index.ts",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "tsx index.ts",
+    "dev": "tsx watch index.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "rag",
+    "ai",
+    "refactored",
+    "agent"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "compression": "^1.8.1",
+    "discord.js": "^14.24.2",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "@types/compression": "^1.8.1",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.0",
+    "@types/socket.io": "^3.0.2",
+    "@types/winston": "^2.4.4",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}
