@@ -73,6 +73,21 @@ except ImportError as e:
     DND_AVAILABLE = False
     logger.warning(f"D&D tools not available: {e}")
 
+# Import YouTube and Website summarizer tools
+try:
+    from src.tools.youtube_transcript_tool import summarize_youtube
+    YOUTUBE_AVAILABLE = True
+except ImportError as e:
+    YOUTUBE_AVAILABLE = False
+    logger.warning(f"YouTube summarizer tool not available: {e}")
+
+try:
+    from src.tools.website_summarizer_tool import summarize_website
+    WEBSITE_AVAILABLE = True
+except ImportError as e:
+    WEBSITE_AVAILABLE = False
+    logger.warning(f"Website summarizer tool not available: {e}")
+
 # Define State
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], operator.add]
@@ -101,14 +116,17 @@ class ReActAgent(BaseAgent):
             description="ReAct pattern agent with tool calling and agent delegation"
         )
         
-        self.tools = self._setup_tools()
-        self.llm = self._setup_llm()
-        self.graph = self._build_graph()
+        # Initialize context and execution tracker before tools (tools need these)
+        self.current_context = {}
         self.last_execution = {
             "steps": [],
             "tool_calls": [],
             "final_result": None
         }
+        
+        self.tools = self._setup_tools()
+        self.llm = self._setup_llm()
+        self.graph = self._build_graph()
         
         # Register capabilities
         self.register_capability(AgentCapability(
@@ -207,7 +225,26 @@ class ReActAgent(BaseAgent):
             return AgentResponse.error_response(str(e))
     
     def _setup_tools(self):
-        """Initialize tools."""
+        """Initialize tools using ReActToolFactory."""
+        from Refactored.src.tools.react_tool_factory import ReActToolFactory
+        
+        # Create factory with execution tracker and context
+        # Context will be updated in run() method, but initialize with empty dict for now
+        factory = ReActToolFactory(
+            execution_tracker=self.last_execution,
+            context=getattr(self, 'current_context', {})
+        )
+        
+        # Get all tools from factory
+        tools = factory.create_all_tools()
+        
+        # Store factory reference so we can update context later if needed
+        self._tool_factory = factory
+        
+        return tools
+    
+    def _setup_tools_old(self):
+        """OLD: Initialize tools (hardcoded - kept for reference)."""
         code_interpreter = CodeInterpreter()
         memory_tools = MemoryTools()
         
@@ -258,6 +295,42 @@ class ReActAgent(BaseAgent):
                 return f"Error: {str(e)}"
         
         tools.append(save_core_memory)
+        
+        @tool
+        def get_core_memory(channel_id: str, query: Optional[str] = None, top_k: int = 5) -> str:
+            """Retrieve core memories for a channel/user. Use this to recall important facts or preferences."""
+            try:
+                import asyncio
+                import concurrent.futures
+                
+                async def _get_memory():
+                    return await memory_tools.get_core_memory(channel_id, query, top_k)
+                
+                # Run async function in thread executor
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, _get_memory())
+                    result = future.result(timeout=30)
+                
+                self.last_execution["tool_calls"].append({
+                    "tool": "get_core_memory",
+                    "channel_id": channel_id,
+                    "success": True
+                })
+                
+                if result:
+                    memories_text = "\n".join([f"- {m}" for m in result[:top_k]])
+                    return f"📝 Core memories for {channel_id}:\n{memories_text}"
+                else:
+                    return f"No core memories found for {channel_id}"
+            except Exception as e:
+                self.last_execution["tool_calls"].append({
+                    "tool": "get_core_memory",
+                    "success": False,
+                    "error": str(e)
+                })
+                return f"Error: {str(e)}"
+        
+        tools.append(get_core_memory)
         
         # Add image generation if available
         if IMAGE_GENERATION_AVAILABLE:
@@ -809,6 +882,107 @@ class ReActAgent(BaseAgent):
                 get_party_members
             ])
             logger.info("✅ D&D tools added to ReActAgent (with party member listing)")
+        
+        # Add YouTube summarizer if available
+        if YOUTUBE_AVAILABLE:
+            @tool
+            def summarize_youtube_tool(url: str, language_codes: Optional[str] = None) -> str:
+                """
+                Summarize a YouTube video by extracting and processing its transcript.
+                Takes a YouTube URL and optional language codes (comma-separated, e.g., "en,es").
+                Returns a summary of the video content.
+                """
+                try:
+                    import asyncio
+                    import concurrent.futures
+                    
+                    # Parse language codes if provided
+                    lang_list = None
+                    if language_codes:
+                        lang_list = [lang.strip() for lang in language_codes.split(",")]
+                    
+                    async def _summarize():
+                        return await summarize_youtube(
+                            url=url,
+                            language_codes=lang_list,
+                            save_to_documents=False
+                        )
+                    
+                    # Run async function in thread executor
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(asyncio.run, _summarize())
+                        result = future.result(timeout=300)  # 5 minute timeout
+                    
+                    self.last_execution["tool_calls"].append({
+                        "tool": "summarize_youtube",
+                        "url": url,
+                        "success": result.get("success", False)
+                    })
+                    
+                    if result.get("success"):
+                        summary = result.get("summary", "")
+                        transcript_length = result.get("transcript_length", 0)
+                        return f"✅ YouTube video summarized!\n\n**Summary:**\n{summary}\n\n**Transcript Length:** {transcript_length} characters"
+                    else:
+                        return f"❌ {result.get('error', 'Unknown error')}"
+                except Exception as e:
+                    self.last_execution["tool_calls"].append({
+                        "tool": "summarize_youtube",
+                        "success": False,
+                        "error": str(e)
+                    })
+                    return f"Error: {str(e)}"
+            
+            tools.append(summarize_youtube_tool)
+            logger.info("✅ YouTube summarizer tool added to ReActAgent")
+        
+        # Add Website summarizer if available
+        if WEBSITE_AVAILABLE:
+            @tool
+            def summarize_website_tool(url: str, max_length: int = 50000) -> str:
+                """
+                Summarize a website by extracting and processing its content.
+                Takes a website URL and optional max_length (default 50000 characters).
+                Returns a summary of the website content.
+                """
+                try:
+                    import asyncio
+                    import concurrent.futures
+                    
+                    async def _summarize():
+                        return await summarize_website(
+                            url=url,
+                            max_length=max_length,
+                            save_to_documents=False
+                        )
+                    
+                    # Run async function in thread executor
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(asyncio.run, _summarize())
+                        result = future.result(timeout=300)  # 5 minute timeout
+                    
+                    self.last_execution["tool_calls"].append({
+                        "tool": "summarize_website",
+                        "url": url,
+                        "success": result.get("success", False)
+                    })
+                    
+                    if result.get("success"):
+                        summary = result.get("summary", "")
+                        content_length = result.get("content_length", 0)
+                        return f"✅ Website summarized!\n\n**Summary:**\n{summary}\n\n**Content Length:** {content_length} characters"
+                    else:
+                        return f"❌ {result.get('error', 'Unknown error')}"
+                except Exception as e:
+                    self.last_execution["tool_calls"].append({
+                        "tool": "summarize_website",
+                        "success": False,
+                        "error": str(e)
+                    })
+                    return f"Error: {str(e)}"
+            
+            tools.append(summarize_website_tool)
+            logger.info("✅ Website summarizer tool added to ReActAgent")
         
         return tools
     
@@ -1384,6 +1558,10 @@ class ReActAgent(BaseAgent):
             "imageUrls": image_urls  # Also store as imageUrls for compatibility
         }
         
+        # Update tool factory context if it exists
+        if hasattr(self, '_tool_factory'):
+            self._tool_factory.context = self.current_context
+        
         # Get available tool names and descriptions
         from langchain_core.tools import BaseTool
         available_tools = [t for t in self.tools if isinstance(t, BaseTool)]
@@ -1396,19 +1574,34 @@ class ReActAgent(BaseAgent):
         if tool_descriptions:
             tools_info = f"\n\nAvailable Tools:\n" + "\n".join(tool_descriptions) + "\n\nYou can use these tools by calling them when needed."
         
-        # Build system prompt
+        # Build system prompt with explicit tool selection guidance
         system_prompt = f"""You are a helpful AI assistant with access to tools. Use the ReAct pattern:
-1. **Thought**: Think about what you need to do
-2. **Action**: Use tools if needed
+1. **Thought**: Analyze the user's request and determine what tools (if any) are needed
+2. **Action**: Use the appropriate tools based on your analysis
 3. **Observation**: Analyze the tool results
 4. Repeat until you have the final answer
+
+**Tool Selection Guidelines:**
+- If the user provides a YouTube URL or asks about a YouTube video → use `summarize_youtube`
+- If the user provides a website URL or asks to summarize a website → use `summarize_website`
+- If the user asks to generate/create/draw an image → use `generate_image`
+- If the user provides an image attachment or asks about an image → use `analyze_image`
+- If the user asks a calculation, math problem, or data analysis question → use `run_python`
+- If the user wants to save important information → use `save_core_memory`
+- If the user asks about past conversations or preferences → use `get_core_memory`
+- If the user mentions inventory, items, or trading → use inventory tools
+- If the user mentions D&D, campaigns, characters, or dice → use D&D tools
+- For general questions without specific tool needs, answer directly without tools
+
+**Important:** Always analyze the user's request first. Don't use tools unless they're actually needed. If the user is just chatting or asking a simple question, answer directly.
 
 Context:
 - Channel ID: {channel_id}
 - User ID: {user_id}
+- Image URLs: {image_urls if image_urls else 'None'}
 {tools_info}
 
-Think step by step, use tools when needed, and provide a clear final answer."""
+Think step by step, analyze what tools are needed (if any), use them appropriately, and provide a clear final answer."""
         
         inputs = {
             "messages": [

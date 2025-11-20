@@ -960,12 +960,13 @@ client.on(Events.MessageCreate, async (message: Message) => {
                 fast_path: true
             };
         } else if (hasUrl) {
-            // URLs are unambiguous - always need tools
+            // URLs detected - let LLM decide which tool to use (summarize_youtube or summarize_website)
+            // Don't force tools, let the agent decide based on the URL type
             routingResult = {
-                handler: 'tools',
-                intent: { intent: 'question', should_respond: true, needs_tools: true, needs_rag: false },
-                routing_confidence: 0.95,
-                fast_path: true
+                handler: 'rag', // Use RAG/agentic mode so LLM can choose the right tool
+                intent: { intent: 'question', should_respond: true, needs_tools: false, needs_rag: true },
+                routing_confidence: 0.90,
+                fast_path: false // Let LLM route it
             };
         } else {
             // Use LLM for natural language understanding (greetings, questions, etc.)
@@ -1183,21 +1184,22 @@ async function handleQuestion(message: Message, routingResult: RoutingResult | n
             /(?:character|portrait).*(?:generate|create|make|draw)/i,
             /(?:side\s+profile|dramatic\s+light|dungeon\s+background).*(?:generate|create|make|draw)/i
         ];
+        // Let LLM decide tool usage - don't force based on patterns
+        // The agent has access to all tools and will use them when appropriate
+        const hasUrl = /(?:https?:\/\/|www\.|youtube\.com|youtu\.be)/i.test(question);
+        if (hasUrl) {
+            // URLs detected - log but let LLM decide which tool (summarize_youtube vs summarize_website)
+            logger.debug('🌐 URL detected - LLM will determine appropriate tool (summarize_youtube or summarize_website)');
+            // Don't override handler - let GopherAgent/LLM decide
+        }
+        
         const hasImageGeneration = imageGenerationPatterns.some(pattern =>
             pattern.test(question) || pattern.test(cleanedQuestionForDetection)
         );
         if (hasImageGeneration) {
-            handler = 'tools';
-            intent = { ...intent, needs_tools: true, needs_rag: true, is_casual: false };
-            logger.info(`🎨 Image generation detected in question: "${question.substring(0, 100)}" - forcing RAG/tools handler (overriding GopherAgent routing)`);
-        }
-
-        // CRITICAL: Check for URLs - URLs ALWAYS need tools, even if GopherAgent says casual
-        const hasUrl = /(?:https?:\/\/|www\.|youtube\.com|youtu\.be)/i.test(question);
-        if (hasUrl) {
-            handler = 'tools';
-            intent = { ...intent, needs_tools: true, needs_rag: false, is_casual: false };
-            logger.debug('🌐 URL detected - forcing tools handler (overriding GopherAgent routing)');
+            // Image generation detected - log but let LLM decide
+            logger.debug(`🎨 Image generation request detected - LLM will use generate_image tool if needed`);
+            // Don't override handler - let agent decide
         }
 
         // Remove all Discord user/role/channel mentions for filename detection
@@ -1225,9 +1227,9 @@ async function handleQuestion(message: Message, routingResult: RoutingResult | n
             logger.warn(`⚠️ Typing indicator failed or timed out: ${err.message}, continuing anyway...`);
         }
 
-        // Check if we should use agentic mode
+        // Check if we should use agentic mode - let LLM decide based on complexity
+        // Agentic mode gives LLM access to all tools and lets it decide which ones to use
         let useAgenticMode = false;
-        // Note: Agentic mode now has access to image generation and other RAG tools
         // Both agentic mode and RAG pipeline can handle image generation
         try {
             const agent = await getGopherAgent();
@@ -1549,19 +1551,21 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
             }
         }
 
-        // 🤖 AGENTIC ROUTING: Use GopherAgent's routing decision
-        if (hasImageGeneration) {
-            useRAG = true;
-            logger.info(`🎨 Image generation detected - forcing RAG pipeline for tool calling`);
-        } else if (hasUrl) {
-            useRAG = true;
-            logger.debug(`🌐 URL detected - forcing RAG pipeline for tool calling`);
-        } else if (hasDocumentReference) {
-            useRAG = true;
-            logger.info(`📄 Document reference detected - forcing RAG pipeline (overriding GopherAgent casual classification)`);
-        } else if (routingResult && intent) {
+        // 🤖 AGENTIC ROUTING: Let LLM decide tool usage via GopherAgent routing
+        // Don't force tool usage based on patterns - trust the LLM's decision
+        if (routingResult && intent) {
             useRAG = intent.needs_rag === true || handler === 'rag' || handler === 'tools';
             logger.info(`🤖 Using GopherAgent routing: needs_rag=${intent.needs_rag}, handler=${handler}, useRAG=${useRAG}`);
+            if (hasUrl) {
+                logger.debug(`🌐 URL detected - LLM will determine appropriate tool (summarize_youtube or summarize_website)`);
+            }
+            if (hasImageGeneration) {
+                logger.debug(`🎨 Image generation request detected - LLM will use generate_image tool if needed`);
+            }
+        } else if (hasDocumentReference) {
+            // Document references still need RAG for document search
+            useRAG = true;
+            logger.info(`📄 Document reference detected - using RAG pipeline for document search`);
         }
         logger.info(`✅ useRAG determined: ${useRAG}`);
 
@@ -1810,20 +1814,20 @@ ${doc2TextShort}${doc2Text.length > 3000 ? '\n\n[Content truncated...]' : ''}`;
         const isStateQueryAboutOtherUser = /<@!?\d+>/.test(question) && /(?:how many|how much|what).*(?:gold|coins?|inventory|items?|balance).*(?:does|do|has|have|owns)/i.test(question);
         const isRAGConversationalResponse = response && (response.is_casual_conversation === true || response.service_routing === 'chat');
 
-        if (hasUrl && isRAGConversationalResponse) {
-            logger.warn(`🌐 URL detected but RAG returned casual response - ignoring conversational response, waiting for tool execution`);
-            // Don't use conversational response when URL is detected - wait for tool execution
-            response = null;
+        // Trust LLM's decision - if it returned a conversational response for a URL, it may be appropriate
+        if (hasUrl && isRAGConversationalResponse && !hasToolCalls) {
+            logger.debug(`🌐 URL detected but LLM returned conversational response - trusting LLM's decision`);
+            // Don't override - let the LLM's response stand
         }
 
         const hasRAGResponse = response && (response.answer || (response.tool_calls && response.tool_calls.length > 0));
         const hasToolCalls = response && response.tool_calls && response.tool_calls.length > 0;
 
-        // CRITICAL: If URL is detected but no tool calls yet, don't send response - wait for tool execution
-        if (hasUrl && !hasToolCalls && !response?.answer?.includes('summary') && !response?.answer?.includes('transcript')) {
-            logger.info(`🌐 URL detected but tool execution not complete - waiting for tool results`);
-            // Don't treat this as a valid response - wait for tool execution
-            response = null;
+        // If URL is detected, check if LLM decided to use tools
+        // Don't force waiting - trust the LLM's decision
+        if (hasUrl && !hasToolCalls && response?.answer && !response.answer.includes('summary') && !response.answer.includes('transcript')) {
+            logger.debug(`🌐 URL detected but LLM chose not to use tools - using LLM's response`);
+            // Trust the LLM - if it didn't call tools, it may have a reason
         }
 
         // Check if this is a memory question (name, personal info) BEFORE generating response
