@@ -437,6 +437,8 @@ MMR_LAMBDA=0.5     # Adjust diversity vs relevance (0.0-1.0)
 - ✅ Fixed Elasticsearch k-NN compatibility issues
 - ✅ Increased image generation timeout to 15 minutes
 - ✅ Improved agentic mode timeout handling with local fallback
+- ✅ Refactored Discord bot to TypeScript with HTTP A2A communication, tool_calls handling, and enhanced thinking messages
+- ✅ Updated .gitignore to exclude secret .env files from the refactored bot
 
 ### Feature Enhancements
 - ✅ FLUX GGUF image generation workflow
