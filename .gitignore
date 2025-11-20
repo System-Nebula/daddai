@@ -22,8 +22,14 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.pytest_cache/
 
 # Environment variables
+# For refactored projects
+discord-bot-refactored/.env
+discord-bot-refactored/.env.local
+*.env
+*.env.*
 .env
 .env.local
 
@@ -60,6 +66,16 @@ discord-bot/data/config.json
 discord-bot/data/conversations/
 discord-bot/.env
 discord-bot/.env.local
+
+# Discord bot refactored specific
+discord-bot-refactored/node_modules/
+discord-bot-refactored/logs/
+discord-bot-refactored/data/
+discord-bot-refactored/.env
+discord-bot-refactored/.env.local
+discord-bot-refactored/*.log
+discord-bot-refactored/*.txt
+discord-bot-refactored/*.backup
 
 # Cache
 .cache/
